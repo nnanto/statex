@@ -1,0 +1,30 @@
+# Rust build output
+target/
+
+# statex local dev state and build artifacts
+.statex/
+*.wasm
+wit_world/
+
+# Generated Python clients (`statex codegen python`)
+*_client.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+dist/
+build/
+
+# Editors / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local env / secrets
+.env
+.env.*

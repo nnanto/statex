@@ -1,0 +1,11 @@
+# Cargo workspace shared by every Rust statex app (maintained by `statex new`).
+[workspace]
+resolver = "2"
+members = [
+    "demo/rustdemo",
+]
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

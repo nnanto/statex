@@ -1,0 +1,11 @@
+[package]
+name = "demo-rustdemo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+statex-guest = { path = "../../../crates/guest" }
+wit-bindgen = "0.62"

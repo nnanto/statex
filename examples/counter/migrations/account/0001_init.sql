@@ -1,0 +1,6 @@
+CREATE TABLE entries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  memo TEXT
+);

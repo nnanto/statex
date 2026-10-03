@@ -1,0 +1,19 @@
+# statex app manifest
+[app]
+name = "pycounter"
+# Team that owns this app name in the cluster; deploys by other owners are refused.
+owner = "examples"
+
+# Hosts the http-client interface may call: "api.example.com", "*.example.com" or "*".
+[http]
+allow = []
+
+[limits]
+timeout_ms = 5000
+memory_mb = 64
+
+# Python actors are compiled to a WebAssembly component with componentize-py
+# (pip install componentize-py==0.25.1, or let uvx fetch it).
+[build]
+command = "uvx --python 3.12 --from componentize-py==0.25.1 componentize-py -d wit -w app componentize app -o app.wasm"
+wasm = "app.wasm"

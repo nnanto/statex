@@ -1,0 +1,45 @@
+{
+  "apps": [
+    {
+      "app": "demo/db",
+      "lang": "python",
+      "owner": "demo",
+      "path": "apps/demo/db",
+      "types": [
+        {
+          "docs": "Each exported interface is an actor type; each function is a method.\nEvery key (e.g. \"alice\") is an independent actor with its own SQLite database.",
+          "methods": [
+            "put(key: string, value: string)",
+            "get(key: string) -> option<string>",
+            "delete(key: string) -> bool",
+            "scan(prefix: string) -> list<entry>"
+          ],
+          "migrations": 1,
+          "name": "kv"
+        }
+      ],
+      "wit": "demo/db.wit",
+      "wit_sha256": "83b2b2dd44bf4d845eba59b7534d3a606362b80a39aa333a3c089c068af414fa"
+    },
+    {
+      "app": "demo/rustdemo",
+      "lang": "rust",
+      "owner": "demo",
+      "path": "apps/demo/rustdemo",
+      "types": [
+        {
+          "docs": "Each exported interface is an actor type; each function is a method.\nEvery key (e.g. \"alice\") is an independent actor with its own SQLite database.",
+          "methods": [
+            "increment(by: s64) -> s64",
+            "get() -> s64"
+          ],
+          "migrations": 1,
+          "name": "counter"
+        }
+      ],
+      "wit": "demo/rustdemo.wit",
+      "wit_sha256": "2f19c3f9ce3971340cab2dfa5581cffa561bd3eb76816af2ce59221df71aaa94"
+    }
+  ],
+  "generated_by": "statex registry build; do not edit by hand"
+}

@@ -1,0 +1,27 @@
+[package]
+name = "statex-cli"
+version.workspace = true
+edition.workspace = true
+description = "statex developer CLI and node binary"
+
+[[bin]]
+name = "statex"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+toml.workspace = true
+reqwest.workspace = true
+rusqlite.workspace = true
+tempfile.workspace = true
+statex-store.workspace = true
+statex-runtime.workspace = true
+statex-node.workspace = true
+
+[dev-dependencies]

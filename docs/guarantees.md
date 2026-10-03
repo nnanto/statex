@@ -1,0 +1,55 @@
+# Guarantees and failure semantics
+
+## Single writer per actor
+
+At most one node executes calls for an actor at a time, and once a newer owner
+exists, no older owner can acknowledge a write. This rests on three
+mechanisms:
+
+1. **Ownership by CAS.** A node may only activate an actor by replacing `owner.json` with `If-Match` on the etag it read. It may only take over from another node whose node lease is expired, or whose session has changed because that node restarted.
+2. **Lease margin.** A node only considers its own lease valid until `expires_at - max(ttl/5, 200ms)`. Expiry is measured from *before* the renewal request was sent. Peers consider the node dead only after `expires_at`. Clock skew between nodes must stay below that margin.
+3. **Fencing.** A failed renewal (`412`), or failing to renew before local expiry, fences the node. It drops every resident actor immediately; `statex node` then exits with code 3 and should be restarted by its supervisor.
+
+## Durability (the ack rule)
+
+A successful response (2xx) is sent only after:
+
+1. the transaction's WAL segment has been written to the object store,
+2. the node's lease is still valid (with margin), **and**
+3. `owner.json` still names this node, session and epoch.
+
+Any write that was acknowledged therefore survives:
+
+- a crash of the owner (the next owner restores snapshot + segments),
+- loss of the node's local disk (local state is only a cache),
+- a network partition (the partitioned node can no longer satisfy the ack rule).
+
+## What is *not* guaranteed
+
+- **Unacknowledged writes may still become visible.** If the segment upload succeeded but the ownership check then failed or timed out, the client receives `503 unavailable`. A later owner may still restore that write, which also happens if the owner crashed between upload and response. Treat 503 as "unknown outcome". Methods that must not be applied twice should take an idempotency key and record it in the actor's database (a `UNIQUE` column makes this a one-line check).
+- **HTTP side effects are not transactional.** `http-client.send` runs during the call. If the transaction later rolls back or is never acknowledged, the request has still been sent. Use idempotency keys with external systems.
+- **No cross-actor transactions.** Each call is atomic within one actor. Coordinate across actors with application-level protocols (sagas or idempotent steps).
+- **Availability during failover.** If an owner dies, its actors are unavailable until its lease expires, i.e. up to `--lease-ttl` (10s by default). Calls received during that window are retried internally for up to 2×TTL before returning 503. A graceful shutdown (SIGINT or SIGTERM) releases actors and the lease immediately.
+
+- **App ownership is not access control.** The owner recorded in `current.json` prevents accidental collisions between teams, but anyone who can write `deploy/` can deploy anything. Grant write access to `deploy/` only to CI, for example with ADLS directory ACLs. Nodes only need read access to `deploy/`.
+
+## Errors
+
+| Status | `error.code` | Meaning |
+|---|---|---|
+| 200 | – | `{"result": ...}`. For `result<T, E>` methods this is the `ok` value |
+| 201 | – | Actor created (`_create`) |
+| 400 | `bad_request` | Invalid JSON or arguments that do not match the WIT signature |
+| 404 | `not_found` | Unknown app, actor type or method |
+| 409 | `conflict` | `_create` on an existing actor |
+| 422 | `method_error` | The method returned `err(E)`; `error.detail` holds E. The transaction is rolled back |
+| 500 | `trap` / `internal` | The guest trapped (panic, timeout, out of memory); the transaction is rolled back |
+| 503 | `unavailable` | Ownership could not be established or confirmed; retry. The outcome of a write is unknown |
+
+## Migrations
+
+- Each actor type has its own ordered `migrations/<type>/*.sql`.
+- Pending migrations are applied lazily inside the transaction of the first call after activation, or after a deploy that adds migrations.
+- They are therefore atomic with that call and durable through the same WAL segment.
+- Applied migrations are recorded in `_statex_migrations`.
+- Migrations are append-only: never edit or reorder an applied file. Add a new one instead.

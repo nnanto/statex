@@ -1,0 +1,7 @@
+# statex monorepo: every app lives at <apps>/<team>/<app> and is named `team/app`.
+# Relative paths are resolved from this file.
+apps = "apps"
+host_wit = "wit"
+guest_sdk = "crates/guest"
+python_guest = "sdk/python-guest"
+registry = "registry"

@@ -1,0 +1,32 @@
+package local:pycounter@0.1.0;
+
+/// Each exported interface is an actor type; each function is a method.
+/// Every key (e.g. "alice") is an independent actor with its own SQLite database.
+interface counter {
+  /// Adds `by` and returns the new value.
+  increment: func(by: s64) -> s64;
+  /// Returns the current value.
+  get: func() -> s64;
+  /// Adds a positive amount; negative amounts are rejected.
+  checked-add: func(by: s64) -> result<s64, string>;
+  /// Always fails with an exception (trap).
+  boom: func();
+}
+
+/// TODO: describe the `profile` actor type.
+interface profile {
+  /// Stores a value.
+  set: func(value: string);
+  /// Returns the stored value, if any.
+  get: func() -> option<string>;
+}
+
+world app {
+  import statex:host/context@0.1.0;
+  import statex:host/sql@0.1.0;
+  import statex:host/http-client@0.1.0;
+  import statex:host/log@0.1.0;
+
+  export counter;
+  export profile;
+}

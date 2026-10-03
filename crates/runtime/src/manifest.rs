@@ -1,0 +1,379 @@
+//! App manifest: the actor types, methods and type signatures discovered from a
+//! component's WIT exports, plus deployment metadata. The manifest drives
+//! routing, JSON mapping and client SDK generation, so teams never register
+//! routes by hand.
+
+use std::collections::BTreeMap;
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use wit_parser::{Resolve, Type, TypeDefKind, WorldItem};
+
+/// A WIT type, fully inlined (WIT types are never recursive).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Ty {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    S8,
+    S16,
+    S32,
+    S64,
+    F32,
+    F64,
+    Char,
+    String,
+    List { element: Box<Ty> },
+    Option { inner: Box<Ty> },
+    Result {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ok: Option<Box<Ty>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        err: Option<Box<Ty>>,
+    },
+    Tuple { items: Vec<Ty> },
+    Record { name: String, fields: Vec<Field> },
+    Variant { name: String, cases: Vec<Case> },
+    Enum { name: String, cases: Vec<String> },
+    Flags { name: String, flags: Vec<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Field {
+    pub name: String,
+    pub ty: Ty,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Case {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ty: Option<Ty>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Param {
+    pub name: String,
+    pub ty: Ty,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Method {
+    pub name: String,
+    pub params: Vec<Param>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Ty>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ActorType {
+    /// Short interface name, used in URLs: `counter`.
+    pub name: String,
+    /// Full export name: `example:counter/counter@0.1.0`.
+    pub export: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs: Option<String>,
+    pub methods: Vec<Method>,
+}
+
+impl ActorType {
+    pub fn method(&self, name: &str) -> Option<&Method> {
+        self.methods.iter().find(|m| m.name == name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Migration {
+    pub name: String,
+    pub sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct HttpPolicy {
+    /// Allowed hosts: `api.example.com`, `*.example.com` or `*`.
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Limits {
+    pub timeout_ms: u64,
+    pub memory_mb: u64,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self { timeout_ms: 5_000, memory_mb: 64 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Manifest {
+    pub format: u32,
+    pub app: String,
+    /// sha256 of component.wasm; also the deployment version id.
+    pub sha256: String,
+    pub types: Vec<ActorType>,
+    /// Per actor type, applied in order on activation.
+    #[serde(default)]
+    pub migrations: BTreeMap<String, Vec<Migration>>,
+    #[serde(default)]
+    pub http: HttpPolicy,
+    #[serde(default)]
+    pub limits: Limits,
+}
+
+impl Manifest {
+    pub fn actor_type(&self, name: &str) -> Option<&ActorType> {
+        self.types.iter().find(|t| t.name == name)
+    }
+
+    /// Builds and validates a manifest for a component binary: checks imports,
+    /// extracts actor types and attaches migrations (`type -> [(file, sql)]`).
+    pub fn build(
+        wasm: &[u8],
+        app: &str,
+        migrations: BTreeMap<String, Vec<Migration>>,
+        http: HttpPolicy,
+        limits: Limits,
+    ) -> Result<Manifest> {
+        validate_app_name(app)?;
+        let ins = inspect(wasm)?;
+        let bad: Vec<_> = ins.imports.iter().filter(|i| !import_allowed(i)).cloned().collect();
+        if !bad.is_empty() {
+            bail!(
+                "component imports interfaces the host does not provide: {}. Only statex:host/* and wasi:* are available",
+                bad.join(", ")
+            );
+        }
+        for t in migrations.keys() {
+            if !ins.types.iter().any(|x| &x.name == t) {
+                bail!("migrations/{t}/ does not match any exported actor type");
+            }
+        }
+        for list in migrations.values() {
+            let mut names: Vec<_> = list.iter().map(|m| &m.name).collect();
+            let sorted = {
+                let mut s = names.clone();
+                s.sort();
+                s
+            };
+            if names != sorted {
+                bail!("migrations must be sorted by name");
+            }
+            names.dedup();
+            if names.len() != list.len() {
+                bail!("duplicate migration names");
+            }
+        }
+        Ok(Manifest {
+            format: 1,
+            app: app.to_string(),
+            sha256: crate::sha256_hex(wasm),
+            types: ins.types,
+            migrations,
+            http,
+            limits,
+        })
+    }
+}
+
+/// App names: lowercase letters, digits and dashes, starting with a letter.
+pub fn validate_name(what: &str, s: &str) -> Result<()> {
+    let ok = !s.is_empty()
+        && s.len() <= 63
+        && s.starts_with(|c: char| c.is_ascii_lowercase())
+        && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+    if !ok {
+        bail!("invalid {what} name {s:?}: use lowercase letters, digits and dashes, starting with a letter");
+    }
+    Ok(())
+}
+
+/// Path segments the HTTP API uses after an app name; no app name segment may
+/// use them, so `/v1/apps/<app...>/actors/...` parses unambiguously.
+pub const RESERVED_APP_SEGMENTS: &[&str] = &["actors", "schema"];
+
+/// App names are one segment (`shop`) or namespaced as `team/app`
+/// (`payments/shop`). Each segment follows [`validate_name`].
+pub fn validate_app_name(s: &str) -> Result<()> {
+    let segs: Vec<&str> = s.split('/').collect();
+    if segs.len() > 2 {
+        bail!("invalid app name {s:?}: use `app` or `team/app`");
+    }
+    for seg in segs {
+        validate_name("app", seg).map_err(|_| {
+            anyhow!("invalid app name {s:?}: use `app` or `team/app`, where each part is lowercase letters, digits and dashes, starting with a letter")
+        })?;
+        if RESERVED_APP_SEGMENTS.contains(&seg) {
+            bail!("invalid app name {s:?}: `{seg}` is reserved");
+        }
+    }
+    Ok(())
+}
+
+/// What a component exports and imports.
+#[derive(Debug, Clone)]
+pub struct Inspection {
+    pub types: Vec<ActorType>,
+    pub imports: Vec<String>,
+}
+
+/// Import namespaces an actor component may use.
+pub fn import_allowed(name: &str) -> bool {
+    name.starts_with("statex:host/") || name.starts_with("wasi:")
+}
+
+/// Decodes a component binary and extracts its actor types.
+pub fn inspect(wasm: &[u8]) -> Result<Inspection> {
+    let decoded = wit_component::decode(wasm).map_err(|e| anyhow!("not a valid component: {e}"))?;
+    let (resolve, world) = match decoded {
+        wit_component::DecodedWasm::Component(r, w) => (r, w),
+        _ => bail!("expected a WebAssembly component, found a WIT package"),
+    };
+    inspect_world(&resolve, world)
+}
+
+/// Extracts actor types from WIT source (a directory such as `wit/`, with
+/// dependencies under `wit/deps/`), without building the component. `world`
+/// may be omitted when the package defines a single world.
+pub fn inspect_wit(dir: &std::path::Path, world: Option<&str>) -> Result<Inspection> {
+    let mut resolve = Resolve::default();
+    let (pkg, _) = resolve.push_dir(dir).with_context(|| format!("parse WIT in {}", dir.display()))?;
+    let world = resolve.select_world(&[pkg], world)?;
+    inspect_world(&resolve, world)
+}
+
+fn inspect_world(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Inspection> {
+    let w = &resolve.worlds[world];
+    let imports = w.imports.keys().map(|k| resolve.name_world_key(k)).collect();
+    let mut types: Vec<ActorType> = Vec::new();
+    for (key, item) in &w.exports {
+        let export = resolve.name_world_key(key);
+        match item {
+            WorldItem::Interface { id, .. } => {
+                let iface = &resolve.interfaces[*id];
+                // Unnamed (inline) interfaces are toolchain plumbing, e.g. the
+                // pre-initialization hook componentize-py exports; they are
+                // never actor types.
+                let Some(name) = iface.name.clone() else { continue };
+                if iface.functions.is_empty() {
+                    continue;
+                }
+                let mut methods = Vec::new();
+                for f in iface.functions.values() {
+                    if !matches!(f.kind, wit_parser::FunctionKind::Freestanding) {
+                        bail!("{export}.{}: resources are not supported in actor interfaces", f.name);
+                    }
+                    let ctx = format!("{name}.{}", f.name);
+                    methods.push(Method {
+                        name: f.name.clone(),
+                        params: f
+                            .params
+                            .iter()
+                            .map(|p| Ok(Param { name: p.name.clone(), ty: ty_of(&resolve, &p.ty, &ctx)? }))
+                            .collect::<Result<_>>()?,
+                        result: f.result.as_ref().map(|t| ty_of(&resolve, t, &ctx)).transpose()?,
+                        docs: f.docs.contents.clone(),
+                    });
+                }
+                if types.iter().any(|t| t.name == name) {
+                    bail!("two exported interfaces are both named `{name}`; actor type names must be unique");
+                }
+                types.push(ActorType { name, export, docs: iface.docs.contents.clone(), methods });
+            }
+            WorldItem::Function(f) => {
+                bail!("world-level export function `{}` is not supported; export an interface instead", f.name)
+            }
+            WorldItem::Type { .. } => {}
+        }
+    }
+    if types.is_empty() {
+        bail!("component exports no interfaces with functions; nothing to serve");
+    }
+    Ok(Inspection { types, imports })
+}
+
+fn ty_of(resolve: &Resolve, t: &Type, ctx: &str) -> Result<Ty> {
+    Ok(match t {
+        Type::Bool => Ty::Bool,
+        Type::U8 => Ty::U8,
+        Type::U16 => Ty::U16,
+        Type::U32 => Ty::U32,
+        Type::U64 => Ty::U64,
+        Type::S8 => Ty::S8,
+        Type::S16 => Ty::S16,
+        Type::S32 => Ty::S32,
+        Type::S64 => Ty::S64,
+        Type::F32 => Ty::F32,
+        Type::F64 => Ty::F64,
+        Type::Char => Ty::Char,
+        Type::String => Ty::String,
+        Type::ErrorContext => bail!("{ctx}: error-context is not supported"),
+        Type::Id(id) => {
+            let td = &resolve.types[*id];
+            let name = td.name.clone().unwrap_or_default();
+            match &td.kind {
+                TypeDefKind::Type(inner) => ty_of(resolve, inner, ctx)?,
+                TypeDefKind::Record(r) => Ty::Record {
+                    name,
+                    fields: r
+                        .fields
+                        .iter()
+                        .map(|f| Ok(Field { name: f.name.clone(), ty: ty_of(resolve, &f.ty, ctx)? }))
+                        .collect::<Result<_>>()?,
+                },
+                TypeDefKind::Variant(v) => Ty::Variant {
+                    name,
+                    cases: v
+                        .cases
+                        .iter()
+                        .map(|c| {
+                            Ok(Case {
+                                name: c.name.clone(),
+                                ty: c.ty.as_ref().map(|t| ty_of(resolve, t, ctx)).transpose()?,
+                            })
+                        })
+                        .collect::<Result<_>>()?,
+                },
+                TypeDefKind::Enum(e) => {
+                    Ty::Enum { name, cases: e.cases.iter().map(|c| c.name.clone()).collect() }
+                }
+                TypeDefKind::Flags(f) => {
+                    Ty::Flags { name, flags: f.flags.iter().map(|c| c.name.clone()).collect() }
+                }
+                TypeDefKind::Tuple(t) => Ty::Tuple {
+                    items: t.types.iter().map(|t| ty_of(resolve, t, ctx)).collect::<Result<_>>()?,
+                },
+                TypeDefKind::Option(t) => Ty::Option { inner: Box::new(ty_of(resolve, t, ctx)?) },
+                TypeDefKind::Result(r) => Ty::Result {
+                    ok: r.ok.as_ref().map(|t| ty_of(resolve, t, ctx).map(Box::new)).transpose()?,
+                    err: r.err.as_ref().map(|t| ty_of(resolve, t, ctx).map(Box::new)).transpose()?,
+                },
+                TypeDefKind::List(t) => Ty::List { element: Box::new(ty_of(resolve, t, ctx)?) },
+                other => bail!("{ctx}: WIT type `{}` is not supported in actor interfaces", other.as_str()),
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_names() {
+        for ok in ["shop", "payments/shop", "a1/b-2"] {
+            validate_app_name(ok).unwrap();
+        }
+        for bad in ["", "/shop", "shop/", "a/b/c", "Pay/shop", "payments/actors", "schema", "a//b", "a.b"] {
+            assert!(validate_app_name(bad).is_err(), "{bad}");
+        }
+    }
+}

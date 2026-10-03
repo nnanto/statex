@@ -1,0 +1,13 @@
+# statex app manifest
+[app]
+name = "counter"
+# Team that owns this app name in the cluster; deploys by other owners are refused.
+owner = "examples"
+
+# Outbound HTTP allowlist for the http-client host interface.
+[http]
+allow = []
+
+[limits]
+timeout_ms = 5000
+memory_mb = 64

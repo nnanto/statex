@@ -1,0 +1,16 @@
+[package]
+name = "statex-guest"
+# No workspace inheritance: app crates depend on this crate from outside the
+# statex workspace (path, git or registry), where inherited fields fail.
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust SDK for writing statex actors (WASM components)"
+
+[dependencies]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "0.62"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }

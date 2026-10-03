@@ -1,0 +1,68 @@
+/// Host capabilities available to every statex actor.
+package statex:host@0.1.0;
+
+/// Identity of the actor currently executing.
+interface context {
+  /// Application name the component was deployed as.
+  app: func() -> string;
+  /// Actor type (= the exported interface name, e.g. `counter`).
+  actor-type: func() -> string;
+  /// Actor key (e.g. `alice`).
+  key: func() -> string;
+  /// Ownership epoch of this activation. Increases on every activation.
+  epoch: func() -> u64;
+}
+
+/// The actor's private SQLite database. Every method invocation runs inside one
+/// transaction managed by the host: a trap rolls back, a normal return commits.
+interface sql {
+  variant value {
+    null,
+    integer(s64),
+    real(f64),
+    text(string),
+    blob(list<u8>),
+  }
+
+  record rows {
+    columns: list<string>,
+    rows: list<list<value>>,
+  }
+
+  /// Executes a statement and returns the number of changed rows.
+  execute: func(stmt: string, params: list<value>) -> result<u64, string>;
+  /// Runs a query and returns all rows.
+  query: func(stmt: string, params: list<value>) -> result<rows, string>;
+}
+
+/// Outbound HTTP, restricted to the hosts allowed in the app's statex.toml.
+/// Side effects are NOT part of the actor transaction.
+interface http-client {
+  record request {
+    method: string,
+    url: string,
+    headers: list<tuple<string, string>>,
+    body: option<list<u8>>,
+  }
+
+  record response {
+    status: u16,
+    headers: list<tuple<string, string>>,
+    body: list<u8>,
+  }
+
+  send: func(req: request) -> result<response, string>;
+}
+
+interface log {
+  enum level { trace, debug, info, warn, error }
+  log: func(level: level, msg: string);
+}
+
+/// Everything an actor may import from the host.
+world imports {
+  import context;
+  import sql;
+  import http-client;
+  import log;
+}

@@ -1,0 +1,38 @@
+package example:counter@0.1.0;
+
+/// A simple counter. Each key (e.g. "alice") is an independent actor.
+interface counter {
+  /// Adds `by` and returns the new value.
+  increment: func(by: s64) -> s64;
+  /// Returns the current value.
+  get: func() -> s64;
+  /// Resets to zero.
+  reset: func();
+}
+
+/// A tiny ledger showing records, enums, variants, options and results.
+interface account {
+  enum kind { deposit, withdrawal }
+
+  record entry {
+    id: u64,
+    kind: kind,
+    amount: u64,
+    memo: option<string>,
+  }
+
+  variant tx-error {
+    insufficient-funds(u64),
+    invalid-amount,
+  }
+
+  deposit: func(amount: u64, memo: option<string>) -> result<u64, tx-error>;
+  withdraw: func(amount: u64) -> result<u64, tx-error>;
+  balance: func() -> u64;
+  history: func(limit: u32) -> list<entry>;
+}
+
+world app {
+  export counter;
+  export account;
+}

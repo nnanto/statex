@@ -1,0 +1,14 @@
+package local:demo-rustdemo@0.1.0;
+
+/// Each exported interface is an actor type; each function is a method.
+/// Every key (e.g. "alice") is an independent actor with its own SQLite database.
+interface counter {
+  /// Adds `by` and returns the new value.
+  increment: func(by: s64) -> s64;
+  /// Returns the current value.
+  get: func() -> s64;
+}
+
+world app {
+  export counter;
+}
