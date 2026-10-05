@@ -1,8 +1,6 @@
 # statex app manifest
 [app]
 name = "demo/db"
-# Owner defaults to the namespace ("demo"); deploys by other owners are refused.
-# owner = "demo"
 
 # Hosts the http-client interface may call: "api.example.com", "*.example.com" or "*".
 [http]

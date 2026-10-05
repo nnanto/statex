@@ -28,6 +28,16 @@ class Counter(exports.Counter):
         statex.execute("UPDATE counter SET value = 999 WHERE id = 0")
         raise RuntimeError("boom")  # traps: the update is rolled back
 
+    def remind(self, delay_ms: int) -> None:
+        statex.set_alarm_in(delay_ms)
+
+    def reminders(self) -> int:
+        return statex.query_scalar("SELECT n FROM reminders WHERE id = 0") or 0
+
+    def alarm(self, retry_count: int) -> None:
+        statex.execute("UPDATE reminders SET n = n + 1 WHERE id = 0")
+        statex.info("reminder fired")
+
 
 class Profile(exports.Profile):
     def set(self, value: str) -> None:

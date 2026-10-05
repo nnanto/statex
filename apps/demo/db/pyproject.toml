@@ -1,0 +1,7 @@
+# Lets editors and type checkers see the typed `wit_world` bindings, which
+# `statex build`, `statex test` and `statex dev` generate into .statex/bindings.
+[tool.pyright]
+extraPaths = [".statex/bindings", "../../../sdk/python-guest"]
+
+[tool.mypy]
+mypy_path = ".statex/bindings:../../../sdk/python-guest"

@@ -138,6 +138,17 @@ pub fn mock_http(
     STATE.with(|s| s.borrow_mut().http = Some(Box::new(f)));
 }
 
+/// When the alarm of actor `(actor_type, key)` is scheduled, if it is. To
+/// test the handler, invoke it like any method:
+/// `testing::call("t", "k", || App::alarm(0))`.
+pub fn alarm(actor_type: &str, key: &str) -> Option<u64> {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        ensure_actor(&mut s, actor_type, key);
+        crate::mock::read_alarm(&s.actors[&(actor_type.into(), key.into())].conn).expect("read alarm")
+    })
+}
+
 /// Log lines emitted so far on this thread.
 pub fn logs() -> Vec<(Level, String)> {
     STATE.with(|s| s.borrow().logs.clone())
@@ -150,7 +161,9 @@ mod tests {
 
     fn setup() {
         reset();
-        let dir = std::env::temp_dir().join(format!("statex-guest-test-{}", std::process::id()));
+        static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("statex-guest-test-{}-{n}", std::process::id()));
         std::fs::create_dir_all(dir.join("kv")).unwrap();
         std::fs::write(
             dir.join("kv/0001_init.sql"),
@@ -188,6 +201,25 @@ mod tests {
         assert_eq!(got, Some(1), "panic must roll back");
         assert_eq!(call("kv", "a", crate::context::key), "a");
         assert!(call("kv", "a", || sql::execute("BEGIN", &[])).is_err());
+    }
+
+    #[test]
+    fn alarms_are_transactional() {
+        setup();
+        assert_eq!(alarm("kv", "a"), None);
+        call("kv", "a", || crate::alarm::set(1_000).unwrap());
+        assert_eq!(alarm("kv", "a"), Some(1_000));
+        let r = catch_unwind(|| {
+            call("kv", "a", || {
+                crate::alarm::clear();
+                panic!("boom");
+            })
+        });
+        assert!(r.is_err());
+        assert_eq!(call("kv", "a", crate::alarm::get), Some(1_000), "panic must roll back");
+        call("kv", "a", crate::alarm::clear);
+        assert_eq!(alarm("kv", "a"), None);
+        assert_eq!(alarm("kv", "b"), None);
     }
 
     #[test]

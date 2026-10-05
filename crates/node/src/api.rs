@@ -63,7 +63,6 @@ async fn list_apps(State(node): S) -> Json<J> {
     Json(json!({
         "apps": node.apps().iter().map(|a| json!({
             "app": a.manifest.app,
-            "owner": node.deployment(&a.manifest.app).map(|d| d.owner),
             "sha256": a.manifest.sha256,
             "types": a.manifest.types.iter().map(|t| &t.name).collect::<Vec<_>>(),
         })).collect::<Vec<_>>()
@@ -144,11 +143,11 @@ async fn call(node: Arc<Node>, app: String, ty: String, key: String, method: Str
         m if m.starts_with('_') => return Outcome::err(404, "not_found", format!("unknown operation {method:?}")),
         m => InvOp::Call { method: m.to_string(), args },
     };
-    node.invoke(Invocation { app, ty, key, op }, 0).await
+    node.invoke(Invocation { app, ty, key, op, chain: vec![] }, 0).await
 }
 
 async fn delete_actor(node: Arc<Node>, app: String, ty: String, key: String) -> Outcome {
-    node.invoke(Invocation { app, ty, key, op: InvOp::Delete }, 0).await
+    node.invoke(Invocation { app, ty, key, op: InvOp::Delete, chain: vec![] }, 0).await
 }
 
 async fn internal_invoke(State(node): S, headers: HeaderMap, body: Bytes) -> Outcome {

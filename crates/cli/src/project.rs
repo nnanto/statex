@@ -19,6 +19,20 @@ pub struct StatexToml {
     /// Non-Rust toolchains: how to build the component.
     #[serde(default)]
     pub build: Option<BuildSection>,
+    /// Other apps whose actors this app calls (see `statex calls sync`).
+    #[serde(default)]
+    pub calls: CallsSection,
+}
+
+/// `[calls]`: apps this app calls; `statex calls sync` generates their client interfaces.
+#[derive(Debug, Default, Deserialize)]
+pub struct CallsSection {
+    #[serde(default)]
+    pub apps: Vec<String>,
+    /// Source directories of callee apps outside a workspace, relative to the
+    /// project root: `counter = "../counter"`.
+    #[serde(default)]
+    pub paths: BTreeMap<String, PathBuf>,
 }
 
 /// `[build]`: a custom build, e.g. componentize-py for Python actors.
@@ -36,10 +50,6 @@ pub struct BuildSection {
 #[derive(Debug, Deserialize)]
 pub struct AppSection {
     pub name: String,
-    /// Team that owns the app name in the cluster (see `statex deploy`).
-    /// Defaults to the namespace of a `team/app` name.
-    #[serde(default)]
-    pub owner: Option<String>,
 }
 
 pub struct Project {
@@ -64,11 +74,6 @@ impl Project {
 
     pub fn app(&self) -> &str {
         &self.cfg.app.name
-    }
-
-    /// The deploy owner from statex.toml, else the app's namespace.
-    pub fn owner(&self) -> Option<String> {
-        self.cfg.app.owner.clone().or_else(|| self.app().split_once('/').map(|(ns, _)| ns.to_string()))
     }
 
     /// Actor types and migrations read from source (`wit/` and `migrations/`),
@@ -162,6 +167,62 @@ impl Project {
     }
 }
 
+/// Adds `apps` to `[calls] apps` in `<root>/statex.toml`, keeping the rest of
+/// the file as is. Returns whether the file changed.
+pub fn add_calls(root: &Path, apps: &[String]) -> Result<bool> {
+    let path = root.join("statex.toml");
+    let text = std::fs::read_to_string(&path)?;
+    let cfg: StatexToml = toml::from_str(&text)?;
+    let mut list = cfg.calls.apps.clone();
+    for a in apps {
+        if !list.contains(a) {
+            list.push(a.clone());
+        }
+    }
+    if list == cfg.calls.apps {
+        return Ok(false);
+    }
+    let rendered = format!("apps = [{}]", list.iter().map(|a| format!("{a:?}")).collect::<Vec<_>>().join(", "));
+    let new = match text.lines().position(|l| l.trim() == "[calls]") {
+        None => format!(
+            "{}\n\n[calls]\n# Apps whose actors this app calls; `statex calls sync` generates their clients.\n{rendered}\n",
+            text.trim_end()
+        ),
+        Some(i) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let end = lines[i + 1..].iter().position(|l| l.trim_start().starts_with('[')).map_or(lines.len(), |p| i + 1 + p);
+            let mut out: Vec<String> = lines[..=i].iter().map(|l| l.to_string()).collect();
+            let mut j = i + 1;
+            let mut done = false;
+            while j < end {
+                let l = lines[j];
+                if !done && l.trim_start().starts_with("apps") && l.contains('=') {
+                    // Skip a multi-line array.
+                    let mut k = j;
+                    while !lines[k].contains(']') && k + 1 < end {
+                        k += 1;
+                    }
+                    out.push(rendered.clone());
+                    done = true;
+                    j = k + 1;
+                    continue;
+                }
+                out.push(l.to_string());
+                j += 1;
+            }
+            if !done {
+                out.insert(i + 1, rendered.clone());
+            }
+            out.extend(lines[end..].iter().map(|l| l.to_string()));
+            out.join("\n") + "\n"
+        }
+    };
+    let check: StatexToml = toml::from_str(&new).context("update statex.toml")?;
+    anyhow::ensure!(check.calls.apps == list, "could not update [calls] in statex.toml; edit it by hand");
+    std::fs::write(&path, new)?;
+    Ok(true)
+}
+
 /// Reads `<root>/migrations/<type>/*.sql`, sorted by file name.
 pub fn read_migrations(root: &Path) -> Result<BTreeMap<String, Vec<Migration>>> {
     let mut out = BTreeMap::new();
@@ -233,6 +294,9 @@ pub fn print_summary(manifest: &Manifest, wasm_len: usize) {
             let ret = m.result.as_ref().map(|r| format!(" -> {}", fmt_ty(r))).unwrap_or_default();
             println!("    {}({params}){ret}", m.name);
         }
+    }
+    for c in &manifest.calls {
+        println!("  calls {} {}  ({} method{})", c.app, c.actor_type, c.methods.len(), if c.methods.len() == 1 { "" } else { "s" });
     }
 }
 

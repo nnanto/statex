@@ -31,12 +31,14 @@ flowchart LR
 ```
 fleet/peer-auth.json                         shared HMAC key for node-to-node calls
 nodes/<node-id>.json                         node lease {session, advertise, expires_at_ms}
-deploy/<app>/current.json                    {id, sha256, version, owner}; CAS on deploy
+deploy/<app>/current.json                    {id, sha256, version}; CAS on deploy
 deploy/<app>/<id>/component.wasm
 deploy/<app>/<id>/manifest.json              WIT-derived schema, migrations, limits, http policy
 actors/<app>/<type>/<key>/owner.json          ownership record (never deleted, so epochs stay monotonic)
 actors/<app>/<type>/<key>/ltx/e<epoch>/snapshot-<txid>.db
 actors/<app>/<type>/<key>/ltx/e<epoch>/<txid>.ltx      WAL page segment of one transaction
+fleet/waker.json                             lease of the node that wakes idle actors' alarms
+wake/<minute>/<app>/<type>/<key>/<at_ms>-<epoch>-<seq>   alarm wake hint (empty object)
 ```
 
 App names are `app` or `team/app`, where each segment is `[a-z0-9-]` and
@@ -113,21 +115,83 @@ Read-only calls produce no WAL frames and skip the upload. Every
 `snapshot_every` transactions (64 by default) the node writes a new snapshot
 and deletes superseded segments and snapshots in the background.
 
+Snapshots are streamed between the database file and the object store
+(`put_file` / `get_to_file`) and are never held in memory whole. On Azure,
+uploads go in 8 MiB blocks committed with one block list, and downloads use
+8 MiB ranged reads pinned to one version with `If-Match`. After a
+`TRUNCATE` checkpoint the database file is a complete image. The actor's slot
+lock is held until the upload finishes, so the file cannot change mid-upload.
+
 ## Deployments
 
 `statex deploy` does the following:
 
 1. Builds and verifies the component, which includes instantiating it against migrated databases.
 2. Uploads the component and its manifest under a content id.
-3. CASes `current.json`. Inside the CAS loop it refuses the deploy if another owner holds the app (unless `--take-over`), or if the new manifest is incompatible with the deployed one (unless `--allow-breaking`). Migrations are compared against the deployed manifest, which is what actors have actually applied.
+3. CASes `current.json`. Inside the CAS loop it refuses the deploy if the new manifest is incompatible with the deployed one (unless `--allow-breaking`). Migrations are compared against the deployed manifest, which is what actors have actually applied.
 
 Nodes poll `current.json` every 2s. Resident actors pick up the new code on
 their next call; pending migrations run inside that call's transaction.
+
+## Alarms
+
+The authoritative alarm is a row in the actor's own SQLite database
+(`_statex_alarm`: `at_ms`, `retry`, `epoch`, `seq`), so it is replicated and
+restored like any other state, and `alarms.set/clear` are transactional. The
+object store only holds **wake hints**, keys under `wake/<minute>/...` whose
+name encodes `at_ms`, the epoch and a sequence number. Ordering in the write
+path:
+
+1. After a transaction that changed the alarm, the node PUTs the new hint
+   **before** uploading the segment, so every durable alarm has a hint.
+2. After the ack it deletes the old hint (best effort; stale hints are harmless).
+
+Two mechanisms fire alarms:
+
+- **Timers.** Each node keeps an in-memory timer for its resident actors
+  (loaded at activation, updated after each committed change, dropped at
+  eviction or release) and invokes the internal `alarm` operation when due.
+- **Waker.** One node in the fleet holds the `fleet/waker.json` lease (CAS,
+  TTL = `--lease-ttl`). Every `wake_tick` it lists the current minute
+  prefixes, and every `wake_full_scan` (or after gaining the lease) all of
+  `wake/`. For each due hint it invokes the actor through the normal routing
+  path, which forwards to the owner or activates the actor elsewhere.
+
+Firing reads the row: if the alarm is not due (it was moved or cleared), nothing
+happens. Otherwise one transaction clears the row and runs the handler; if that
+fails, a second transaction re-arms it with backoff. The response reports the
+current hint name, and the waker deletes a hint that no longer matches (or whose
+actor was deleted). Because calls to an actor are serialized and the row
+decides, duplicate firings from a timer and the waker are harmless.
+
+## Actor-to-actor calls
+
+A caller imports generated client interfaces (`team:app/type`), whose functions
+take the actor key first and return `result<T, statex:host/actors.call-error>`.
+At instantiation the runtime links every such import dynamically
+(`calls::link`). When it is called, the runtime converts the arguments to JSON
+using the import's WIT signature, then calls the node's `ActorCaller`
+(`NodeCaller`). The node does the following:
+
+1. Builds an `Invocation` whose `chain` is the caller's chain plus the caller itself.
+2. Rejects the invocation with `508 cycle` if the target is already on the chain or the chain has 16 entries. Each actor on the chain holds its slot lock while waiting, so re-entering one would deadlock.
+3. Runs it through the normal `invoke` path: the local slot if this node owns the actor, otherwise a forward to the owner over the internal invoke endpoint, carrying the chain.
+4. Bounds the wait by the caller's remaining deadline. If it runs out, the caller gets `call-error::timeout`.
+
+The reply is mapped back to the typed result: `ok`, the callee's `err(E)`
+(HTTP 422) in the inner result, or one of the `call-error` cases. A mismatch
+between the callee's JSON and the caller's expected types becomes
+`incompatible`. The callee commits in its own transaction, independent of the
+caller's.
+
+Deploys check imports against callees in both directions (`call_mismatches`):
+a caller against the deployed callees, and a callee against the deployed
+callers listed in the manifest's `calls`.
 
 ## Runtime and sandbox
 
 - A wasmtime component model instance is created per resident actor.
 - Execution time is bounded using epoch interruption (`limits.timeout_ms`) and memory is capped (`limits.memory_mb`).
-- Imports are allowlisted to `statex:host/*` and WASI p2. Nothing is granted beyond that: no preopened directories, no environment and no sockets. Guest stdout and stderr go to the node log.
+- Imports are allowlisted to `statex:host/*`, WASI p2 and client interfaces of other apps (routed as actor calls). Nothing is granted beyond that: no preopened directories, no environment and no sockets. Guest stdout and stderr go to the node log.
 - Outbound HTTP goes through `statex:host/http-client` and is restricted to `[http] allow` hosts.
 - The guest `sql` interface rejects transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`, ...) as well as `ATTACH`, `VACUUM` and `PRAGMA`, because the host owns the transaction.

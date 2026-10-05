@@ -149,3 +149,41 @@ pub fn log(level: Level, msg: &str) {
     eprintln!("[{level:?}] {msg}");
     STATE.with(|s| s.borrow_mut().logs.push((level, msg.to_string())));
 }
+
+const ALARM_TABLE: &str = "CREATE TABLE IF NOT EXISTS _statex_alarm(
+    id INTEGER PRIMARY KEY CHECK (id = 0),
+    at_ms INTEGER,
+    retry INTEGER NOT NULL DEFAULT 0,
+    epoch INTEGER NOT NULL DEFAULT 0,
+    seq INTEGER NOT NULL DEFAULT 0)";
+
+pub(crate) fn read_alarm(c: &Connection) -> rusqlite::Result<Option<u64>> {
+    c.execute_batch(ALARM_TABLE)?;
+    c.query_row("SELECT at_ms FROM _statex_alarm WHERE id = 0", [], |r| r.get::<_, Option<i64>>(0))
+        .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })
+        .map(|v| v.map(|v| v as u64))
+}
+
+pub fn alarm_set(at_ms: u64) -> Result<()> {
+    let epoch = epoch();
+    with_conn(|c| {
+        c.execute_batch(ALARM_TABLE)?;
+        c.execute(
+            "INSERT INTO _statex_alarm(id, at_ms, retry, epoch, seq) VALUES(0, ?1, 0, ?2, 1)
+             ON CONFLICT(id) DO UPDATE SET at_ms = ?1, retry = 0, epoch = ?2, seq = seq + 1",
+            rusqlite::params![i64::try_from(at_ms).unwrap_or(i64::MAX), epoch as i64],
+        )
+        .map(|_| ())
+    })
+}
+
+pub fn alarm_get() -> Option<u64> {
+    with_conn(read_alarm).ok().flatten()
+}
+
+pub fn alarm_clear() {
+    let _ = with_conn(|c| {
+        c.execute_batch(ALARM_TABLE)?;
+        c.execute("UPDATE _statex_alarm SET at_ms = NULL, retry = 0 WHERE id = 0", []).map(|_| ())
+    });
+}

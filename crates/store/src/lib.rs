@@ -8,6 +8,7 @@
 mod azure;
 mod local;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -47,6 +48,13 @@ pub trait ObjectStore: Send + Sync + 'static {
     async fn put_if_absent(&self, key: &str, data: Bytes) -> Result<ETag>;
     /// Overwrite only if the current version matches `etag`.
     async fn put_if_match(&self, key: &str, data: Bytes, etag: &str) -> Result<ETag>;
+    /// Unconditional write of a local file's contents, streamed so memory use
+    /// stays bounded regardless of file size. The file must not change while
+    /// this runs.
+    async fn put_file(&self, key: &str, path: &Path) -> Result<ETag>;
+    /// Streams an object into a local file (created or truncated), without
+    /// buffering it in memory. Returns `false` if the object does not exist.
+    async fn get_to_file(&self, key: &str, path: &Path) -> Result<bool>;
     /// Lists keys with the given prefix, sorted lexicographically.
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     async fn delete(&self, key: &str) -> Result<()>;
@@ -147,5 +155,20 @@ mod tests {
         ));
         s.delete("a/c").await.unwrap();
         assert!(s.get("a/c").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_store_file_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = LocalFsStore::new(dir.path().join("store")).unwrap();
+        let src = dir.path().join("src.bin");
+        let data: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&src, &data).unwrap();
+        s.put_file("snap/x.db", &src).await.unwrap();
+        assert_eq!(&s.get("snap/x.db").await.unwrap().unwrap().data[..], &data[..]);
+        let dst = dir.path().join("dst.bin");
+        assert!(s.get_to_file("snap/x.db", &dst).await.unwrap());
+        assert_eq!(std::fs::read(&dst).unwrap(), data);
+        assert!(!s.get_to_file("snap/missing.db", &dst).await.unwrap());
     }
 }

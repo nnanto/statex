@@ -11,6 +11,12 @@ interface counter {
   checked-add: func(by: s64) -> result<s64, string>;
   /// Always fails with an exception (trap).
   boom: func();
+  /// Schedules a reminder (the alarm) `delay-ms` from now.
+  remind: func(delay-ms: u64);
+  /// How many reminders have fired.
+  reminders: func() -> s64;
+  /// The alarm handler: runs when the alarm is due (not a public method).
+  alarm: func(retry-count: u32);
 }
 
 /// TODO: describe the `profile` actor type.
@@ -26,6 +32,7 @@ world app {
   import statex:host/sql@0.1.0;
   import statex:host/http-client@0.1.0;
   import statex:host/log@0.1.0;
+  import statex:host/alarms@0.1.0;
 
   export counter;
   export profile;

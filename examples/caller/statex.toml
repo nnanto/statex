@@ -1,0 +1,17 @@
+# statex app manifest
+[app]
+name = "caller"
+
+[http]
+allow = []
+
+[limits]
+timeout_ms = 2000
+memory_mb = 64
+
+# Apps whose actors this app calls; `statex calls sync` generates their clients
+# into wit/deps/ and src/statex_calls.rs.
+[calls]
+apps = ["counter", "caller"]
+# Where to read callee source outside a workspace.
+paths = { counter = "../counter" }

@@ -3,7 +3,6 @@
     {
       "app": "demo/db",
       "lang": "python",
-      "owner": "demo",
       "path": "apps/demo/db",
       "types": [
         {
@@ -23,22 +22,29 @@
     },
     {
       "app": "demo/rustdemo",
+      "calls": [
+        {
+          "app": "demo/db",
+          "type": "kv"
+        }
+      ],
       "lang": "rust",
-      "owner": "demo",
       "path": "apps/demo/rustdemo",
       "types": [
         {
           "docs": "Each exported interface is an actor type; each function is a method.\nEvery key (e.g. \"alice\") is an independent actor with its own SQLite database.",
           "methods": [
             "increment(by: s64) -> s64",
-            "get() -> s64"
+            "get() -> s64",
+            "save() -> result<s64, string>",
+            "saved() -> result<option<string>, string>"
           ],
           "migrations": 1,
           "name": "counter"
         }
       ],
       "wit": "demo/rustdemo.wit",
-      "wit_sha256": "2f19c3f9ce3971340cab2dfa5581cffa561bd3eb76816af2ce59221df71aaa94"
+      "wit_sha256": "b70e11fcde7b52e7aff668febc0a3c4ae1bebdb51944d0c1bb508acbf26f1285"
     }
   ],
   "generated_by": "statex registry build; do not edit by hand"

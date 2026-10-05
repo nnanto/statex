@@ -1,0 +1,26 @@
+package example:pycaller@0.1.0;
+
+/// Calls actors of the `counter` example app (written in Rust), and other relays.
+interface relay {
+  /// Increments counter `key` of app counter by `by`; returns its new value.
+  bump: func(key: string, by: s64) -> result<s64, string>;
+  /// Deposits into account `key` of app counter. A refused deposit
+  /// (the callee's own `tx-error`) is reported as `refused: ...`.
+  deposit: func(key: string, amount: u64, memo: option<string>) -> result<u64, string>;
+  /// Calls `ping` on each relay of `path` in turn; returns the keys visited.
+  ping: func(path: list<string>) -> result<list<string>, string>;
+  /// Number of calls this relay has made that succeeded.
+  calls: func() -> u64;
+}
+
+world app {
+  import statex:host/context@0.1.0;
+  import statex:host/sql@0.1.0;
+  import statex:host/http-client@0.1.0;
+  import statex:host/log@0.1.0;
+  import statex:counter/counter;
+  import statex:counter/account;
+  import statex:pycaller/relay;
+
+  export relay;
+}

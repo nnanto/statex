@@ -1,0 +1,2 @@
+CREATE TABLE reminders (id INTEGER PRIMARY KEY CHECK (id = 0), n INTEGER NOT NULL);
+INSERT INTO reminders (id, n) VALUES (0, 0);

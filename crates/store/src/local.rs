@@ -60,13 +60,27 @@ impl LocalFsStore {
     }
 
     fn write_locked(&self, key: &str, data: &[u8]) -> anyhow::Result<ETag> {
+        self.write_locked_with(key, |f| Ok(f.write_all(data)?))
+    }
+
+    /// Writes a new version of `key` via a temp file filled by `fill`.
+    fn write_locked_with(
+        &self,
+        key: &str,
+        fill: impl FnOnce(&mut File) -> anyhow::Result<()>,
+    ) -> anyhow::Result<ETag> {
         let p = self.obj_path(key);
         fs::create_dir_all(p.parent().unwrap())?;
         let tmp = p.with_extension(format!("tmp-{:016x}", rand::random::<u64>()));
-        {
+        let res = (|| {
             let mut f = File::create(&tmp)?;
-            f.write_all(data)?;
+            fill(&mut f)?;
             f.sync_all()?;
+            Ok(())
+        })();
+        if let Err(e) = res {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
         let etag = format!("\"{:016x}\"", rand::random::<u64>());
         let m = self.meta_path(key);
@@ -152,6 +166,40 @@ impl ObjectStore for LocalFsStore {
         self.blocking(move |s| {
             let _l = s.lock(&key)?;
             Ok(s.write_locked(&key, &data)?)
+        })
+        .await
+    }
+
+    async fn put_file(&self, key: &str, path: &Path) -> Result<ETag> {
+        Self::validate(key)?;
+        let key = key.to_string();
+        let src = path.to_path_buf();
+        self.blocking(move |s| {
+            let _l = s.lock(&key)?;
+            Ok(s.write_locked_with(&key, |f| {
+                let mut r = File::open(&src).with_context(|| format!("open {}", src.display()))?;
+                std::io::copy(&mut r, f)?;
+                Ok(())
+            })?)
+        })
+        .await
+    }
+
+    async fn get_to_file(&self, key: &str, path: &Path) -> Result<bool> {
+        Self::validate(key)?;
+        let key = key.to_string();
+        let dst = path.to_path_buf();
+        self.blocking(move |s| {
+            let _l = s.lock(&key)?;
+            let mut r = match File::open(s.obj_path(&key)) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(StoreError::Other(e.into())),
+            };
+            let mut w = File::create(&dst).with_context(|| format!("create {}", dst.display()))?;
+            std::io::copy(&mut r, &mut w).map_err(anyhow::Error::from)?;
+            w.sync_all().map_err(anyhow::Error::from)?;
+            Ok(true)
         })
         .await
     }

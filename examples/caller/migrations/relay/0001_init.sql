@@ -1,0 +1,2 @@
+CREATE TABLE stats (id INTEGER PRIMARY KEY CHECK (id = 0), calls INTEGER NOT NULL);
+INSERT INTO stats (id, calls) VALUES (0, 0);

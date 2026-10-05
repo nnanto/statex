@@ -24,6 +24,10 @@ There is nothing to register: the WIT is the API. `POST
 /v1/apps/<app>/actors/<type>/<key>/<method>` calls `<method>` on actor `<key>`
 of `<type>`. The actor is created on first use.
 
+Actors can also schedule an **alarm**: the host calls their `alarm` handler at
+the given time, waking the actor on some node if it is not loaded (see the
+[developer guide](docs/developer-guide.md#8-alarms)).
+
 ## Quick start
 
 ```sh
@@ -53,15 +57,15 @@ statex deploy                              # from the project directory
 Teams add their apps to this repo. `statex new team/app` creates
 `apps/team/app`, linked to the host WIT and SDKs in this repo.
 `statex check --all --against origin/main` and `statex registry build --check`
-gate PRs (name/path consistency and breaking changes). The first
-deploy of an app claims it for its team, and incompatible deploys are refused.
+gate PRs (name/path consistency and breaking changes). Incompatible
+deploys are refused.
 See [Monorepo workspaces](docs/developer-guide.md#monorepo-workspaces).
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `wit/statex-host.wit` | The host contract (`context`, `sql`, `http-client`, `log`) |
+| `wit/statex-host.wit` | The host contract (`context`, `sql`, `http-client`, `log`, `actors`) |
 | `crates/store` | `ObjectStore` trait with conditional writes; local-fs and Azure Blob backends |
 | `crates/ltx` | WAL-frame capture, segment codec, restore planning |
 | `crates/runtime` | wasmtime host: WIT/JSON mapping, limits, host imports, compatibility rules |
@@ -70,15 +74,17 @@ See [Monorepo workspaces](docs/developer-guide.md#monorepo-workspaces).
 | `crates/cli` | The `statex` CLI and node binary: scaffolding, workspaces, `check`, registry, Python codegen |
 | `sdk/python` | Generic Python client runtime (also embedded in generated clients) |
 | `examples/counter` | Rust: two actor types, `counter` and `account` (records, enums, variants, results) |
+| `examples/caller` | Rust: typed calls to another app (`counter`) and its own actors, with native stubs |
+| `examples/python-caller` | Python: typed calls to a Rust app and between its own actors, tested with `statex test` stubs |
 | `examples/python-counter` | Python (componentize-py): `counter` and `profile` actor types |
-| `sdk/python-guest/statex.py` | Python guest helper; `statex new --lang python` vendors it into standalone projects and links it in workspaces |
+| `sdk/python-guest/` | Python guest helper (`statex.py`) and mock host for tests (`statex_testing.py`); `statex new --lang python` vendors them into standalone projects and links them in workspaces |
 | `apps/<team>/<app>` | Teams' apps; layout configured in `statex-workspace.toml` |
 | `registry/` | Generated index and WIT of every app (`statex registry build`) |
-| `scripts/e2e.sh` | End-to-end run: forwarding, crash takeover, generated client, ownership, monorepo checks |
+| `scripts/e2e.sh` | End-to-end run: forwarding, actor-to-actor calls, crash takeover, generated client, monorepo checks |
 
 ## Docs
 
-- [Developer guide](docs/developer-guide.md): writing, testing and calling actors
+- [Developer guide](docs/developer-guide.md): writing, testing and calling actors, including [from other actors](docs/developer-guide.md#7-call-other-actors)
 - [Architecture](docs/architecture.md): routing, leases, storage layout and the request path
 - [Guarantees](docs/guarantees.md): durability, fencing and failure semantics
 

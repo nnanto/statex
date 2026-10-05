@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -14,17 +14,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as J};
 use sha2::Sha256;
 use statex_ltx::segment_name;
-use statex_runtime::{resolve_method, AppCode, CallError, Runtime};
+use statex_runtime::{
+    resolve_method, ActorCaller, ActorRef, AppCode, CallError, CallFailure, CallReply, CallRequest, Runtime,
+};
 use statex_store::{get_json, to_json_bytes, DynStore, StoreError};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::actor::{self, Actor, Op};
 use crate::deploy;
-use crate::layout::{app_dir, now_ms, ActorId, MAX_KEY_LEN, PEER_AUTH};
+use crate::layout::{app_dir, now_ms, wake_key, ActorId, MAX_KEY_LEN, PEER_AUTH};
 use crate::lease::{Lease, NodeRecord};
 use crate::owner::{self, Acquire, OwnerRecord, OwnerState};
 
 pub const MAX_HOPS: u32 = 4;
+/// Longest chain of nested actor-to-actor calls.
+pub const MAX_CALL_DEPTH: usize = 16;
 pub const SIGNATURE_HEADER: &str = "x-statex-signature";
 
 #[derive(Clone)]
@@ -44,6 +48,11 @@ pub struct NodeConfig {
     pub snapshot_every: u64,
     /// Exit the process with status 3 when fenced (production behaviour).
     pub exit_on_fence: bool,
+    /// How often the waker node scans for due alarms of non-resident actors.
+    pub wake_tick: Duration,
+    /// How often the waker rescans all wake hints, picking up ones whose
+    /// earlier attempts failed.
+    pub wake_full_scan: Duration,
 }
 
 impl NodeConfig {
@@ -60,6 +69,8 @@ impl NodeConfig {
             deploy_poll: Duration::from_secs(2),
             snapshot_every: 64,
             exit_on_fence: false,
+            wake_tick: Duration::from_secs(1),
+            wake_full_scan: Duration::from_secs(30),
         }
     }
 }
@@ -73,6 +84,10 @@ pub struct Invocation {
     pub key: String,
     #[serde(flatten)]
     pub op: InvOp,
+    /// For calls made by actors: the actors executing up the call chain,
+    /// outermost first. Never set by the public API.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain: Vec<ActorRef>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +96,9 @@ pub enum InvOp {
     Call { method: String, #[serde(default)] args: J },
     Create,
     Delete,
+    /// Fire the actor's alarm if it is due (internal: issued by alarm timers
+    /// and the waker, never by the public API). Never creates the actor.
+    Alarm,
 }
 
 /// HTTP status + JSON body, identical whether produced locally or by a peer.
@@ -114,6 +132,55 @@ pub struct Node {
     actors: Mutex<HashMap<ActorId, Slot>>,
     secret: Vec<u8>,
     client: reqwest::Client,
+    caller: Arc<dyn ActorCaller>,
+    /// Due times of the alarms of resident actors (see `alarms.rs`).
+    pub(crate) timers: Mutex<HashMap<ActorId, u64>>,
+    pub(crate) timers_changed: tokio::sync::Notify,
+}
+
+/// Routes calls made by actors through [`Node::invoke`], exactly like calls
+/// arriving over HTTP.
+struct NodeCaller {
+    node: Weak<Node>,
+    rt: tokio::runtime::Handle,
+}
+
+impl ActorCaller for NodeCaller {
+    fn call(&self, req: CallRequest) -> CallReply {
+        let Some(node) = self.node.upgrade() else {
+            return CallReply::Failed(CallFailure::Unavailable("node is shutting down".into()));
+        };
+        let inv = Invocation {
+            app: req.target.app,
+            ty: req.target.actor_type,
+            key: req.target.key,
+            op: InvOp::Call { method: req.method, args: req.args },
+            chain: req.chain,
+        };
+        // Runs on the blocking thread executing the caller.
+        match self.rt.block_on(tokio::time::timeout(req.timeout, node.invoke(inv, 0))) {
+            Err(_) => CallReply::Failed(CallFailure::Timeout),
+            Ok(o) => reply_of(o),
+        }
+    }
+}
+
+/// Maps an HTTP-shaped outcome to a call reply.
+pub fn reply_of(o: Outcome) -> CallReply {
+    let err = &o.body["error"];
+    let msg = err["message"].as_str().unwrap_or_default().to_string();
+    if (200..300).contains(&o.status) {
+        return CallReply::Ok(o.body["result"].clone());
+    }
+    CallReply::Failed(match err["code"].as_str() {
+        Some("method_error") => return CallReply::MethodErr(err["detail"].clone()),
+        Some("not_found") => CallFailure::NotFound(msg),
+        Some("bad_request") => CallFailure::Incompatible(msg),
+        Some("trap") => CallFailure::Trap(msg),
+        // The variant already says "cycle"; keep only the path.
+        Some("cycle") => CallFailure::Cycle(msg.trim_start_matches("call cycle: ").to_string()),
+        _ => CallFailure::Unavailable(format!("{} {msg}", o.status)),
+    })
 }
 
 #[derive(Serialize, Deserialize)]
@@ -166,7 +233,9 @@ impl Node {
                 return Err(e);
             }
         };
-        let node = Arc::new(Node {
+        let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
+        let rt = tokio::runtime::Handle::current();
+        let node = Arc::new_cyclic(|me| Node {
             cfg,
             store,
             runtime,
@@ -175,7 +244,10 @@ impl Node {
             deployed: Default::default(),
             actors: Default::default(),
             secret,
-            client: reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?,
+            client,
+            caller: Arc::new(NodeCaller { node: me.clone(), rt }),
+            timers: Default::default(),
+            timers_changed: Default::default(),
         });
         if let Err(e) = node.refresh_apps().await {
             renew.abort();
@@ -282,17 +354,28 @@ impl Node {
             return Done(Outcome::err(400, "bad_request", format!("actor key must be 1..={MAX_KEY_LEN} bytes")));
         }
         let id = ActorId { app: inv.app.clone(), ty: inv.ty.clone(), key: inv.key.clone() };
+        // The actors on the chain hold their slot locks while waiting for this
+        // call, so calling back into one of them would deadlock.
+        if inv.chain.iter().any(|a| a.app == id.app && a.actor_type == id.ty && a.key == id.key) {
+            let path: Vec<String> = inv.chain.iter().map(|a| a.to_string()).collect();
+            return Done(Outcome::err(508, "cycle", format!("call cycle: {} -> {id}", path.join(" -> "))));
+        }
+        if inv.chain.len() >= MAX_CALL_DEPTH {
+            return Done(Outcome::err(508, "cycle", format!("call chain deeper than {MAX_CALL_DEPTH}")));
+        }
         let slot = self.slot(&id);
         let mut guard = slot.clone().lock_owned().await;
         let mut created = false;
         if guard.is_none() {
-            if matches!(inv.op, InvOp::Delete) {
+            if matches!(inv.op, InvOp::Delete | InvOp::Alarm) {
                 match owner::read(&self.store, &id).await {
                     Ok(Some((r, _))) if r.state != OwnerState::Deleted => {}
                     Ok(_) => {
                         drop(guard);
                         self.drop_slot_if_empty(&id);
-                        return Done(Outcome::err(404, "not_found", format!("actor {id} does not exist")));
+                        // `gone` tells the waker the actor no longer exists.
+                        let code = if matches!(inv.op, InvOp::Alarm) { "gone" } else { "not_found" };
+                        return Done(Outcome::err(404, code, format!("actor {id} does not exist")));
                     }
                     Err(e) => return Again(format!("read owner: {e}")),
                 }
@@ -318,8 +401,10 @@ impl Node {
                 }
                 Ok(Acquire::Acquired { epoch, etag, fresh }) => {
                     match actor::activate(&self.store, &self.cfg.data_dir, &id, epoch, etag, fresh, code.clone()).await {
-                        Ok(c) => {
+                        Ok(mut c) => {
+                            c.caller = Some(self.caller.clone());
                             tracing::info!(actor = %id, epoch, "activated");
+                            self.set_timer(&id, c.alarm.map(|a| a.at_ms));
                             *guard = Some(c);
                             created = true;
                         }
@@ -337,7 +422,10 @@ impl Node {
                 debug_assert!(created);
                 Op::Touch
             }
-            InvOp::Call { method, args } => Op::Call { method: method.clone(), args: args.clone() },
+            InvOp::Call { method, args } => {
+                Op::Call { method: method.clone(), args: args.clone(), chain: inv.chain.clone() }
+            }
+            InvOp::Alarm => Op::Alarm { now_ms: now_ms() },
         };
         Done(self.run(guard, &id, code, op, matches!(inv.op, InvOp::Create)).await)
     }
@@ -361,9 +449,19 @@ impl Node {
             Ok(x) => x,
             Err(e) => {
                 *guard = None;
+                self.set_timer(id, None);
                 return Outcome::err(500, "internal", format!("{e:#}"));
             }
         };
+        // A new alarm's wake hint is written before the transaction becomes
+        // durable, so a durable alarm always has one.
+        if let Some(a) = executed.alarm.and_then(|c| c.after) {
+            if let Err(e) = self.store.put(&wake_key(id, &a), to_json_bytes(&json!({ "at_ms": a.at_ms }))).await {
+                *guard = None;
+                self.set_timer(id, None);
+                return Outcome::unavailable(format!("write was not made durable ({e}); it did not apply"));
+            }
+        }
         if let Some(seg) = executed.segment {
             // Actor is not Sync: copy what we need before awaiting.
             let (epoch, txid, snapshot_txid) = {
@@ -373,6 +471,7 @@ impl Node {
             let key = format!("{}{}", id.epoch_prefix(epoch), segment_name(seg.txid));
             if let Err(e) = self.store.put(&key, Bytes::from(seg.encode())).await {
                 *guard = None;
+                self.set_timer(id, None);
                 return Outcome::unavailable(format!("write was not made durable ({e}); it may or may not have applied"));
             }
             let owned = self.lease.valid()
@@ -380,7 +479,19 @@ impl Node {
             if !owned {
                 tracing::warn!(actor = %id, epoch, "lost ownership; not acknowledging");
                 *guard = None;
+                self.set_timer(id, None);
                 return Outcome::unavailable("actor ownership moved; write not acknowledged");
+            }
+            if let Some(change) = executed.alarm {
+                self.set_timer(id, change.after.map(|a| a.at_ms));
+                if let Some(old) = change.before {
+                    let (store, key) = (self.store.clone(), wake_key(id, &old));
+                    tokio::spawn(async move {
+                        if let Err(e) = store.delete(&key).await {
+                            tracing::debug!("delete stale wake hint {key}: {e}");
+                        }
+                    });
+                }
             }
             if txid - snapshot_txid >= self.cfg.snapshot_every {
                 let store = self.store.clone();
@@ -393,7 +504,9 @@ impl Node {
                     .await
                     .expect("snapshot task");
                     match res {
-                        Some(Ok((epoch, txid, image))) => match actor::compact(&store, &id, epoch, txid, image).await {
+                        // `guard` stays held until the upload is done, which
+                        // keeps the snapshot file unchanged.
+                        Some(Ok((epoch, txid, image))) => match actor::compact(&store, &id, epoch, txid, &image).await {
                             Ok(()) => {
                                 if let Some(c) = guard.as_mut() {
                                     c.snapshot_txid = txid;
@@ -435,6 +548,10 @@ impl Node {
             Ok(true) => {}
             Ok(false) => return Outcome::unavailable("actor ownership moved; retry"),
             Err(e) => return Outcome::unavailable(format!("delete failed: {e}")),
+        }
+        self.set_timer(id, None);
+        if let Some(a) = actor.alarm {
+            let _ = self.store.delete(&wake_key(id, &a)).await;
         }
         drop(actor);
         let prefix = id.ltx_prefix();
@@ -493,6 +610,8 @@ impl Node {
             let Ok(mut g) = slot.clone().try_lock_owned() else { continue };
             if g.as_ref().is_some_and(|c| c.last_used.elapsed() >= idle) {
                 let c = g.take().unwrap();
+                // The waker fires its alarm from now on.
+                self.set_timer(&id, None);
                 match owner::release(&self.store, &id, &self.me(), c.epoch, &c.owner_etag, OwnerState::Unowned).await {
                     Ok(_) => tracing::info!(actor = %id, "released"),
                     Err(e) => tracing::warn!(actor = %id, "release failed: {e}"),
@@ -511,6 +630,7 @@ impl Node {
 
     /// Drops all resident actors without touching the store (after fencing).
     pub fn drop_all(&self) {
+        self.timers.lock().unwrap().clear();
         let slots: Vec<Slot> = self.actors.lock().unwrap().drain().map(|(_, v)| v).collect();
         for s in slots {
             if let Ok(mut g) = s.try_lock() {

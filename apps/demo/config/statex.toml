@@ -1,0 +1,23 @@
+# statex app manifest
+[app]
+name = "demo/config"
+# Owner defaults to the namespace ("demo"); deploys by other owners are refused.
+# owner = "demo"
+
+# Hosts the http-client interface may call: "api.example.com", "*.example.com" or "*".
+[http]
+allow = []
+
+[limits]
+timeout_ms = 5000
+memory_mb = 64
+
+# Python actors are compiled to a WebAssembly component with componentize-py
+# (pip install componentize-py==0.25.1, or let uvx fetch it).
+[build]
+command = "uvx --python 3.12 --from componentize-py==0.25.1 componentize-py -d wit -w app componentize -p . -p ../../../sdk/python-guest app -o app.wasm"
+wasm = "app.wasm"
+
+[calls]
+# Apps whose actors this app calls; `statex calls sync` generates their clients.
+apps = ["demo/db"]

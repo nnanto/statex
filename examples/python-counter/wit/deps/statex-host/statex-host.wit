@@ -54,6 +54,53 @@ interface http-client {
   send: func(req: request) -> result<response, string>;
 }
 
+/// Calls to other actors (in this app or any other deployed app).
+///
+/// A caller imports a generated *client interface* per callee actor type
+/// (`statex calls sync`): for app `team/app` the package is `team:app`, for a
+/// single-segment app `shop` it is `statex:shop`. Each callee method
+/// `m(p...) -> t` is imported as `m(actor: string, p...) -> result<t, call-error>`.
+/// The callee runs in its own transaction, which commits independently of the
+/// caller's.
+interface actors {
+  variant call-error {
+    /// The callee app, actor type or method does not exist.
+    not-found(string),
+    /// The callee rejected the arguments or returned a value that does not
+    /// match the caller's client interface (the callee was redeployed with a
+    /// different signature).
+    incompatible(string),
+    /// The callee trapped (panic, timeout, out of memory); its transaction was rolled back.
+    trap(string),
+    /// Ownership could not be established or confirmed. The outcome of a write is unknown.
+    unavailable(string),
+    /// The callee is already executing further up this call chain (A -> B -> A).
+    cycle(string),
+    /// The caller's time budget ran out before the callee answered. The outcome is unknown.
+    timeout,
+  }
+}
+
+/// The actor's alarm: at most one scheduled wake-up per actor, stored in its
+/// database. When it is due, the host calls the actor type's alarm handler
+/// (`alarm: func(retry-count: u32)`, exported next to its methods), activating
+/// the actor if needed. Delivery is at-least-once: the handler runs in its own
+/// transaction, and if it traps or returns `err` the alarm is retried with
+/// backoff (`retry-count` counts the failed attempts).
+///
+/// Setting and clearing are part of the calling method's transaction: they
+/// take effect only if it commits.
+interface alarms {
+  /// Schedules the alarm for `at-ms` (Unix time, milliseconds), replacing any
+  /// earlier one. A time in the past fires as soon as possible. Fails if the
+  /// actor type exports no alarm handler.
+  set: func(at-ms: u64) -> result<_, string>;
+  /// When the alarm is scheduled, if it is.
+  get: func() -> option<u64>;
+  /// Cancels the alarm, if any.
+  clear: func();
+}
+
 interface log {
   enum level { trace, debug, info, warn, error }
   log: func(level: level, msg: string);
@@ -65,4 +112,6 @@ world imports {
   import sql;
   import http-client;
   import log;
+  import actors;
+  import alarms;
 }

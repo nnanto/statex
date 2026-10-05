@@ -1,4 +1,4 @@
-use statex_guest::{log, params, sql};
+use statex_guest::{alarm, log, params, sql};
 
 wit_bindgen::generate!({
     path: "wit",
@@ -23,6 +23,33 @@ impl counter::Guest for App {
 
     fn reset() {
         sql::execute("UPDATE counter SET value = 0 WHERE id = 0", &[]).unwrap();
+    }
+
+    fn schedule(delay_ms: u64, fail_times: u32) {
+        sql::execute("UPDATE alarm_demo SET fail_times = ?1 WHERE id = 0", params![fail_times]).unwrap();
+        alarm::set_in(std::time::Duration::from_millis(delay_ms)).unwrap();
+    }
+
+    fn cancel() {
+        alarm::clear();
+    }
+
+    fn alarm_at() -> Option<u64> {
+        alarm::get()
+    }
+
+    fn fired() -> i64 {
+        sql::query_scalar("SELECT fired FROM alarm_demo WHERE id = 0", &[]).unwrap().unwrap_or(0)
+    }
+
+    fn alarm(retry_count: u32) -> Result<(), String> {
+        let fail_times: u32 = sql::query_scalar("SELECT fail_times FROM alarm_demo WHERE id = 0", &[]).unwrap().unwrap_or(0);
+        if retry_count < fail_times {
+            return Err(format!("planned failure {} of {fail_times}", retry_count + 1));
+        }
+        sql::execute("UPDATE alarm_demo SET fired = fired + 1 WHERE id = 0", &[]).unwrap();
+        log::info(&format!("alarm fired (after {retry_count} failed attempts)"));
+        Ok(())
     }
 }
 
@@ -103,6 +130,18 @@ mod tests {
         assert_eq!(call("counter", "bob", App::get), 0);
         call("counter", "alice", App::reset);
         assert_eq!(call("counter", "alice", App::get), 0);
+    }
+
+    #[test]
+    fn alarm_schedules_and_fires() {
+        call("counter", "t", || App::schedule(60_000, 1));
+        let at = statex_guest::testing::alarm("counter", "t").unwrap();
+        assert_eq!(call("counter", "t", App::alarm_at), Some(at));
+        assert!(try_call("counter", "t", || App::alarm(0)).is_err());
+        assert_eq!(try_call("counter", "t", || App::alarm(1)), Ok(()));
+        assert_eq!(call("counter", "t", App::fired), 1);
+        call("counter", "t", App::cancel);
+        assert_eq!(statex_guest::testing::alarm("counter", "t"), None);
     }
 
     #[test]

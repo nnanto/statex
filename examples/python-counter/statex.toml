@@ -1,8 +1,6 @@
 # statex app manifest
 [app]
 name = "pycounter"
-# Team that owns this app name in the cluster; deploys by other owners are refused.
-owner = "examples"
 
 # Hosts the http-client interface may call: "api.example.com", "*.example.com" or "*".
 [http]

@@ -9,7 +9,14 @@
 //! actors/<app>/<type>/<key>/owner.json       ownership record + epoch (CAS)
 //! actors/<app>/<type>/<key>/ltx/e<epoch>/snapshot-<txid>.db
 //! actors/<app>/<type>/<key>/ltx/e<epoch>/<txid>.ltx
+//! fleet/waker.json                          lease of the node scanning wake/
+//! wake/<minute>/<app>/<type>/<key>/<at_ms>-<epoch>-<seq>   alarm wake hint
 //! ```
+//!
+//! Wake hints index scheduled alarms by Unix minute (10 digits, so keys sort
+//! by time). They are only hints: the alarm row in the actor's database is
+//! authoritative, and a hint naming an alarm that is no longer scheduled is
+//! deleted when it is found.
 //!
 //! `<app>` is the app's storage name (see [`app_dir`]): a namespaced app
 //! `payments/shop` is stored as `payments.shop`, so every app is exactly one
@@ -18,6 +25,8 @@
 use std::fmt;
 
 pub const PEER_AUTH: &str = "fleet/peer-auth.json";
+pub const WAKER: &str = "fleet/waker.json";
+pub const WAKE_PREFIX: &str = "wake/";
 pub const MAX_KEY_LEN: usize = 512;
 
 /// Identity of an actor.
@@ -110,6 +119,57 @@ pub fn deploy_object(app: &str, sha: &str, name: &str) -> String {
     format!("deploy/{}/{sha}/{name}", app_dir(app))
 }
 
+/// Identity of one alarm installation, as named in its wake hint.
+pub fn wake_name(a: &statex_runtime::alarm::Alarm) -> String {
+    format!("{:015}-{:016x}-{:016x}", a.at_ms, a.epoch, a.seq)
+}
+
+/// Prefix of the wake hints due in Unix minute `minute`.
+pub fn wake_minute_prefix(minute: u64) -> String {
+    format!("{WAKE_PREFIX}{minute:010}/")
+}
+
+/// Key of the wake hint for alarm `a` of actor `id`.
+pub fn wake_key(id: &ActorId, a: &statex_runtime::alarm::Alarm) -> String {
+    format!(
+        "{}{}/{}/{}/{}",
+        wake_minute_prefix(a.at_ms / 60_000),
+        app_dir(&id.app),
+        id.ty,
+        enc(&id.key),
+        wake_name(a)
+    )
+}
+
+/// A parsed wake hint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WakeEntry {
+    pub id: ActorId,
+    pub at_ms: u64,
+    pub epoch: u64,
+    /// The alarm installation it names (see [`wake_name`]).
+    pub name: String,
+}
+
+pub fn parse_wake(key: &str) -> Option<WakeEntry> {
+    let rest = key.strip_prefix(WAKE_PREFIX)?;
+    let mut parts = rest.split('/');
+    let (_minute, app, ty, k, name) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut f = name.split('-');
+    let at_ms = f.next()?.parse().ok()?;
+    let epoch = u64::from_str_radix(f.next()?, 16).ok()?;
+    u64::from_str_radix(f.next()?, 16).ok()?;
+    Some(WakeEntry {
+        id: ActorId { app: app.replace('.', "/"), ty: ty.to_string(), key: dec(k)? },
+        at_ms,
+        epoch,
+        name: name.to_string(),
+    })
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
@@ -128,5 +188,16 @@ mod tests {
         assert_eq!(id.owner_key(), "actors/payments.shop/cart/a%2Fb/owner.json");
         assert_eq!(deploy_current("payments/shop"), "deploy/payments.shop/current.json");
         assert_eq!(parse_ltx("e0000000003/snapshot-0000000000000007.db"), Some((3, statex_ltx::LogEntry::Snapshot(7))));
+    }
+
+    #[test]
+    fn wake_keys() {
+        let id = ActorId { app: "payments/shop".into(), ty: "cart".into(), key: "a/b".into() };
+        let a = statex_runtime::alarm::Alarm { at_ms: 120_500, retry: 0, epoch: 3, seq: 10 };
+        let k = wake_key(&id, &a);
+        assert_eq!(k, "wake/0000000002/payments.shop/cart/a%2Fb/000000000120500-0000000000000003-000000000000000a");
+        let e = parse_wake(&k).unwrap();
+        assert_eq!((e.id, e.at_ms, e.epoch, e.name), (id, 120_500, 3, wake_name(&a)));
+        assert_eq!(parse_wake("wake/0000000002/x"), None);
     }
 }

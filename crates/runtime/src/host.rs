@@ -1,7 +1,7 @@
 //! Host implementations of the `statex:host` interfaces.
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::types::Value as RV;
 use rusqlite::Connection;
@@ -9,6 +9,7 @@ use wasmtime::component::ResourceTable;
 use wasmtime::StoreLimits;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
+use crate::calls::{ActorCaller, ActorRef};
 use crate::manifest::HttpPolicy;
 
 wasmtime::component::bindgen!({
@@ -16,7 +17,7 @@ wasmtime::component::bindgen!({
     world: "imports",
 });
 
-use statex::host::{context, http_client, log, sql};
+use statex::host::{actors, alarms, context, http_client, log, sql};
 
 /// Identity of the executing actor, exposed through `statex:host/context`.
 #[derive(Debug, Clone)]
@@ -36,7 +37,17 @@ pub struct HostState {
     pub db: Arc<Mutex<Connection>>,
     pub(crate) http: HttpPolicy,
     pub(crate) http_timeout: Duration,
+    /// Routes actor-to-actor calls; `None` where calls are unavailable.
+    pub(crate) caller: Option<Arc<dyn ActorCaller>>,
+    /// Call chain of the running method, ending with this actor.
+    pub(crate) chain: Vec<ActorRef>,
+    /// When the running method times out.
+    pub(crate) deadline: Option<Instant>,
+    /// Whether the actor type exports an alarm handler.
+    pub(crate) has_alarm: bool,
 }
+
+impl actors::Host for HostState {}
 
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -56,6 +67,31 @@ impl context::Host for HostState {
     }
     fn epoch(&mut self) -> u64 {
         self.identity.epoch
+    }
+}
+
+impl alarms::Host for HostState {
+    fn set(&mut self, at_ms: u64) -> Result<(), String> {
+        if !self.has_alarm {
+            return Err(format!(
+                "actor type {} has no alarm handler; export `alarm: func(retry-count: u32);` in its interface",
+                self.identity.actor_type
+            ));
+        }
+        let db = self.db.lock().unwrap();
+        crate::alarm::set(&db, at_ms, self.identity.epoch).map_err(|e| e.to_string())
+    }
+
+    fn get(&mut self) -> Option<u64> {
+        let db = self.db.lock().unwrap();
+        crate::alarm::read(&db).ok().flatten().map(|a| a.at_ms)
+    }
+
+    fn clear(&mut self) {
+        let db = self.db.lock().unwrap();
+        if let Err(e) = crate::alarm::clear(&db) {
+            tracing::warn!("clear alarm: {e}");
+        }
     }
 }
 
@@ -209,6 +245,31 @@ mod tests {
         assert!(!host_allowed(&p, "corp.test.evil.com"));
         assert!(!host_allowed(&p, "example.com"));
         assert_eq!(url_host("https://u:p@a.corp.test:8443/x?y").as_deref(), Some("a.corp.test"));
+    }
+
+    #[test]
+    fn alarm_set_requires_a_handler() {
+        let mut s = HostState {
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
+            table: Default::default(),
+            limits: Default::default(),
+            identity: ActorIdentity { app: "a".into(), actor_type: "t".into(), key: "k".into(), epoch: 2 },
+            db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
+            http: HttpPolicy { allow: vec![] },
+            http_timeout: Duration::from_secs(1),
+            caller: None,
+            chain: vec![],
+            deadline: None,
+            has_alarm: false,
+        };
+        let e = alarms::Host::set(&mut s, 10).unwrap_err();
+        assert!(e.contains("no alarm handler"), "{e}");
+        assert_eq!(alarms::Host::get(&mut s), None);
+        s.has_alarm = true;
+        alarms::Host::set(&mut s, 10).unwrap();
+        assert_eq!(alarms::Host::get(&mut s), Some(10));
+        alarms::Host::clear(&mut s);
+        assert_eq!(alarms::Host::get(&mut s), None);
     }
 
     #[test]

@@ -1,12 +1,9 @@
 //! App deployments: content-addressed component + manifest, and a CAS'd
 //! `current.json` pointer that nodes poll.
 //!
-//! `current.json` also records the app's owner. The first deploy of an app
-//! claims it (create-if-absent), and later deploys by a different owner are
-//! refused unless they explicitly take over. Because the claim lives in the
-//! same CAS'd record as the version pointer, two teams racing to deploy the
-//! same new name cannot both win. Every deploy is also checked for breaking
-//! changes against the version it replaces (see `statex_runtime::compat`).
+//! Every deploy is checked for breaking changes against the version it
+//! replaces (see `statex_runtime::compat`). Who may deploy an app is decided
+//! by write access to `deploy/` in the store, not by statex.
 
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
@@ -26,60 +23,95 @@ pub struct Current {
     /// Increments on every deploy.
     pub version: u64,
     pub deployed_at_ms: u64,
-    /// Team or principal that owns the app name. Empty for records written
-    /// before ownership existed; the next deploy claims them.
-    #[serde(default)]
-    pub owner: String,
 }
 
-/// How a deploy treats ownership and compatibility.
+/// How a deploy treats compatibility.
 #[derive(Debug, Clone, Default)]
 pub struct DeployOptions {
-    /// Who is deploying (a team, e.g. `payments`).
-    pub owner: String,
-    /// Transfer the app to `owner` if someone else owns it.
-    pub take_over: bool,
     /// Deploy even if the new version breaks clients or existing actors.
     pub allow_breaking: bool,
-}
-
-impl DeployOptions {
-    pub fn new(owner: impl Into<String>) -> Self {
-        Self { owner: owner.into(), ..Default::default() }
-    }
+    /// Deploy even if actor types this app calls are not deployed or do not
+    /// match its client interfaces.
+    pub allow_unresolved_calls: bool,
 }
 
 /// Why a deploy was refused.
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
-    #[error("app {app:?} is owned by {owner:?}; you are deploying as {you:?}. Pick another app name, or pass --take-over if the app really moved to you")]
-    NotOwner { app: String, owner: String, you: String },
     #[error("deploy of {app:?} has breaking changes against the deployed version {version}:\n  - {}\nKeep the old surface (add new methods or types instead), or pass --allow-breaking", changes.join("\n  - "))]
     Breaking { app: String, version: u64, changes: Vec<String> },
+    #[error("deploy of {app:?} calls actor types that are not deployed or do not match its client interfaces:\n  - {}\nDeploy the callees first, or regenerate the client interfaces (`statex calls sync`); pass --allow-unresolved-calls to deploy anyway", problems.join("\n  - "))]
+    UnresolvedCalls { app: String, problems: Vec<String> },
+}
+
+/// Checks `manifest`'s client interfaces against the deployed callees (or
+/// `manifest` itself for calls within the app).
+pub async fn unresolved_calls(store: &DynStore, manifest: &Manifest) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut callees: std::collections::BTreeMap<&str, Option<Manifest>> = Default::default();
+    for c in &manifest.calls {
+        if c.app == manifest.app {
+            out.extend(statex_runtime::call_mismatches(c, manifest).into_iter().map(|p| format!("{}: {p}", c.import)));
+            continue;
+        }
+        if !callees.contains_key(c.app.as_str()) {
+            let m = match get_json::<Current>(&**store, &deploy_current(&c.app)).await? {
+                Some((cur, _)) => Some(fetch_manifest(store, &cur).await?),
+                None => None,
+            };
+            callees.insert(&c.app, m);
+        }
+        match &callees[c.app.as_str()] {
+            None => out.push(format!("{}: app {} is not deployed", c.import, c.app)),
+            Some(m) => out.extend(statex_runtime::call_mismatches(c, m).into_iter().map(|p| format!("{}: {p}", c.import))),
+        }
+    }
+    Ok(out)
+}
+
+/// Deployed apps whose client interfaces of `manifest.app` would no longer
+/// match if `manifest` were deployed.
+pub async fn broken_callers(store: &DynStore, manifest: &Manifest) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for cur in list(store).await? {
+        if cur.app == manifest.app {
+            continue;
+        }
+        let caller = fetch_manifest(store, &cur).await?;
+        for c in caller.calls.iter().filter(|c| c.app == manifest.app) {
+            for p in statex_runtime::call_mismatches(c, manifest) {
+                out.push(format!("deployed caller {} ({}): {p}", cur.app, c.import));
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Uploads a version and makes it current. Idempotent for the same binary.
 pub async fn deploy(store: &DynStore, wasm: &[u8], manifest: &Manifest, opts: &DeployOptions) -> Result<Current> {
-    anyhow::ensure!(!opts.owner.is_empty(), "deploy owner must not be empty");
     let (app, sha) = (&manifest.app, &manifest.sha256);
     anyhow::ensure!(statex_runtime::sha256_hex(wasm) == *sha, "manifest sha256 does not match component");
     let manifest_bytes = to_json_bytes(manifest);
     let id = statex_runtime::sha256_hex(&[sha.as_bytes(), &manifest_bytes[..]].concat())[..32].to_string();
+    if !opts.allow_unresolved_calls {
+        let problems = unresolved_calls(store, manifest).await?;
+        if !problems.is_empty() {
+            return Err(DeployError::UnresolvedCalls { app: app.clone(), problems }.into());
+        }
+    }
     store.put(&deploy_object(app, &id, "component.wasm"), Bytes::copy_from_slice(wasm)).await?;
     store.put(&deploy_object(app, &id, "manifest.json"), manifest_bytes).await?;
     let key = deploy_current(app);
     loop {
         let old = get_json::<Current>(&**store, &key).await?;
         if let Some((c, _)) = &old {
-            if !c.owner.is_empty() && c.owner != opts.owner && !opts.take_over {
-                return Err(DeployError::NotOwner { app: app.clone(), owner: c.owner.clone(), you: opts.owner.clone() }.into());
-            }
-            if c.id == id && c.owner == opts.owner {
+            if c.id == id {
                 return Ok(c.clone());
             }
-            if c.id != id && !opts.allow_breaking {
+            if !opts.allow_breaking {
                 let (_, prev) = fetch(store, c).await?;
-                let changes = statex_runtime::breaking_changes((&prev).into(), manifest.into());
+                let mut changes = statex_runtime::breaking_changes((&prev).into(), manifest.into());
+                changes.extend(broken_callers(store, manifest).await?);
                 if !changes.is_empty() {
                     return Err(DeployError::Breaking { app: app.clone(), version: c.version, changes }.into());
                 }
@@ -91,7 +123,6 @@ pub async fn deploy(store: &DynStore, wasm: &[u8], manifest: &Manifest, opts: &D
             sha256: sha.clone(),
             version: old.as_ref().map_or(1, |(c, _)| c.version + 1),
             deployed_at_ms: now_ms(),
-            owner: opts.owner.clone(),
         };
         let res = match &old {
             None => store.put_if_absent(&key, to_json_bytes(&cur)).await,
@@ -128,6 +159,15 @@ pub async fn history(store: &DynStore, app: &str) -> Result<Vec<Manifest>> {
         }
     }
     Ok(out)
+}
+
+/// The manifest of a deployment, without downloading its component.
+pub async fn fetch_manifest(store: &DynStore, cur: &Current) -> Result<Manifest> {
+    let (m, _) = get_json::<Manifest>(&**store, &deploy_object(&cur.app, &cur.id, "manifest.json"))
+        .await?
+        .ok_or_else(|| anyhow!("missing manifest for {}@{}", cur.app, cur.id))?;
+    anyhow::ensure!(m.sha256 == cur.sha256, "manifest checksum mismatch for {}@{}", cur.app, cur.id);
+    Ok(m)
 }
 
 pub async fn fetch(store: &DynStore, cur: &Current) -> Result<(Vec<u8>, Manifest)> {

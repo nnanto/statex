@@ -1,8 +1,10 @@
 //! `statex`: developer CLI and node binary.
 
+mod calls;
 mod check;
 mod codegen;
 mod project;
+mod python;
 mod registry;
 mod scaffold;
 mod workspace;
@@ -53,6 +55,13 @@ enum Cmd {
     AddActor { name: String },
     /// Build the component (cargo build --release --target wasm32-wasip2).
     Build,
+    /// Run the unit tests against the mock host: pytest for Python projects
+    /// (after refreshing the typed bindings in .statex/bindings), cargo test for Rust.
+    Test {
+        /// Extra arguments for pytest / cargo test.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Build and verify: WIT exports, allowed imports, migrations and instantiation.
     Verify {
         /// Verify an existing component instead of building the project.
@@ -77,17 +86,13 @@ enum Cmd {
         wasm: Option<PathBuf>,
         #[arg(long, requires = "wasm")]
         manifest: Option<PathBuf>,
-        /// Team deploying. The first deploy of an app claims its name for this
-        /// owner; later deploys by other owners are refused. Defaults to
-        /// `[app] owner` in statex.toml, else the namespace of `team/app`.
-        #[arg(long, env = "STATEX_OWNER")]
-        owner: Option<String>,
-        /// Transfer the app to --owner if another team owns it.
-        #[arg(long)]
-        take_over: bool,
         /// Deploy even if it breaks the deployed version's clients or migrations.
         #[arg(long)]
         allow_breaking: bool,
+        /// Deploy even if apps this app calls are not deployed or do not match
+        /// its client interfaces (those calls fail until they do).
+        #[arg(long)]
+        allow_unresolved_calls: bool,
     },
     /// Pre-merge checks: app name matches its path, WIT and migrations are
     /// consistent, and (with --against) nothing breaks.
@@ -184,6 +189,12 @@ enum Cmd {
         #[arg(long, env = "STATEX_STORE")]
         store: String,
     },
+    /// Typed calls to other actors: client interfaces of the apps listed under
+    /// `[calls] apps` in statex.toml.
+    Calls {
+        #[command(subcommand)]
+        cmd: CallsCmd,
+    },
     /// Generate a typed client SDK.
     Codegen {
         #[command(subcommand)]
@@ -199,6 +210,26 @@ enum WorkspaceCmd {
         /// sdk/python-guest (defaults to the one this CLI was built from).
         #[arg(long)]
         statex: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CallsCmd {
+    /// Add apps to `[calls] apps` and generate their client interfaces.
+    Add {
+        /// Callee apps, e.g. `payments/ledger` (the project's own app works too).
+        #[arg(required = true)]
+        apps: Vec<String>,
+        /// Read callee schemas not found in the workspace from a running node.
+        #[arg(long)]
+        from_url: Option<String>,
+    },
+    /// (Re)generate wit/deps/<ns>-<app>/client.wit for every `[calls]` app,
+    /// plus src/statex_calls.rs in Rust projects.
+    Sync {
+        /// Read callee schemas not found in the workspace from a running node.
+        #[arg(long)]
+        from_url: Option<String>,
     },
 }
 
@@ -283,7 +314,11 @@ async fn run(cli: Cli) -> Result<()> {
             }
             if lang == "python" {
                 scaffold::new_python_project(&name, &dir, &actor, ws.as_ref())?;
-                println!("created {}\n\nnext:\n  cd {}\n  statex verify     # builds with componentize-py and checks the component\n  statex dev        # local server with hot reload\n  statex call {actor} alice increment '{{\"by\": 1}}'", dir.display(), dir.display());
+                // Best effort: typed bindings for editors right away.
+                if let Err(e) = Project::find(&dir).and_then(|p| python::bindings(&p, true)) {
+                    eprintln!("warning: could not generate {}: {e:#}", python::BINDINGS);
+                }
+                println!("created {}\n\nnext:\n  cd {}\n  statex test       # unit tests against the mock host\n  statex verify     # builds with componentize-py and checks the component\n  statex dev        # local server with hot reload\n  statex call {actor} alice increment '{{\"by\": 1}}'", dir.display(), dir.display());
             } else {
                 scaffold::new_project(&name, &dir, &actor, sdk, ws.as_ref())?;
                 println!("created {}\n\nnext:\n  cd {}\n  cargo test        # unit tests against the mock host\n  statex dev        # local server with hot reload\n  statex call {actor} alice increment '{{\"by\": 1}}'", dir.display(), dir.display());
@@ -295,8 +330,14 @@ async fn run(cli: Cli) -> Result<()> {
             let code = if p.root.join("app.py").exists() { "app.py" } else { "src/lib.rs" };
             println!("added actor type {name}: edit wit/app.wit, migrations/{name}/ and {code}");
         }
+        Cmd::Test { args } => {
+            let p = Project::find(Path::new("."))?;
+            sync_local(&p)?;
+            python::test(&p, &args)?;
+        }
         Cmd::Build => {
             let p = Project::find(Path::new("."))?;
+            sync_local(&p)?;
             let wasm = p.build(false)?;
             println!("built {}", wasm.display());
         }
@@ -304,7 +345,10 @@ async fn run(cli: Cli) -> Result<()> {
             let p = Project::find(Path::new("."))?;
             let path = match wasm {
                 Some(w) => w,
-                None => p.build(true)?,
+                None => {
+                    sync_local(&p)?;
+                    p.build(true)?
+                }
             };
             let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
             let manifest = p.manifest(&bytes)?;
@@ -313,8 +357,7 @@ async fn run(cli: Cli) -> Result<()> {
             println!("ok: component verified");
         }
         Cmd::Dev { port, clean } => dev(port, clean).await?,
-        Cmd::Deploy { store, wasm, manifest, owner, take_over, allow_breaking } => {
-            let project = Project::find(Path::new(".")).ok();
+        Cmd::Deploy { store, wasm, manifest, allow_breaking, allow_unresolved_calls } => {
             let (bytes, manifest) = match (wasm, manifest) {
                 (Some(w), Some(m)) => {
                     let bytes = std::fs::read(&w)?;
@@ -324,6 +367,9 @@ async fn run(cli: Cli) -> Result<()> {
                 }
                 (w, _) => {
                     let p = Project::find(Path::new("."))?;
+                    if w.is_none() {
+                        sync_local(&p)?;
+                    }
                     let path = match w {
                         Some(w) => w,
                         None => p.build(true)?,
@@ -334,19 +380,12 @@ async fn run(cli: Cli) -> Result<()> {
                 }
             };
             project::verify(&bytes, &manifest)?;
-            let owner = owner
-                .or_else(|| project.as_ref().filter(|p| p.app() == manifest.app).and_then(|p| p.owner()))
-                .or_else(|| manifest.app.split_once('/').map(|(ns, _)| ns.to_string()))
-                .unwrap_or_else(|| {
-                    eprintln!("note: no owner configured (set [app] owner in statex.toml or pass --owner); deploying as \"default\"");
-                    "default".into()
-                });
             let store = statex_store::open(&store)?;
-            let opts = deploy::DeployOptions { owner, take_over, allow_breaking };
+            let opts = deploy::DeployOptions { allow_breaking, allow_unresolved_calls };
             let cur = deploy::deploy(&store, &bytes, &manifest, &opts).await?;
             println!(
-                "deployed {} version {} (id {}, owner {}); nodes pick it up within seconds",
-                cur.app, cur.version, cur.id, cur.owner
+                "deployed {} version {} (id {}); nodes pick it up within seconds",
+                cur.app, cur.version, cur.id
             );
         }
         Cmd::Check { against, all, allow_breaking } => {
@@ -473,6 +512,24 @@ async fn run(cli: Cli) -> Result<()> {
             statex_store::conformance_test(&*s).await?;
             println!("ok: {store} supports conditional create/replace and ranged reads");
         }
+        Cmd::Calls { cmd } => {
+            let p = Project::find(Path::new("."))?;
+            let ws = Workspace::find(&p.root)?;
+            let from_url = match cmd {
+                CallsCmd::Add { apps, from_url } => {
+                    for a in &apps {
+                        statex_runtime::validate_app_name(a)?;
+                    }
+                    if project::add_calls(&p.root, &apps)? {
+                        println!("updated statex.toml [calls] apps");
+                    }
+                    from_url
+                }
+                CallsCmd::Sync { from_url } => from_url,
+            };
+            let p = Project::find(&p.root)?;
+            calls_sync(&p, ws.as_ref(), from_url.as_deref()).await?;
+        }
         Cmd::Codegen { lang: Lang::Python { out, from_url, app, url } } => {
             let manifest = match from_url {
                 Some(u) => {
@@ -492,6 +549,94 @@ async fn run(cli: Cli) -> Result<()> {
             let out = out.unwrap_or_else(|| PathBuf::from(format!("{}_client.py", manifest.app.replace(['-', '/'], "_"))));
             std::fs::write(&out, code)?;
             println!("wrote {}", out.display());
+        }
+    }
+    Ok(())
+}
+
+/// Regenerates client interfaces whose callee source is local; prints changes.
+fn sync_local(p: &Project) -> Result<()> {
+    let ws = Workspace::find(&p.root)?;
+    for f in calls::sync_local(p, ws.as_ref())? {
+        println!("updated {f}");
+    }
+    // Typed `wit_world` bindings for editors and `statex test`; the build itself does not need them.
+    if let Err(e) = python::bindings(p, false) {
+        eprintln!("warning: could not refresh {}: {e:#}", python::BINDINGS);
+    }
+    Ok(())
+}
+
+async fn calls_sync(p: &Project, ws: Option<&Workspace>, from_url: Option<&str>) -> Result<()> {
+    let mut callees = Vec::new();
+    for app in calls::listed(p)? {
+        let types = match calls::local_types(p, ws, &app) {
+            Some(t) => t?,
+            None => match from_url {
+                Some(u) => schema(u, &app).await.with_context(|| format!("read schema of app {app}"))?.types,
+                None => bail!(
+                    "app {app} is not in this workspace; pass --from-url <node url> to read its schema from a running cluster"
+                ),
+            },
+        };
+        callees.push(calls::Callee { app, types });
+    }
+    let want = calls::render(p, &callees)?;
+    let changed = calls::write(p, ws, &want)?;
+    for f in &changed {
+        println!("wrote {f}");
+    }
+    if callees.is_empty() {
+        println!("no apps under [calls] in statex.toml (add some with `statex calls add <team/app>`)");
+        return Ok(());
+    }
+    if changed.is_empty() {
+        println!("client interfaces are up to date");
+    }
+    let world = std::fs::read_to_string(p.root.join("wit/app.wit")).unwrap_or_default();
+    let missing: Vec<_> = calls::imports(&callees).into_iter().filter(|i| !world.contains(i.as_str())).collect();
+    if !missing.is_empty() {
+        println!("\nimport the actor types you call in your world (wit/app.wit):");
+        for i in &missing {
+            println!("    {i}");
+        }
+    }
+    if calls::is_rust(p) {
+        let lib = std::fs::read_to_string(p.root.join("src/lib.rs")).unwrap_or_default();
+        if !lib.contains("mod statex_calls") || !lib.contains("statex_guest::actors") {
+            println!("\nin src/lib.rs, declare the generated module and reuse its bindings:");
+            println!("    mod statex_calls;\n");
+            println!("    wit_bindgen::generate!({{\n        path: \"wit\",\n        world: \"app\",\n        with: {{");
+            for w in calls::with_entries(&callees) {
+                println!("            {w}");
+            }
+            println!("        }},\n    }});");
+            if let Some((c, t)) = callees.iter().find_map(|c| c.types.first().map(|t| (c, t))) {
+                let path = calls::module_path(&c.app, &t.name);
+                if let Some(m) = t.methods.first() {
+                    println!(
+                        "\nthen call e.g. `{path}::{}(\"some-key\", ..)`; in `cargo test`, install a stub with `{path}::stub(..)`.",
+                        m.name.replace('-', "_")
+                    );
+                }
+            }
+        }
+    }
+    if python::is_python(p) {
+        if missing.is_empty() {
+            python::bindings(p, false)?;
+        }
+        if let Some((c, t)) = callees.iter().find_map(|c| c.types.first().map(|t| (c, t))) {
+            let module = t.name.replace('-', "_");
+            if let Some(m) = t.methods.first() {
+                println!(
+                    "
+in app.py: `from wit_world.imports import {module}`, then `{module}.{}(\"some-key\", ..)` (app {}).\n\
+                     A failed call raises statex.Err(call_error); in tests, answer calls with statex_testing.stub({module}, ..).",
+                    m.name.replace('-', "_"),
+                    c.app
+                );
+            }
         }
     }
     Ok(())
@@ -582,15 +727,19 @@ async fn dev_deploy(p: &Project, store: &statex_store::DynStore) -> Result<Manif
     let root = p.root.clone();
     let (bytes, manifest) = tokio::task::spawn_blocking(move || -> Result<_> {
         let p = Project::find(&root)?;
+        sync_local(&p)?;
         let bytes = std::fs::read(p.build(true)?)?;
         let manifest = p.manifest(&bytes)?;
         project::verify(&bytes, &manifest)?;
         Ok((bytes, manifest))
     })
     .await??;
-    // Local dev state is disposable: never block a reload on ownership or
-    // compatibility (`statex check --against` and real deploys enforce them).
-    let opts = deploy::DeployOptions { owner: "dev".into(), take_over: true, allow_breaking: true };
+    // Local dev state is disposable: never block a reload on compatibility
+    // or on callees that are missing (`statex check` and real deploys enforce both).
+    let opts = deploy::DeployOptions { allow_breaking: true, allow_unresolved_calls: true };
+    for problem in deploy::unresolved_calls(store, &manifest).await? {
+        eprintln!("warning: {problem}; calls to it fail until it is deployed to the dev store and matches");
+    }
     let stale = stale_migrations(store, &manifest).await?;
     deploy::deploy(store, &bytes, &manifest, &opts).await?;
     if !stale.is_empty() {
@@ -623,6 +772,14 @@ async fn dev(port: u16, clean: bool) -> Result<()> {
         std::fs::remove_dir_all(&dev_dir)?;
     }
     let store = statex_store::open(dev_dir.join("bucket").to_str().unwrap())?;
+    // Callees with local source run in the dev node too (deployed once, at startup).
+    let ws = Workspace::find(&p.root)?;
+    for app in calls::listed(&p)? {
+        if let Some(dir) = calls::callee_root(&p, ws.as_ref(), &app).filter(|_| app != p.app()) {
+            println!("building callee {app} ...");
+            dev_deploy(&Project::find(&dir)?, &store).await.with_context(|| format!("deploy callee {app}"))?;
+        }
+    }
     println!("building {} ...", p.app());
     let manifest = dev_deploy(&p, &store).await?;
 

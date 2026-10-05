@@ -3,7 +3,7 @@
 //! registry is a derived view that CI regenerates (and `--check` verifies).
 //!
 //! ```text
-//! <registry>/index.json          every app: name, path, owners, actor types, method signatures
+//! <registry>/index.json          every app: name, path, actor types, method signatures, calls
 //! <registry>/<team>/<app>.wit    copy of the app's wit/app.wit
 //! ```
 
@@ -36,11 +36,11 @@ pub fn generate(ws: &Workspace) -> Result<BTreeMap<PathBuf, String>> {
         } else {
             "other"
         };
-        apps.push(json!({
+        let calls = statex_runtime::inspect_wit(&p.root.join("wit"), None).with_context(|| format!("read {path}/wit"))?.calls;
+        let mut entry = json!({
             "app": p.app(),
             "path": path,
             "lang": lang,
-            "owner": p.owner(),
             "wit": wit_file,
             "wit_sha256": sha256_hex(wit_src.as_bytes()),
             "types": types.iter().map(|t| json!({
@@ -53,7 +53,12 @@ pub fn generate(ws: &Workspace) -> Result<BTreeMap<PathBuf, String>> {
                     format!("{}({params}){ret}", m.name)
                 }).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
-        }));
+        });
+        if !calls.is_empty() {
+            // Actor types this app calls, as `app type`; reverse lookups find an app's callers.
+            entry["calls"] = json!(calls.iter().map(|c| json!({ "app": c.app, "type": c.actor_type })).collect::<Vec<_>>());
+        }
+        apps.push(entry);
         files.insert(PathBuf::from(&wit_file), wit_src);
     }
     let index = json!({

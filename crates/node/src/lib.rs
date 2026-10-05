@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod actor;
+mod alarms;
 pub mod deploy;
 pub mod layout;
 pub mod lease;
@@ -123,6 +124,8 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             }
         }));
     }
+    tasks.push(tokio::spawn(node.clone().run_timers()));
+    tasks.push(tokio::spawn(node.clone().run_waker()));
     let serve = |listener: tokio::net::TcpListener, router: axum::Router| {
         let mut rx = stop.subscribe();
         tokio::spawn(async move {

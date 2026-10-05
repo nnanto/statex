@@ -1,8 +1,6 @@
 # statex app manifest
 [app]
 name = "demo/rustdemo"
-# Owner defaults to the namespace ("demo"); deploys by other owners are refused.
-# owner = "demo"
 
 # Hosts the http-client interface may call: "api.example.com", "*.example.com" or "*".
 [http]
@@ -11,3 +9,7 @@ allow = []
 [limits]
 timeout_ms = 5000
 memory_mb = 64
+
+[calls]
+# Apps whose actors this app calls; `statex calls sync` generates their clients.
+apps = ["demo/db"]

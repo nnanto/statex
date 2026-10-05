@@ -79,12 +79,34 @@ pub struct ActorType {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
     pub methods: Vec<Method>,
+    /// The alarm handler (`alarm: func(retry-count: u32)`), if the type has
+    /// one. It runs when the actor's alarm fires and is not a public method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alarm: Option<Method>,
 }
+
+/// Name of the method an actor type exports to handle its alarm.
+pub const ALARM_HANDLER: &str = "alarm";
 
 impl ActorType {
     pub fn method(&self, name: &str) -> Option<&Method> {
         self.methods.iter().find(|m| m.name == name)
     }
+}
+
+/// A client interface the component imports to call another actor type
+/// (`statex:host/actors`). `methods` describe the callee as the caller sees
+/// it: without the leading `actor` key parameter and with the outer
+/// `result<_, call-error>` removed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CallImport {
+    /// Import name as it appears in the component: `demo:db/kv`.
+    pub import: String,
+    /// Callee app: `demo/db`.
+    pub app: String,
+    /// Callee actor type: `kv`.
+    pub actor_type: String,
+    pub methods: Vec<Method>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,6 +149,9 @@ pub struct Manifest {
     pub http: HttpPolicy,
     #[serde(default)]
     pub limits: Limits,
+    /// Actor types of other apps (or this one) the component calls.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub calls: Vec<CallImport>,
 }
 
 impl Manifest {
@@ -145,10 +170,15 @@ impl Manifest {
     ) -> Result<Manifest> {
         validate_app_name(app)?;
         let ins = inspect(wasm)?;
-        let bad: Vec<_> = ins.imports.iter().filter(|i| !import_allowed(i)).cloned().collect();
+        let bad: Vec<_> = ins
+            .imports
+            .iter()
+            .filter(|i| !import_allowed(i) && !ins.calls.iter().any(|c| &c.import == *i))
+            .cloned()
+            .collect();
         if !bad.is_empty() {
             bail!(
-                "component imports interfaces the host does not provide: {}. Only statex:host/* and wasi:* are available",
+                "component imports interfaces the host does not provide: {}. Only statex:host/*, wasi:* and statex client interfaces (`statex calls sync`) are available",
                 bad.join(", ")
             );
         }
@@ -180,6 +210,7 @@ impl Manifest {
             migrations,
             http,
             limits,
+            calls: ins.calls,
         })
     }
 }
@@ -215,7 +246,36 @@ pub fn validate_app_name(s: &str) -> Result<()> {
             bail!("invalid app name {s:?}: `{seg}` is reserved");
         }
     }
+    // Client interfaces of app `team/app` live in WIT package `team:app`, and
+    // of a single-segment app `app` in `statex:app` (see [`client_package`]).
+    match s.split_once('/') {
+        Some((team, _)) if RESERVED_TEAMS.contains(&team) => bail!("invalid app name {s:?}: team `{team}` is reserved"),
+        None if s == "host" => bail!("invalid app name {s:?}: `host` is reserved"),
+        _ => {}
+    }
     Ok(())
+}
+
+/// Teams that cannot own apps because their WIT namespaces belong to the host.
+pub const RESERVED_TEAMS: &[&str] = &["statex", "wasi"];
+
+/// WIT package (`namespace`, `name`) holding the client interfaces of `app`:
+/// `team/app` -> `team:app`, `app` -> `statex:app`.
+pub fn client_package(app: &str) -> (String, String) {
+    match app.split_once('/') {
+        Some((team, name)) => (team.to_string(), name.to_string()),
+        None => ("statex".to_string(), app.to_string()),
+    }
+}
+
+/// Inverse of [`client_package`]. `None` for host packages (`statex:host`, `wasi:*`).
+pub fn app_of_package(namespace: &str, name: &str) -> Option<String> {
+    match namespace {
+        "wasi" => None,
+        "statex" if name == "host" => None,
+        "statex" => Some(name.to_string()),
+        ns => Some(format!("{ns}/{name}")),
+    }
 }
 
 /// What a component exports and imports.
@@ -223,6 +283,8 @@ pub fn validate_app_name(s: &str) -> Result<()> {
 pub struct Inspection {
     pub types: Vec<ActorType>,
     pub imports: Vec<String>,
+    /// Imported client interfaces of other actor types.
+    pub calls: Vec<CallImport>,
 }
 
 /// Import namespaces an actor component may use.
@@ -250,9 +312,31 @@ pub fn inspect_wit(dir: &std::path::Path, world: Option<&str>) -> Result<Inspect
     inspect_world(&resolve, world)
 }
 
+/// Client interfaces imported by a WIT world, e.g. a generated `statex-calls`
+/// world (which, unlike an app world, exports nothing).
+pub fn inspect_wit_calls(dir: &std::path::Path, world: Option<&str>) -> Result<Vec<CallImport>> {
+    let mut resolve = Resolve::default();
+    let (pkg, _) = resolve.push_dir(dir).with_context(|| format!("parse WIT in {}", dir.display()))?;
+    let world = resolve.select_world(&[pkg], world)?;
+    world_calls(&resolve, world)
+}
+
+fn world_calls(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Vec<CallImport>> {
+    let mut calls = Vec::new();
+    for (key, item) in &resolve.worlds[world].imports {
+        if let WorldItem::Interface { id, .. } = item {
+            if let Some(c) = call_import(resolve, *id, &resolve.name_world_key(key))? {
+                calls.push(c);
+            }
+        }
+    }
+    Ok(calls)
+}
+
 fn inspect_world(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Inspection> {
     let w = &resolve.worlds[world];
     let imports = w.imports.keys().map(|k| resolve.name_world_key(k)).collect();
+    let calls = world_calls(resolve, world)?;
     let mut types: Vec<ActorType> = Vec::new();
     for (key, item) in &w.exports {
         let export = resolve.name_world_key(key);
@@ -267,26 +351,33 @@ fn inspect_world(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Inspec
                     continue;
                 }
                 let mut methods = Vec::new();
+                let mut alarm = None;
                 for f in iface.functions.values() {
                     if !matches!(f.kind, wit_parser::FunctionKind::Freestanding) {
                         bail!("{export}.{}: resources are not supported in actor interfaces", f.name);
                     }
                     let ctx = format!("{name}.{}", f.name);
-                    methods.push(Method {
+                    let m = Method {
                         name: f.name.clone(),
                         params: f
                             .params
                             .iter()
-                            .map(|p| Ok(Param { name: p.name.clone(), ty: ty_of(&resolve, &p.ty, &ctx)? }))
+                            .map(|p| Ok(Param { name: p.name.clone(), ty: ty_of(resolve, &p.ty, &ctx)? }))
                             .collect::<Result<_>>()?,
-                        result: f.result.as_ref().map(|t| ty_of(&resolve, t, &ctx)).transpose()?,
+                        result: f.result.as_ref().map(|t| ty_of(resolve, t, &ctx)).transpose()?,
                         docs: f.docs.contents.clone(),
-                    });
+                    };
+                    if m.name == ALARM_HANDLER {
+                        check_alarm_handler(&m, &ctx)?;
+                        alarm = Some(m);
+                    } else {
+                        methods.push(m);
+                    }
                 }
                 if types.iter().any(|t| t.name == name) {
                     bail!("two exported interfaces are both named `{name}`; actor type names must be unique");
                 }
-                types.push(ActorType { name, export, docs: iface.docs.contents.clone(), methods });
+                types.push(ActorType { name, export, docs: iface.docs.contents.clone(), methods, alarm });
             }
             WorldItem::Function(f) => {
                 bail!("world-level export function `{}` is not supported; export an interface instead", f.name)
@@ -297,7 +388,99 @@ fn inspect_world(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Inspec
     if types.is_empty() {
         bail!("component exports no interfaces with functions; nothing to serve");
     }
-    Ok(Inspection { types, imports })
+    Ok(Inspection { types, imports, calls })
+}
+
+/// The alarm handler takes nothing or the retry count (`u32`) and returns
+/// nothing or a `result` (an `err` counts as a failure and is retried).
+fn check_alarm_handler(m: &Method, ctx: &str) -> Result<()> {
+    let params_ok = match m.params.as_slice() {
+        [] => true,
+        [p] => matches!(p.ty, Ty::U32),
+        _ => false,
+    };
+    let result_ok = matches!(m.result, None | Some(Ty::Result { .. }));
+    if !params_ok || !result_ok {
+        bail!(
+            "{ctx}: `{ALARM_HANDLER}` is reserved for the alarm handler; declare it as \
+             `{ALARM_HANDLER}: func(retry-count: u32);` (the parameter and a `result<_, E>` return are optional)"
+        );
+    }
+    Ok(())
+}
+
+/// Parses an imported interface as a statex client interface, or returns
+/// `None` for host interfaces (`statex:host/*`, `wasi:*`).
+fn call_import(resolve: &Resolve, id: wit_parser::InterfaceId, import: &str) -> Result<Option<CallImport>> {
+    let iface = &resolve.interfaces[id];
+    let Some(pkg) = iface.package else { return Ok(None) };
+    let pn = &resolve.packages[pkg].name;
+    let Some(app) = app_of_package(&pn.namespace, &pn.name) else { return Ok(None) };
+    let hint = "client interfaces are generated by `statex calls sync`";
+    let actor_type = iface.name.clone().ok_or_else(|| anyhow!("import {import}: unnamed interface; {hint}"))?;
+    validate_app_name(&app).with_context(|| format!("import {import} does not name a statex app; {hint}"))?;
+    let mut methods = Vec::new();
+    for f in iface.functions.values() {
+        let ctx = format!("{import}.{}", f.name);
+        if !matches!(f.kind, wit_parser::FunctionKind::Freestanding) {
+            bail!("{ctx}: resources are not supported in client interfaces; {hint}");
+        }
+        match f.params.first() {
+            Some(p) if p.ty == Type::String => {}
+            _ => bail!("{ctx}: the first parameter must be the callee's actor key (`actor: string`); {hint}"),
+        }
+        let result = match f.result.as_ref().map(|t| deref(resolve, t)) {
+            Some(TypeDefKind::Result(r)) if r.err.as_ref().is_some_and(|e| is_call_error(resolve, e)) => {
+                r.ok.as_ref().map(|t| ty_of(resolve, t, &ctx)).transpose()?
+            }
+            _ => bail!("{ctx}: must return `result<T, call-error>` (call-error from statex:host/actors); {hint}"),
+        };
+        methods.push(Method {
+            name: f.name.clone(),
+            params: f.params[1..]
+                .iter()
+                .map(|p| Ok(Param { name: p.name.clone(), ty: ty_of(resolve, &p.ty, &ctx)? }))
+                .collect::<Result<_>>()?,
+            result,
+            docs: f.docs.contents.clone(),
+        });
+    }
+    Ok(Some(CallImport { import: import.to_string(), app, actor_type, methods }))
+}
+
+/// Follows type aliases (`use`, `type x = y`) to the defining type.
+fn deref<'a>(resolve: &'a Resolve, t: &Type) -> &'a TypeDefKind {
+    static NONE: TypeDefKind = TypeDefKind::Unknown;
+    let mut t = *t;
+    loop {
+        match t {
+            Type::Id(id) => match &resolve.types[id].kind {
+                TypeDefKind::Type(inner) => t = *inner,
+                k => return k,
+            },
+            _ => return &NONE,
+        }
+    }
+}
+
+/// Whether `t` is `call-error` from `statex:host/actors`.
+fn is_call_error(resolve: &Resolve, t: &Type) -> bool {
+    let mut t = *t;
+    loop {
+        let Type::Id(id) = t else { return false };
+        let td = &resolve.types[id];
+        if let TypeDefKind::Type(inner) = &td.kind {
+            t = *inner;
+            continue;
+        }
+        let wit_parser::TypeOwner::Interface(i) = td.owner else { return false };
+        let iface = &resolve.interfaces[i];
+        let host = iface.package.is_some_and(|p| {
+            let n = &resolve.packages[p].name;
+            n.namespace == "statex" && n.name == "host"
+        });
+        return host && iface.name.as_deref() == Some("actors") && td.name.as_deref() == Some("call-error");
+    }
 }
 
 fn ty_of(resolve: &Resolve, t: &Type, ctx: &str) -> Result<Ty> {

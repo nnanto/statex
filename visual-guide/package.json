@@ -1,0 +1,19 @@
+{
+  "name": "statex-visual-guide",
+  "version": "1.0.0",
+  "private": true,
+  "description": "An offline, multi-page React field guide to the StateX working tree",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node tests.mjs",
+    "start": "node serve.mjs"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "esbuild": "0.21.5",
+    "jsdom": "22.1.0"
+  }
+}

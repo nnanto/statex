@@ -7,8 +7,14 @@ interface counter {
   increment: func(by: s64) -> s64;
   /// Returns the current value.
   get: func() -> s64;
+  /// Saves the current value in the `counters` actor of app demo/db (a
+  /// Python app) under this counter's key, and returns the value.
+  save: func() -> result<s64, string>;
+  /// The value last saved by `save`, read back from demo/db.
+  saved: func() -> result<option<string>, string>;
 }
 
 world app {
+  import demo:db/kv;
   export counter;
 }

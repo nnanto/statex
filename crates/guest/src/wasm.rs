@@ -7,7 +7,7 @@ wit_bindgen::generate!({
     world: "imports",
 });
 
-use statex::host::{context as c, http_client as h, log as l, sql as s};
+use statex::host::{alarms as a, context as c, http_client as h, log as l, sql as s};
 
 pub fn app() -> String {
     c::app()
@@ -76,4 +76,16 @@ pub fn log(level: Level, msg: &str) {
         Level::Error => l::Level::Error,
     };
     l::log(lv, msg)
+}
+
+pub fn alarm_set(at_ms: u64) -> Result<()> {
+    a::set(at_ms).map_err(Error)
+}
+
+pub fn alarm_get() -> Option<u64> {
+    a::get()
+}
+
+pub fn alarm_clear() {
+    a::clear()
 }

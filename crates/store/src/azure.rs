@@ -13,6 +13,7 @@
 //! Conditional writes use `If-None-Match: *` / `If-Match: <etag>`; HTTP 412 and
 //! `BlobAlreadyExists` (409) are clean rejections, everything else is ambiguous.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context};
@@ -22,11 +23,14 @@ use bytes::Bytes;
 use hmac::{Hmac, Mac};
 use reqwest::{header::HeaderMap, Method, StatusCode};
 use sha2::Sha256;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use crate::{ETag, Object, ObjectStore, Result, StoreError};
 
 const API_VERSION: &str = "2023-11-03";
+/// Block size for streamed uploads and range size for streamed downloads.
+const CHUNK: u64 = 8 << 20;
 
 enum Credential {
     SharedKey(Vec<u8>),
@@ -262,6 +266,20 @@ fn error_code(resp: &reqwest::Response) -> String {
         .to_string()
 }
 
+/// Full object size from `Content-Range: bytes a-b/total`, or from
+/// `Content-Length` when the server returned the whole object.
+fn content_total(resp: &reqwest::Response) -> Option<u64> {
+    let h = |n: &str| resp.headers().get(n).and_then(|v| v.to_str().ok());
+    match h("content-range") {
+        Some(r) => parse_content_range_total(r),
+        None => h("content-length")?.parse().ok(),
+    }
+}
+
+fn parse_content_range_total(r: &str) -> Option<u64> {
+    r.rsplit_once('/')?.1.trim().parse().ok()
+}
+
 fn parse_list(xml: &str) -> anyhow::Result<(Vec<String>, Option<String>)> {
     use quick_xml::events::Event;
     let mut r = quick_xml::Reader::from_str(xml);
@@ -333,6 +351,111 @@ impl ObjectStore for AzureBlobStore {
         self.put_with(key, data, Some(("if-match", etag.to_string()))).await
     }
 
+    async fn put_file(&self, key: &str, path: &Path) -> Result<ETag> {
+        let mut f = tokio::fs::File::open(path)
+            .await
+            .with_context(|| format!("open {}", path.display()))?;
+        let len = f.metadata().await.map_err(anyhow::Error::from)?.len();
+        if len <= CHUNK {
+            let mut buf = Vec::with_capacity(len as usize);
+            f.read_to_end(&mut buf).await.map_err(anyhow::Error::from)?;
+            return self.put(key, Bytes::from(buf)).await;
+        }
+        // Stage fixed-size blocks, then commit them with one Put Block List.
+        // Block ids must all have the same length. The per-upload nonce keeps
+        // two concurrent uploads to the same key from overwriting each
+        // other's staged blocks.
+        let url = self.url(Some(key));
+        let nonce: u64 = rand::random();
+        let mut ids = Vec::new();
+        let mut remaining = len;
+        while remaining > 0 {
+            let n = remaining.min(CHUNK) as usize;
+            let mut buf = vec![0u8; n];
+            f.read_exact(&mut buf)
+                .await
+                .with_context(|| format!("read {} (file changed during upload?)", path.display()))?;
+            let id = base64::engine::general_purpose::STANDARD
+                .encode(format!("{nonce:016x}{:08}", ids.len()));
+            let block_url = format!("{url}?comp=block&blockid={}", urlencoding::encode(&id));
+            let resp = self.request(Method::PUT, block_url, &[], Some(Bytes::from(buf))).await?;
+            if !resp.status().is_success() {
+                let s = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                return Err(StoreError::Other(anyhow!("PUT block {key}: {s} {text}")));
+            }
+            ids.push(id);
+            remaining -= n as u64;
+        }
+        let mut xml = String::from(r#"<?xml version="1.0" encoding="utf-8"?><BlockList>"#);
+        for id in &ids {
+            xml.push_str(&format!("<Latest>{id}</Latest>"));
+        }
+        xml.push_str("</BlockList>");
+        let resp = self
+            .request(Method::PUT, format!("{url}?comp=blocklist"), &[], Some(Bytes::from(xml)))
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(etag_of(&resp));
+        }
+        let text = resp.text().await.unwrap_or_default();
+        Err(StoreError::Other(anyhow!("PUT block list {key}: {status} {text}")))
+    }
+
+    async fn get_to_file(&self, key: &str, path: &Path) -> Result<bool> {
+        // Ranged reads keep each request within the client timeout; If-Match
+        // pins every chunk to the version the first chunk came from.
+        let url = self.url(Some(key));
+        let mut out: Option<tokio::fs::File> = None;
+        let mut etag: Option<String> = None;
+        let mut pos = 0u64;
+        loop {
+            let mut extra = vec![("x-ms-range", format!("bytes={}-{}", pos, pos + CHUNK - 1))];
+            if let Some(e) = &etag {
+                extra.push(("if-match", e.clone()));
+            }
+            let resp = self.request(Method::GET, url.clone(), &extra, None).await?;
+            let status = resp.status();
+            let total = match status {
+                StatusCode::NOT_FOUND if etag.is_none() => return Ok(false),
+                // Only an empty blob rejects a range starting at 0.
+                StatusCode::RANGE_NOT_SATISFIABLE if pos == 0 => 0,
+                s if s.is_success() => content_total(&resp)
+                    .ok_or_else(|| anyhow!("GET {key}: missing content length"))?,
+                s => return Err(StoreError::Other(anyhow!("GET {key}: {s}"))),
+            };
+            if etag.is_none() {
+                etag = Some(etag_of(&resp));
+            }
+            let body = if total == 0 {
+                Bytes::new()
+            } else {
+                resp.bytes().await.map_err(anyhow::Error::from)?
+            };
+            if out.is_none() {
+                out = Some(
+                    tokio::fs::File::create(path)
+                        .await
+                        .with_context(|| format!("create {}", path.display()))?,
+                );
+            }
+            let f = out.as_mut().unwrap();
+            f.write_all(&body).await.map_err(anyhow::Error::from)?;
+            pos += body.len() as u64;
+            if pos >= total {
+                break;
+            }
+            if body.is_empty() {
+                return Err(StoreError::Other(anyhow!("GET {key}: empty chunk at {pos}/{total}")));
+            }
+        }
+        let f = out.as_mut().unwrap();
+        f.flush().await.map_err(anyhow::Error::from)?;
+        f.sync_all().await.map_err(anyhow::Error::from)?;
+        Ok(true)
+    }
+
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
         let mut out = Vec::new();
         let mut marker: Option<String> = None;
@@ -392,5 +515,49 @@ mod tests {
         let (n, m) = parse_list(xml).unwrap();
         assert_eq!(n, vec!["a/b&c", "a/d"]);
         assert_eq!(m.as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn parses_content_range_total() {
+        assert_eq!(parse_content_range_total("bytes 0-8388607/20000000"), Some(20_000_000));
+        assert_eq!(parse_content_range_total("bytes */0"), Some(0));
+        assert_eq!(parse_content_range_total("garbage"), None);
+    }
+
+    /// Runs against Azurite when `STATEX_AZURITE_TEST=1` and the usual
+    /// `AZURE_STORAGE_*` variables point at it.
+    #[tokio::test]
+    async fn azurite_file_roundtrip() {
+        if std::env::var("STATEX_AZURITE_TEST").as_deref() != Ok("1") {
+            return;
+        }
+        let container = format!("t{:016x}", rand::random::<u64>());
+        let s = AzureBlobStore::from_env(&container).unwrap();
+        let r = s
+            .request(Method::PUT, format!("{}?restype=container", s.url(None)), &[], Some(Bytes::new()))
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "create container: {}", r.status());
+        let dir = tempfile::tempdir().unwrap();
+        // Larger than two chunks and not a multiple of the chunk size.
+        let n = (2 * CHUNK + 12_345) as usize;
+        let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let src = dir.path().join("src.bin");
+        std::fs::write(&src, &data).unwrap();
+        s.put_file("a/big.db", &src).await.unwrap();
+        let dst = dir.path().join("dst.bin");
+        assert!(s.get_to_file("a/big.db", &dst).await.unwrap());
+        assert!(std::fs::read(&dst).unwrap() == data);
+        // Small and empty files go through a single PUT.
+        std::fs::write(&src, b"tiny").unwrap();
+        s.put_file("a/small.db", &src).await.unwrap();
+        assert!(s.get_to_file("a/small.db", &dst).await.unwrap());
+        assert_eq!(std::fs::read(&dst).unwrap(), b"tiny");
+        std::fs::write(&src, b"").unwrap();
+        s.put_file("a/empty.db", &src).await.unwrap();
+        assert!(s.get_to_file("a/empty.db", &dst).await.unwrap());
+        assert!(std::fs::read(&dst).unwrap().is_empty());
+        assert!(!s.get_to_file("a/missing.db", &dst).await.unwrap());
+        let _ = s.request(Method::DELETE, format!("{}?restype=container", s.url(None)), &[], None).await;
     }
 }

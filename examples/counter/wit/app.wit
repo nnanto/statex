@@ -8,6 +8,18 @@ interface counter {
   get: func() -> s64;
   /// Resets to zero.
   reset: func();
+
+  /// Schedules the alarm `delay-ms` from now. Its first `fail-times`
+  /// attempts fail, to show retries.
+  schedule: func(delay-ms: u64, fail-times: u32);
+  /// Cancels the alarm.
+  cancel: func();
+  /// When the alarm is scheduled (Unix ms), if it is.
+  alarm-at: func() -> option<u64>;
+  /// How often the alarm has fired successfully.
+  fired: func() -> s64;
+  /// The alarm handler: runs when the alarm is due (not a public method).
+  alarm: func(retry-count: u32) -> result<_, string>;
 }
 
 /// A tiny ledger showing records, enums, variants, options and results.

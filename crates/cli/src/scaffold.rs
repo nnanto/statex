@@ -18,20 +18,13 @@ pub fn default_sdk_path() -> Option<PathBuf> {
     p.canonicalize().ok()
 }
 
-const HOST_WIT: &str = include_str!("../../../wit/statex-host.wit");
+pub const HOST_WIT: &str = include_str!("../../../wit/statex-host.wit");
 const PY_GUEST: &str = include_str!("../../../sdk/python-guest/statex.py");
+const PY_TESTING: &str = include_str!("../../../sdk/python-guest/statex_testing.py");
 const COMPONENTIZE_PY: &str = "componentize-py==0.25.1";
 
 fn pascal(s: &str) -> String {
     s.split(['-', '_']).filter(|p| !p.is_empty()).map(|p| p[..1].to_uppercase() + &p[1..]).collect()
-}
-
-/// statex.toml `owner` hint: namespaced apps default to their namespace.
-fn owner_line(name: &str) -> String {
-    match name.split_once('/') {
-        Some((ns, _)) => format!("# Owner defaults to the namespace ({ns:?}); deploys by other owners are refused.\n# owner = {ns:?}\n"),
-        None => "# Team that owns this app name in the cluster; deploys by other owners are refused.\n# owner = \"my-team\"\n".into(),
-    }
 }
 
 fn on_path(bin: &str) -> bool {
@@ -44,7 +37,6 @@ fn on_path(bin: &str) -> bool {
 /// WIT and `statex.py` are linked from the workspace instead of copied.
 pub fn new_python_project(name: &str, dir: &Path, actor: &str, ws: Option<&Workspace>) -> Result<()> {
     validate_app_name(name)?;
-    let owner_line = owner_line(name);
     validate_name("actor type", actor)?;
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         bail!("{} already exists and is not empty", dir.display());
@@ -72,7 +64,7 @@ pub fn new_python_project(name: &str, dir: &Path, actor: &str, ws: Option<&Works
             r#"# statex app manifest
 [app]
 name = "{name}"
-{owner_line}
+
 # Hosts the http-client interface may call: "api.example.com", "*.example.com" or "*".
 [http]
 allow = []
@@ -108,19 +100,14 @@ world app {{
   import statex:host/sql@0.1.0;
   import statex:host/http-client@0.1.0;
   import statex:host/log@0.1.0;
+  import statex:host/alarms@0.1.0;
 
   export {actor};
 }}
 "#
         ),
     )?;
-    match ws {
-        Some(ws) => {
-            let link = dir.join("wit/deps/statex-host");
-            link_dir(&ws.path(&ws.cfg.host_wit), &ws.reach(link.parent().unwrap(), &ws.cfg.host_wit)?, &link)?
-        }
-        None => w("wit/deps/statex-host/statex-host.wit", HOST_WIT.to_string())?,
-    }
+    ensure_host_wit(dir, ws)?;
     w(
         &format!("migrations/{actor}/0001_init.sql"),
         format!(
@@ -130,9 +117,47 @@ world app {{
             t = snake(actor)
         ),
     )?;
-    if ws.is_none() {
-        w("statex.py", PY_GUEST.to_string())?;
+    let mut extra_paths = vec![".statex/bindings".to_string()];
+    match ws {
+        Some(ws) => extra_paths.push(slash(&ws.reach(dir, &ws.cfg.python_guest)?)),
+        None => {
+            w("statex.py", PY_GUEST.to_string())?;
+            w("statex_testing.py", PY_TESTING.to_string())?;
+        }
     }
+    w(
+        "pyproject.toml",
+        format!(
+            "# Lets editors and type checkers see the typed `wit_world` bindings, which\n\
+             # `statex build`, `statex test` and `statex dev` generate into .statex/bindings.\n\
+             [tool.pyright]\nextraPaths = [{}]\n\n[tool.mypy]\nmypy_path = \"{}\"\n",
+            extra_paths.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>().join(", "),
+            extra_paths.join(":")
+        ),
+    )?;
+    w(
+        "conftest.py",
+        "# Resets the statex mock host (actors, stubs, logs) before every test.\npytest_plugins = [\"statex_testing\"]\n".into(),
+    )?;
+    w(
+        "test_app.py",
+        format!(
+            r#"# Unit tests against the mock host; run them with `statex test`.
+# Each (actor type, key) gets its own in-memory database with migrations applied,
+# and each `call` is one transaction, like on a node.
+from statex_testing import call
+
+from app import {cls}
+
+
+def test_increments_per_key():
+    assert call("{actor}", "alice", {cls}().increment, 2) == 2
+    assert call("{actor}", "alice", {cls}().increment, 3) == 5
+    assert call("{actor}", "bob", {cls}().get) == 0
+"#,
+            cls = pascal(actor)
+        ),
+    )?;
     w(
         "app.py",
         format!(
@@ -172,7 +197,6 @@ fn snake(s: &str) -> String {
 /// depends on the workspace's statex-guest crate by relative path.
 pub fn new_project(name: &str, dir: &Path, actor: &str, sdk: Option<PathBuf>, ws: Option<&Workspace>) -> Result<()> {
     validate_app_name(name)?;
-    let owner_line = owner_line(name);
     validate_name("actor type", actor)?;
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         bail!("{} already exists and is not empty", dir.display());
@@ -218,7 +242,7 @@ wit-bindgen = "0.62"
             r#"# statex app manifest
 [app]
 name = "{name}"
-{owner_line}
+
 # Hosts the http-client interface may call: "api.example.com", "*.example.com" or "*".
 [http]
 allow = []
@@ -348,6 +372,24 @@ fn add_cargo_member(ws: &Workspace, dir: &Path) -> Result<()> {
     let new = format!("{}members = [\n{list}]{}", &text[..start], &text[end..]);
     std::fs::write(&manifest, new)?;
     Ok(())
+}
+
+/// Makes `<dir>/wit/deps/statex-host` available: linked to the workspace's
+/// host WIT inside a workspace, else a copy of the one this CLI was built with.
+/// Returns whether it was created.
+pub fn ensure_host_wit(dir: &Path, ws: Option<&Workspace>) -> Result<bool> {
+    let link = dir.join("wit/deps/statex-host");
+    if link.exists() {
+        return Ok(false);
+    }
+    match ws {
+        Some(ws) => link_dir(&ws.path(&ws.cfg.host_wit), &ws.reach(link.parent().unwrap(), &ws.cfg.host_wit)?, &link)?,
+        None => {
+            std::fs::create_dir_all(&link)?;
+            std::fs::write(link.join("statex-host.wit"), HOST_WIT)?;
+        }
+    }
+    Ok(true)
 }
 
 /// Symlinks directory `target` at `link` via `rel` (relative when the target

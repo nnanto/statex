@@ -15,7 +15,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::manifest::{ActorType, Migration, Ty};
+use crate::manifest::{ActorType, CallImport, Migration, Ty};
 
 /// The parts of an app version that compatibility is judged on.
 #[derive(Clone, Copy)]
@@ -91,6 +91,49 @@ pub fn breaking_changes(old: Surface<'_>, new: Surface<'_>) -> Vec<String> {
                     ));
                 }
             }
+        }
+    }
+    out
+}
+
+/// Checks a caller's client interface against the callee app's manifest.
+/// Returns every method the caller expects that the callee does not provide
+/// with the same signature; empty when the call import is satisfied.
+/// Parameter names do not matter: calls pass arguments by position.
+pub fn call_mismatches(call: &CallImport, callee: &crate::Manifest) -> Vec<String> {
+    call_mismatches_in(call, &callee.app, &callee.types)
+}
+
+/// [`call_mismatches`] against the actor types of app `app` (e.g. read from source).
+pub fn call_mismatches_in(call: &CallImport, app: &str, types: &[crate::ActorType]) -> Vec<String> {
+    let Some(t) = types.iter().find(|t| t.name == call.actor_type) else {
+        return vec![format!("app {app} has no actor type `{}`", call.actor_type)];
+    };
+    let mut out = Vec::new();
+    for m in &call.methods {
+        let at = format!("{}.{}", call.actor_type, m.name);
+        let Some(cm) = t.method(&m.name) else {
+            out.push(format!("app {app} has no method `{at}`"));
+            continue;
+        };
+        let types = |ps: &[crate::manifest::Param]| ps.iter().map(|p| fmt_ty(&p.ty)).collect::<Vec<_>>().join(", ");
+        if m.params.len() != cm.params.len() {
+            out.push(format!("`{at}`: caller passes ({}), callee takes ({})", types(&m.params), types(&cm.params)));
+        } else {
+            for (i, (a, b)) in m.params.iter().zip(&cm.params).enumerate() {
+                if let Some(d) = diff_ty(&a.ty, &b.ty) {
+                    out.push(format!("`{at}`, parameter {} (`{}`): {d}", i + 1, b.name));
+                }
+            }
+        }
+        match (&m.result, &cm.result) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                if let Some(d) = diff_ty(a, b) {
+                    out.push(format!("`{at}`, result: {d}"));
+                }
+            }
+            (a, b) => out.push(format!("`{at}`: caller expects {}, callee returns {}", opt(a), opt(b))),
         }
     }
     out
@@ -193,7 +236,7 @@ mod tests {
     use crate::manifest::{Field, Method, Param};
 
     fn ty(methods: Vec<Method>) -> ActorType {
-        ActorType { name: "cart".into(), export: "x:y/cart".into(), docs: None, methods }
+        ActorType { name: "cart".into(), export: "x:y/cart".into(), docs: None, methods, alarm: None }
     }
     fn m(name: &str, params: Vec<(&str, Ty)>, result: Option<Ty>) -> Method {
         Method {

@@ -52,6 +52,7 @@ pub fn check(p: &Project, ws: Option<&Workspace>, against: Option<&str>, allow_b
             return r;
         }
     };
+    check_calls(p, ws, &mut r);
     if let Some(rev) = against {
         match old_version(&p.root, rev) {
             Ok(None) => r.warnings.push(format!("new app (not present at {rev})")),
@@ -140,4 +141,40 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Client interfaces: every imported one is listed under `[calls]`, generated
+/// files are up to date, and calls match the callee's source where available.
+fn check_calls(p: &Project, ws: Option<&Workspace>, r: &mut Report) {
+    let listed = match crate::calls::listed(p) {
+        Ok(l) => l,
+        Err(e) => return r.errors.push(format!("{e:#}")),
+    };
+    let calls = match statex_runtime::inspect_wit(&p.root.join("wit"), None) {
+        Ok(i) => i.calls,
+        Err(e) => return r.errors.push(format!("{e:#}")),
+    };
+    for c in &calls {
+        if !listed.contains(&c.app) {
+            r.errors.push(format!("{} is imported but app {} is not listed under [calls] apps in statex.toml", c.import, c.app));
+            continue;
+        }
+        if let Some(Ok(types)) = crate::calls::local_types(p, ws, &c.app) {
+            for m in statex_runtime::call_mismatches_in(c, &c.app, &types) {
+                r.errors.push(format!("{}: {m} (run `statex calls sync`)", c.import));
+            }
+        }
+    }
+    match crate::calls::local_plan(p, ws) {
+        Ok((want, remote)) => {
+            let have = crate::calls::on_disk(p);
+            for d in crate::calls::diff(&want, &have) {
+                r.errors.push(format!("client interfaces: {d} (run `statex calls sync`)"));
+            }
+            for a in remote {
+                r.warnings.push(format!("app {a} is not in this workspace; its client interface was not checked against its source"));
+            }
+        }
+        Err(e) => r.errors.push(format!("{e:#}")),
+    }
 }
