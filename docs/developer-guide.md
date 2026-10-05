@@ -25,6 +25,33 @@ apps/payments/shop/
 `statex add-actor <name>` adds another actor type. It creates the WIT interface,
 adds the `export` to the world, creates a migration and adds a Rust stub.
 
+### Stateless actor types
+
+Opt an exported type into fresh, non-durable execution in `statex.toml`:
+
+```toml
+[actors.worker]
+stateless = true
+```
+
+Every call runs a new component instance on the receiving node, without acquiring
+actor ownership or creating a durable database. The normal keyed method URLs,
+identity (with epoch `0`), JSON API, limits, outbound HTTP and actor calls still
+work. Instance memory is discarded after each call. SQL, alarms and spawning
+tasks are unavailable; stateless types cannot have migrations or export an alarm
+handler. Explicit create and delete operations are rejected. `statex check` and
+deploy validation enforce these restrictions. Changing an existing type between
+stateful and stateless is a breaking change. See `examples/stateless`.
+
+Nodes bound concurrent stateless calls with `NodeConfig::max_stateless_calls`
+(default `64`, must be positive). Calls beyond that capacity return HTTP `503`
+without allocating a new instance; a slot stays reserved until guest execution
+finishes, even if the requesting client disconnects. Actor-call cycle detection
+and the normal call-depth limit apply to stateless calls as well.
+
+Stateful types can separately enable `[actors.<type>] group_commit = true`;
+it cannot be combined with `stateless = true`.
+
 ## 2. Describe the API in WIT
 
 ```wit
@@ -712,3 +739,36 @@ Operational notes:
 - **`--advertise`** must be reachable from the other nodes. `--internal-listen` can put node-to-node traffic on a separate port.
 - **Nodes are only fenced on lease loss.** A fenced node exits with code 3; let your supervisor restart it.
 - **Local disk is a cache.** Losing it never loses acknowledged data.
+
+## Application-level queue example
+
+[`examples/queue`](../examples/queue/README.md) implements a queue as an
+ordinary Rust Wasm app using actor SQL, alarms and transactional
+`statex_guest::spawn::send`, not a dedicated host queue API. Its stateful
+`queue` actors enable group commit; its stateless `worker` runs only after
+durable enqueue commit, outside the queue actor lock, and synchronously
+records idempotent effects in a stateful `sink` before settling the queue.
+
+Each queue key has bounded batching, delayed delivery, retry delay/count,
+lease duration, concurrent-batch limits and an optional local DLQ key.
+Producer IDs have persistent acceptance receipts even after consumption;
+batch settlement requires a current unexpired token, preventing stale
+workers from settling a newer lease. Worker traps recover through lease
+expiry rather than automatic acknowledgement. Four-day payload retention
+continues sweeping while paused or without a consumer.
+
+```sh
+cd examples/queue
+cargo test
+cargo build --release --target wasm32-wasip2
+statex dev
+# In another terminal in the same directory:
+statex call queue orders send '{"id":"order-1","body":"aGVsbG8=","delay-ms":0}'
+# After the batching timeout:
+statex call sink orders entries
+statex call queue orders info
+```
+
+See the example README for configuration, limits, DLQ semantics, native
+mock tests and the end-to-end host integration contract. Use a current CLI
+that provides the `statex:host/spawn` import.

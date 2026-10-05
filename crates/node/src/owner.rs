@@ -43,6 +43,25 @@ pub async fn read(store: &DynStore, id: &ActorId) -> Result<Option<(OwnerRecord,
     Ok(get_json::<OwnerRecord>(&**store, &id.owner_key()).await?)
 }
 
+/// Resolve a live remote owner without acquiring or serializing its actor.
+pub async fn remote_owner(store: &DynStore, id: &ActorId, me: &NodeRecord) -> Result<Option<NodeRecord>> {
+    match read(store, id).await? {
+        Some((record, _)) => live_remote_owner(store, &record, me).await,
+        None => Ok(None),
+    }
+}
+
+async fn live_remote_owner(store: &DynStore, record: &OwnerRecord, me: &NodeRecord) -> Result<Option<NodeRecord>> {
+    if record.state == OwnerState::Owned && !(record.node == me.node_id && record.session == me.session) {
+        if let Some(node) = read_node(store, &record.node).await? {
+            if node.session == record.session && node.alive() {
+                return Ok(Some(node));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Takes ownership of an actor if it is unowned or its owner is dead.
 pub async fn acquire(store: &DynStore, id: &ActorId, me: &NodeRecord, create_only: bool) -> Result<Acquire> {
     let key = id.owner_key();
@@ -58,10 +77,8 @@ pub async fn acquire(store: &DynStore, id: &ActorId, me: &NodeRecord, create_onl
                     return Ok(Acquire::Exists);
                 }
                 if old.state == OwnerState::Owned && !(old.node == me.node_id && old.session == me.session) {
-                    if let Some(n) = read_node(store, &old.node).await? {
-                        if n.session == old.session && n.alive() {
-                            return Ok(Acquire::Remote(n));
-                        }
+                    if let Some(n) = live_remote_owner(store, old, me).await? {
+                        return Ok(Acquire::Remote(n));
                     }
                     tracing::info!(actor = %id, "taking over from dead owner {} (epoch {})", old.node, old.epoch);
                 }

@@ -39,6 +39,26 @@ Any write that was acknowledged therefore survives:
   the waker node within `wake_tick` (1 s), or within `wake_full_scan` (30 s)
   after the waker fails over, plus any failover time of the actor itself.
 
+## Asynchronous calls
+
+- Scheduling `spawn.send` is atomic with the sender's writes. A rollback
+  cancels the scheduled call; dispatch starts only after its scheduling
+  transaction is durable.
+- Spawn delivery is at least once. A successful stateful delivery records a
+  durable receipt atomically with its database changes, so re-delivery of that
+  task does not repeat those changes. External HTTP effects are still not
+  transactional.
+- Stateless receivers have no durable storage or delivery receipts. Their
+  effects can repeat, including after a dispatcher crash. Use stable business
+  ids (such as the queue's message id) when calling external systems.
+- Task settlement is independent of the callee's transaction. Failed and
+  uncertain deliveries remain pending and retry with bounded backoff; deleting
+  the sender discards its outbox. A permanently invalid target can occupy an
+  outbox slot until repaired or the sender is deleted.
+- A successful producer response means the outbox task is durable, not that
+  the destination has run. Retrying an unacknowledged producer call can create
+  a second task unless the producer method itself is idempotent.
+
 ## What is *not* guaranteed
 
 - **Unacknowledged writes may still become visible.** If the segment upload succeeded but the ownership check then failed or timed out, the client receives `503 unavailable`. A later owner may still restore that write, which also happens if the owner crashed between upload and response. Treat 503 as "unknown outcome". Methods that must not be applied twice should take an idempotency key and record it in the actor's database (a `UNIQUE` column makes this a one-line check).

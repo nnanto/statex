@@ -17,7 +17,7 @@ wasmtime::component::bindgen!({
     world: "imports",
 });
 
-use statex::host::{actors, alarms, context, http_client, log, sql};
+use statex::host::{actors, alarms, context, http_client, log, sql, spawn};
 
 /// Identity of the executing actor, exposed through `statex:host/context`.
 #[derive(Debug, Clone)]
@@ -45,9 +45,32 @@ pub struct HostState {
     pub(crate) deadline: Option<Instant>,
     /// Whether the actor type exports an alarm handler.
     pub(crate) has_alarm: bool,
+    pub(crate) stateless: bool,
+    pub(crate) spawn_methods: Vec<(String, String, crate::manifest::Method)>,
 }
 
 impl actors::Host for HostState {}
+
+impl spawn::Host for HostState {
+    fn send(&mut self, app: String, actor_type: String, key: String, method: String, args_json: String) -> Result<String, String> {
+        if self.stateless {
+            return Err("stateless actors have no transaction for a durable spawn".into());
+        }
+        if key.is_empty() || key.len() > 512 {
+            return Err("spawn target key must be 1..=512 bytes".into());
+        }
+        if args_json.len() > crate::spawn::MAX_ARGS_BYTES {
+            return Err(format!("spawn arguments exceed {} bytes", crate::spawn::MAX_ARGS_BYTES));
+        }
+        let signature = self.spawn_methods.iter()
+            .find(|(a, t, m)| a == &app && t == &actor_type && m.name == method)
+            .map(|(_, _, m)| m)
+            .ok_or_else(|| format!("spawn target {app}/{actor_type}.{method} is not exported by this app or declared in its client imports"))?;
+        let args: serde_json::Value = serde_json::from_str(&args_json).map_err(|e| format!("invalid spawn arguments: {e}"))?;
+        crate::json::args_to_vals(signature, &args)?;
+        crate::spawn::enqueue(&self.db.lock().unwrap(), self.identity.epoch, &app, &actor_type, &key, &method, &args_json)
+    }
+}
 
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -72,6 +95,9 @@ impl context::Host for HostState {
 
 impl alarms::Host for HostState {
     fn set(&mut self, at_ms: u64) -> Result<(), String> {
+        if self.stateless {
+            return Err("stateless actors cannot schedule alarms".into());
+        }
         if !self.has_alarm {
             return Err(format!(
                 "actor type {} has no alarm handler; export `alarm: func(retry-count: u32);` in its interface",
@@ -132,6 +158,9 @@ fn from_rv(v: RV) -> sql::Value {
 
 impl sql::Host for HostState {
     fn execute(&mut self, stmt: String, params: Vec<sql::Value>) -> Result<u64, String> {
+        if self.stateless {
+            return Err("stateless actors have no SQL storage".into());
+        }
         if let Some(kw) = forbidden(&stmt) {
             return Err(format!("{kw} is not allowed: the host manages transactions"));
         }
@@ -141,6 +170,9 @@ impl sql::Host for HostState {
     }
 
     fn query(&mut self, stmt: String, params: Vec<sql::Value>) -> Result<sql::Rows, String> {
+        if self.stateless {
+            return Err("stateless actors have no SQL storage".into());
+        }
         if let Some(kw) = forbidden(&stmt) {
             return Err(format!("{kw} is not allowed: the host manages transactions"));
         }
@@ -261,6 +293,8 @@ mod tests {
             chain: vec![],
             deadline: None,
             has_alarm: false,
+            stateless: false,
+            spawn_methods: Vec::new(),
         };
         let e = alarms::Host::set(&mut s, 10).unwrap_err();
         assert!(e.contains("no alarm handler"), "{e}");

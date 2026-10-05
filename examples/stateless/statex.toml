@@ -1,0 +1,5 @@
+[app]
+name = "stateless"
+
+[actors.worker]
+stateless = true

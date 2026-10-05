@@ -177,7 +177,7 @@ impl Node {
     }
 
     /// Acquires or renews the waker lease. Returns whether this node holds it.
-    async fn hold_waker(&self) -> anyhow::Result<bool> {
+    pub(crate) async fn hold_waker(&self) -> anyhow::Result<bool> {
         let me = self.me();
         let now = now_ms();
         let ttl = self.cfg.lease_ttl.as_millis() as u64;

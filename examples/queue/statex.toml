@@ -1,0 +1,18 @@
+[app]
+name = "queue"
+
+[http]
+allow = []
+
+[limits]
+timeout_ms = 5000
+memory_mb = 64
+
+[actors.queue]
+group_commit = true
+
+[actors.worker]
+stateless = true
+
+[calls]
+apps = ["queue"]

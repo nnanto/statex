@@ -101,6 +101,7 @@ world app {{
   import statex:host/http-client@0.1.0;
   import statex:host/log@0.1.0;
   import statex:host/alarms@0.1.0;
+  import statex:host/spawn@0.1.0;
 
   export {actor};
 }}

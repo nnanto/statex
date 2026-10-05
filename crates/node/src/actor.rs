@@ -23,7 +23,7 @@ pub struct Actor {
     pub owner_etag: ETag,
     pub dir: PathBuf,
     db_path: PathBuf,
-    db: Arc<Mutex<Connection>>,
+    pub(crate) db: Arc<Mutex<Connection>>,
     wal: WalTail,
     /// Last durable transaction id.
     pub txid: u64,
@@ -50,6 +50,9 @@ pub enum Op {
     /// a retry if it fails. Answers `{"fired": bool, "error"?: string,
     /// "armed"?: wake name}`, `armed` naming the alarm still scheduled.
     Alarm { now_ms: u64 },
+    Deliver { method: String, args: J, delivery_id: String },
+    OutboxPoll { id: String, now_ms: u64 },
+    OutboxSettle { id: String, attempt: u32, error: Option<String>, now_ms: u64 },
 }
 
 pub struct Executed {
@@ -58,6 +61,15 @@ pub struct Executed {
     pub segment: Option<Segment>,
     /// Set when the committed transaction changed the scheduled alarm.
     pub alarm: Option<AlarmChange>,
+    /// Newly committed tasks whose wake hints must precede the segment upload.
+    pub outbox: Vec<statex_runtime::spawn::Pending>,
+}
+
+pub struct ExecutedGroup {
+    pub outcomes: Vec<Outcome>,
+    pub segment: Option<Segment>,
+    pub alarm: Option<AlarmChange>,
+    pub outbox: Vec<statex_runtime::spawn::Pending>,
 }
 
 /// The alarm before and after a transaction that changed it.
@@ -165,6 +177,75 @@ fn checkpoint(conn: &Connection) -> Result<()> {
 }
 
 impl Actor {
+    /// Commits a batch of calls in one SQLite transaction. Each call has its
+    /// own rollback boundary; migrations follow the first successful call.
+    pub fn execute_group(&mut self, code: &Arc<AppCode>, ops: Vec<Op>) -> Result<ExecutedGroup> {
+        if ops.iter().any(|op| !matches!(op, Op::Call { .. } | Op::Deliver { .. })) {
+            bail!("only calls and deliveries may execute in a group");
+        }
+        if !Arc::ptr_eq(code, &self.code) {
+            self.instance = None;
+            self.code = code.clone();
+            self.migrated = false;
+        }
+        let before = self.alarm;
+        let outbox_before = statex_runtime::spawn::pending(&self.db.lock().unwrap())?;
+        self.db.lock().unwrap().execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<Vec<Outcome>> {
+            let mut outcomes = Vec::with_capacity(ops.len());
+            let mut migrated = self.migrated;
+            for op in ops {
+                self.db.lock().unwrap().execute_batch("SAVEPOINT method")?;
+                let result = self.migrate().and_then(|()| match op {
+                    Op::Call { method, args, chain } => {
+                        let ty = self.id.ty.clone();
+                        Ok(self.instance()?.call_with(&ty, &method, &args, &chain))
+                    }
+                    Op::Deliver { method, args, delivery_id } => self.deliver(&method, &args, &delivery_id),
+                    _ => unreachable!("group operations were validated"),
+                });
+                let commit = matches!(&result, Ok(Ok(out)) if !out.is_err);
+                self.db.lock().unwrap().execute_batch(if commit {
+                    "RELEASE method"
+                } else {
+                    "ROLLBACK TO method; RELEASE method"
+                })?;
+                let outcome = result?;
+                if commit {
+                    migrated = true;
+                    self.migrated = true;
+                }
+                if matches!(outcome, Err(CallError::Trap(_))) {
+                    self.instance = None;
+                }
+                outcomes.push(outcome);
+            }
+            self.db.lock().unwrap().execute_batch("COMMIT").context("commit group")?;
+            self.migrated = migrated;
+            Ok(outcomes)
+        })();
+        let outcomes = match result {
+            Ok(outcomes) => outcomes,
+            Err(e) => {
+                let _ = self.db.lock().unwrap().execute_batch("ROLLBACK");
+                self.instance = None;
+                self.migrated = false;
+                return Err(e);
+            }
+        };
+        let segment = self.wal.capture()?.map(|pages| {
+            self.txid += 1;
+            Segment { epoch: self.epoch, txid: self.txid, pages }
+        });
+        if segment.is_some() {
+            self.alarm = alarm::read(&self.db.lock().unwrap())?;
+        }
+        self.last_used = Instant::now();
+        let alarm = (before != self.alarm).then_some(AlarmChange { before, after: self.alarm });
+        let outbox = self.new_outbox(&outbox_before)?;
+        Ok(ExecutedGroup { outcomes, segment, alarm, outbox })
+    }
+
     /// Runs one operation (one committed transaction at most). Blocking; call
     /// from `spawn_blocking`.
     pub fn execute(&mut self, code: &Arc<AppCode>, op: Op) -> Result<Executed> {
@@ -175,6 +256,7 @@ impl Actor {
             self.migrated = false;
         }
         let before = self.alarm;
+        let outbox_before = statex_runtime::spawn::pending(&self.db.lock().unwrap())?;
         let is_alarm = matches!(op, Op::Alarm { .. });
         let (mut outcome, segment) = match op {
             Op::Touch => self.transaction(|_| Ok(ok(J::Null)))?,
@@ -183,6 +265,19 @@ impl Actor {
                 Ok(a.instance()?.call_with(&ty, &method, &args, &chain))
             })?,
             Op::Alarm { now_ms } => self.fire_alarm(now_ms)?,
+            Op::Deliver { method, args, delivery_id } => self.transaction(|a| a.deliver(&method, &args, &delivery_id))?,
+            Op::OutboxPoll { id, now_ms } => self.transaction(|a| {
+                let db = a.db.lock().unwrap();
+                let task = statex_runtime::spawn::claim(&db, &id, now_ms)?;
+                let pending = statex_runtime::spawn::pending(&db)?.iter().any(|task| task.id == id);
+                Ok(ok(serde_json::json!({ "pending": pending, "task": task })))
+            })?,
+            Op::OutboxSettle { id, attempt, error, now_ms } => self.transaction(|a| {
+                let db = a.db.lock().unwrap();
+                statex_runtime::spawn::settle(&db, &id, attempt, error.as_deref(), now_ms)?;
+                let pending = statex_runtime::spawn::pending(&db)?.iter().any(|task| task.id == id);
+                Ok(ok(serde_json::json!({ "pending": pending })))
+            })?,
         };
         if segment.is_some() {
             self.alarm = alarm::read(&self.db.lock().unwrap())?;
@@ -196,7 +291,31 @@ impl Actor {
         }
         self.last_used = Instant::now();
         let alarm = (self.alarm != before).then_some(AlarmChange { before, after: self.alarm });
-        Ok(Executed { outcome, segment, alarm })
+        let outbox = self.new_outbox(&outbox_before)?;
+        Ok(Executed { outcome, segment, alarm, outbox })
+    }
+
+    fn new_outbox(&self, before: &[statex_runtime::spawn::Pending]) -> Result<Vec<statex_runtime::spawn::Pending>> {
+        Ok(statex_runtime::spawn::pending(&self.db.lock().unwrap())?
+            .into_iter()
+            .filter(|task| !before.iter().any(|old| old.id == task.id))
+            .collect())
+    }
+
+    fn deliver(&mut self, method: &str, args: &J, delivery_id: &str) -> Result<Outcome> {
+        if let Some(value) = statex_runtime::spawn::receipt(&self.db.lock().unwrap(), delivery_id)? {
+            return Ok(ok(serde_json::from_str(&value)?));
+        }
+        let ty = self.id.ty.clone();
+        let outcome = self.instance()?.call_with(&ty, method, args, &[]);
+        if let Ok(output) = &outcome {
+            if !output.is_err {
+                statex_runtime::spawn::acknowledge(
+                    &self.db.lock().unwrap(), delivery_id, &serde_json::to_string(&output.value)?,
+                )?;
+            }
+        }
+        Ok(outcome)
     }
 
     /// Runs `body` in one transaction, after any pending migrations. Only a

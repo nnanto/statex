@@ -1,0 +1,1 @@
+CREATE TABLE entries (id TEXT PRIMARY KEY, body BLOB NOT NULL);

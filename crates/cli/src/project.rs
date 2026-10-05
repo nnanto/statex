@@ -22,6 +22,18 @@ pub struct StatexToml {
     /// Other apps whose actors this app calls (see `statex calls sync`).
     #[serde(default)]
     pub calls: CallsSection,
+    /// Per-exported-type execution options.
+    #[serde(default)]
+    pub actors: BTreeMap<String, ActorConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActorConfig {
+    #[serde(default)]
+    pub stateless: bool,
+    #[serde(default)]
+    pub group_commit: bool,
 }
 
 /// `[calls]`: apps this app calls; `statex calls sync` generates their client interfaces.
@@ -140,7 +152,11 @@ impl Project {
     }
 
     pub fn manifest(&self, wasm: &[u8]) -> Result<Manifest> {
-        Manifest::build(wasm, self.app(), self.migrations()?, self.cfg.http.clone(), self.cfg.limits.clone())
+        let mut manifest =
+            Manifest::build(wasm, self.app(), self.migrations()?, self.cfg.http.clone(), self.cfg.limits.clone())?;
+        configure_types(&mut manifest.types, &self.cfg.actors)?;
+        manifest.validate_actor_options()?;
+        Ok(manifest)
     }
 
     /// Paths whose changes trigger a rebuild in `statex dev`.
@@ -255,14 +271,34 @@ pub fn read_migrations(root: &Path) -> Result<BTreeMap<String, Vec<Migration>>> 
 /// Actor types (from `<root>/wit`) and migrations of an app's source tree,
 /// with the same consistency checks a deploy applies.
 pub fn source_surface(root: &Path) -> Result<(Vec<statex_runtime::ActorType>, BTreeMap<String, Vec<Migration>>)> {
-    let types = statex_runtime::inspect_wit(&root.join("wit"), None)?.types;
+    let mut types = statex_runtime::inspect_wit(&root.join("wit"), None)?.types;
+    let cfg: StatexToml = toml::from_str(&std::fs::read_to_string(root.join("statex.toml"))?)?;
+    configure_types(&mut types, &cfg.actors)?;
     let migrations = read_migrations(root)?;
     for t in migrations.keys() {
         if !types.iter().any(|x| &x.name == t) {
             bail!("migrations/{t}/ does not match any exported actor type");
         }
     }
+    for t in types.iter().filter(|t| t.stateless) {
+        anyhow::ensure!(t.alarm.is_none(), "stateless actor type {} cannot export an alarm handler", t.name);
+        anyhow::ensure!(
+            migrations.get(&t.name).is_none_or(Vec::is_empty),
+            "stateless actor type {} cannot have migrations", t.name
+        );
+    }
     Ok((types, migrations))
+}
+
+fn configure_types(types: &mut [statex_runtime::ActorType], cfg: &BTreeMap<String, ActorConfig>) -> Result<()> {
+    for (name, options) in cfg {
+        let ty = types.iter_mut().find(|t| &t.name == name)
+            .with_context(|| format!("[actors.{name}] does not match any exported actor type"))?;
+        anyhow::ensure!(!(options.stateless && options.group_commit), "stateless actor type {name} cannot enable group_commit");
+        ty.stateless = options.stateless;
+        ty.group_commit = options.group_commit;
+    }
+    Ok(())
 }
 
 /// Full verification: imports, exports, linking, instantiation and migrations.
@@ -270,12 +306,16 @@ pub fn verify(wasm: &[u8], manifest: &Manifest) -> Result<()> {
     let rt = Runtime::shared()?;
     let code = rt.load(wasm, manifest.clone())?;
     for t in &manifest.types {
+        let id = ActorIdentity { app: manifest.app.clone(), actor_type: t.name.clone(), key: "verify".into(), epoch: 0 };
+        if t.stateless {
+            code.instantiate_stateless(id, None).with_context(|| format!("instantiate for {}", t.name))?;
+            continue;
+        }
         let dir = tempfile::tempdir()?;
         let conn = open_db(&dir.path().join("verify.db"))?;
         conn.execute_batch("BEGIN")?;
         let migrations = manifest.migrations.get(&t.name).cloned().unwrap_or_default();
         apply_migrations(&conn, &migrations).with_context(|| format!("migrations of actor type {}", t.name))?;
-        let id = ActorIdentity { app: manifest.app.clone(), actor_type: t.name.clone(), key: "verify".into(), epoch: 0 };
         code.instantiate(id, Arc::new(Mutex::new(conn))).with_context(|| format!("instantiate for {}", t.name))?;
     }
     Ok(())
@@ -288,7 +328,8 @@ pub fn print_summary(manifest: &Manifest, wasm_len: usize) {
     println!("app {}  ({size}sha256 {})", manifest.app, &manifest.sha256[..12]);
     for t in &manifest.types {
         let n = manifest.migrations.get(&t.name).map_or(0, |m| m.len());
-        println!("  actor type {}  ({} migration{})", t.name, n, if n == 1 { "" } else { "s" });
+        let mode = if t.stateless { ", stateless" } else if t.group_commit { ", group commit" } else { "" };
+        println!("  actor type {}  ({} migration{}{mode})", t.name, n, if n == 1 { "" } else { "s" });
         for m in &t.methods {
             let params = m.params.iter().map(|p| format!("{}: {}", p.name, fmt_ty(&p.ty))).collect::<Vec<_>>().join(", ");
             let ret = m.result.as_ref().map(|r| format!(" -> {}", fmt_ty(r))).unwrap_or_default();
@@ -316,5 +357,38 @@ pub fn sample(t: &Ty) -> serde_json::Value {
         Ty::Variant { cases, .. } => json!({ "tag": cases.first().map(|c| c.name.clone()) }),
         Ty::Result { ok, .. } => json!({ "ok": ok.as_deref().map(sample) }),
         _ => json!(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn actor_configuration_is_applied_to_source_checks() {
+        let root = tempfile::tempdir_in(env!("CARGO_MANIFEST_DIR")).unwrap();
+        std::fs::create_dir(root.path().join("wit")).unwrap();
+        std::fs::write(root.path().join("wit/app.wit"),
+            "package test:app; interface worker { run: func(); } world app { export worker; }").unwrap();
+        let cfg = root.path().join("statex.toml");
+        std::fs::write(&cfg, "[app]\nname = 'test'\n[actors.worker]\nstateless = true\n").unwrap();
+        let (types, _) = source_surface(root.path()).unwrap();
+        assert!(types[0].stateless);
+        assert!(!types[0].group_commit);
+        std::fs::write(root.path().join("wit/app.wit"),
+            "package test:app; interface worker { run: func(); alarm: func(); } world app { export worker; }").unwrap();
+        assert!(source_surface(root.path()).unwrap_err().to_string().contains("cannot export an alarm"));
+        std::fs::write(root.path().join("wit/app.wit"),
+            "package test:app; interface worker { run: func(); } world app { export worker; }").unwrap();
+        std::fs::create_dir_all(root.path().join("migrations/worker")).unwrap();
+        std::fs::write(root.path().join("migrations/worker/0001.sql"), "SELECT 1;").unwrap();
+        assert!(source_surface(root.path()).unwrap_err().to_string().contains("cannot have migrations"));
+        std::fs::write(&cfg, "[app]\nname = 'test'\n[actors.worker]\ngroup_commit = true\n").unwrap();
+        let (types, _) = source_surface(root.path()).unwrap();
+        assert!(types[0].group_commit && !types[0].stateless);
+        std::fs::write(&cfg, "[app]\nname = 'test'\n[actors.missing]\nstateless = true\n").unwrap();
+        assert!(source_surface(root.path()).unwrap_err().to_string().contains("does not match"));
+        std::fs::write(&cfg, "[app]\nname = 'test'\n[actors.worker]\nstateless = true\ngroup_commit = true\n").unwrap();
+        assert!(source_surface(root.path()).unwrap_err().to_string().contains("group_commit"));
     }
 }

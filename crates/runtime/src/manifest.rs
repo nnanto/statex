@@ -83,6 +83,12 @@ pub struct ActorType {
     /// one. It runs when the actor's alarm fires and is not a public method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alarm: Option<Method>,
+    /// Run each call in a fresh instance without durable actor state.
+    #[serde(default)]
+    pub stateless: bool,
+    /// Batch durable acknowledgements for this actor type.
+    #[serde(default)]
+    pub group_commit: bool,
 }
 
 /// Name of the method an actor type exports to handle its alarm.
@@ -157,6 +163,21 @@ pub struct Manifest {
 impl Manifest {
     pub fn actor_type(&self, name: &str) -> Option<&ActorType> {
         self.types.iter().find(|t| t.name == name)
+    }
+
+    /// Checks options even for manifests received directly through the deploy API.
+    pub fn validate_actor_options(&self) -> Result<()> {
+        for t in &self.types {
+            if t.stateless {
+                anyhow::ensure!(t.alarm.is_none(), "stateless actor type {} cannot export an alarm handler", t.name);
+                anyhow::ensure!(
+                    self.migrations.get(&t.name).is_none_or(Vec::is_empty),
+                    "stateless actor type {} cannot have migrations", t.name
+                );
+                anyhow::ensure!(!t.group_commit, "stateless actor type {} cannot enable group_commit", t.name);
+            }
+        }
+        Ok(())
     }
 
     /// Builds and validates a manifest for a component binary: checks imports,
@@ -377,7 +398,9 @@ fn inspect_world(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Inspec
                 if types.iter().any(|t| t.name == name) {
                     bail!("two exported interfaces are both named `{name}`; actor type names must be unique");
                 }
-                types.push(ActorType { name, export, docs: iface.docs.contents.clone(), methods, alarm });
+                types.push(ActorType {
+                    name, export, docs: iface.docs.contents.clone(), methods, alarm, stateless: false, group_commit: false,
+                });
             }
             WorldItem::Function(f) => {
                 bail!("world-level export function `{}` is not supported; export an interface instead", f.name)
@@ -549,6 +572,28 @@ fn ty_of(resolve: &Resolve, t: &Type, ctx: &str) -> Result<Ty> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actor_options_default_for_old_manifests_and_validate_stateless() {
+        let mut ty: ActorType = serde_json::from_value(serde_json::json!({
+            "name": "worker", "export": "x:y/worker", "methods": []
+        })).unwrap();
+        assert!(!ty.stateless && !ty.group_commit);
+        ty.stateless = true;
+        let mut m = Manifest {
+            format: 1, app: "test".into(), sha256: String::new(), types: vec![ty],
+            migrations: BTreeMap::new(), http: Default::default(), limits: Default::default(), calls: vec![],
+        };
+        m.validate_actor_options().unwrap();
+        m.types[0].group_commit = true;
+        assert!(m.validate_actor_options().unwrap_err().to_string().contains("group_commit"));
+        m.types[0].group_commit = false;
+        m.types[0].alarm = Some(Method { name: "alarm".into(), params: vec![], result: None, docs: None });
+        assert!(m.validate_actor_options().unwrap_err().to_string().contains("alarm"));
+        m.types[0].alarm = None;
+        m.migrations.insert("worker".into(), vec![Migration { name: "init.sql".into(), sql: "SELECT 1".into() }]);
+        assert!(m.validate_actor_options().unwrap_err().to_string().contains("migrations"));
+    }
 
     #[test]
     fn app_names() {

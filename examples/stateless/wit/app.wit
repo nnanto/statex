@@ -1,0 +1,15 @@
+package example:stateless@0.1.0;
+
+interface worker {
+  // Instance memory starts at zero on every invocation.
+  increment: func() -> u64;
+  epoch: func() -> u64;
+  sql: func() -> result<u64, string>;
+  schedule: func() -> result<_, string>;
+  spawn: func() -> result<string, string>;
+  fail: func();
+}
+
+world app {
+  export worker;
+}

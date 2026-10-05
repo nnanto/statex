@@ -39,6 +39,9 @@ pub fn breaking_changes(old: Surface<'_>, new: Surface<'_>) -> Vec<String> {
             out.push(format!("actor type `{}` was removed", ot.name));
             continue;
         };
+        if ot.stateless != nt.stateless {
+            out.push(format!("actor type `{}` changed stateless mode", ot.name));
+        }
         for om in &ot.methods {
             let Some(nm) = nt.method(&om.name) else {
                 out.push(format!("method `{}.{}` was removed", ot.name, om.name));
@@ -236,7 +239,29 @@ mod tests {
     use crate::manifest::{Field, Method, Param};
 
     fn ty(methods: Vec<Method>) -> ActorType {
-        ActorType { name: "cart".into(), export: "x:y/cart".into(), docs: None, methods, alarm: None }
+        ActorType { name: "cart".into(), export: "x:y/cart".into(), docs: None, methods, alarm: None, stateless: false, group_commit: false }
+    }
+
+    #[test]
+    fn changing_stateless_mode_is_breaking_but_group_commit_is_not() {
+        let migrations = BTreeMap::new();
+        let old = vec![ty(vec![])];
+        let mut new = old.clone();
+        new[0].group_commit = true;
+        assert!(breaking_changes(
+            Surface { types: &old, migrations: &migrations },
+            Surface { types: &new, migrations: &migrations },
+        ).is_empty());
+        new[0].group_commit = false;
+        new[0].stateless = true;
+        assert!(breaking_changes(
+            Surface { types: &old, migrations: &migrations },
+            Surface { types: &new, migrations: &migrations },
+        )[0].contains("stateless"));
+        assert!(breaking_changes(
+            Surface { types: &new, migrations: &migrations },
+            Surface { types: &old, migrations: &migrations },
+        )[0].contains("stateless"));
     }
     fn m(name: &str, params: Vec<(&str, Ty)>, result: Option<Ty>) -> Method {
         Method {

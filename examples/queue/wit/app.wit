@@ -1,0 +1,53 @@
+package example:queue@0.1.0;
+
+interface queue {
+  record config {
+    max-batch-size: u32,
+    batch-timeout-ms: u64,
+    max-retries: u32,
+    retry-delay-ms: u64,
+    lease-ms: u64,
+    max-concurrency: u32,
+    consumer-key: option<string>,
+    dlq-key: option<string>,
+  }
+  record input { id: string, body: list<u8>, delay-ms: u64 }
+  record outcome { id: string, ack: bool }
+  record status {
+    configuration: config,
+    paused: bool,
+    pending: u64,
+    in-flight: u64,
+    active-batches: u64,
+    receipts: u64,
+    alarm-at: option<u64>,
+  }
+  configure: func(configuration: config) -> result<_, string>;
+  // False means this id was accepted previously, including already settled ids.
+  send: func(id: string, body: list<u8>, delay-ms: u64) -> result<bool, string>;
+  send-batch: func(messages: list<input>) -> result<list<bool>, string>;
+  settle: func(token: string, outcomes: list<outcome>) -> result<_, string>;
+  pause: func();
+  resume: func();
+  info: func() -> status;
+  alarm: func(retry-count: u32) -> result<_, string>;
+}
+
+interface worker {
+  record delivery { id: string, body: list<u8>, attempt: u32 }
+  process: func(queue-key: string, token: string, messages: list<delivery>) -> result<_, string>;
+}
+
+interface sink {
+  record entry { id: string, body: list<u8> }
+  %record: func(id: string, body: list<u8>) -> result<bool, string>;
+  entries: func() -> list<entry>;
+}
+
+world app {
+  import statex:queue/queue;
+  import statex:queue/sink;
+  export queue;
+  export worker;
+  export sink;
+}

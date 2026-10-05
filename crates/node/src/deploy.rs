@@ -89,6 +89,7 @@ pub async fn broken_callers(store: &DynStore, manifest: &Manifest) -> Result<Vec
 
 /// Uploads a version and makes it current. Idempotent for the same binary.
 pub async fn deploy(store: &DynStore, wasm: &[u8], manifest: &Manifest, opts: &DeployOptions) -> Result<Current> {
+    manifest.validate_actor_options()?;
     let (app, sha) = (&manifest.app, &manifest.sha256);
     anyhow::ensure!(statex_runtime::sha256_hex(wasm) == *sha, "manifest sha256 does not match component");
     let manifest_bytes = to_json_bytes(manifest);

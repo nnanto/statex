@@ -154,6 +154,26 @@ pub fn logs() -> Vec<(Level, String)> {
     STATE.with(|s| s.borrow().logs.clone())
 }
 
+/// Committed asynchronous calls. The mock records but does not dispatch them.
+pub fn spawned(actor_type: &str, key: &str) -> Vec<crate::spawn::Request> {
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        ensure_actor(&mut s, actor_type, key);
+        let conn = &s.actors[&(actor_type.into(), key.into())].conn;
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='_statex_outbox')", [], |r| r.get(0),
+        ).expect("inspect outbox");
+        if !exists {
+            return Vec::new();
+        }
+        let mut stmt = conn.prepare("SELECT id,app,actor_type,actor_key,method,args_json FROM _statex_outbox ORDER BY rowid").expect("prepare outbox");
+        stmt.query_map([], |r| Ok(crate::spawn::Request {
+            id: r.get(0)?, app: r.get(1)?, actor_type: r.get(2)?, key: r.get(3)?,
+            method: r.get(4)?, args_json: r.get(5)?,
+        })).expect("query outbox").collect::<rusqlite::Result<Vec<_>>>().expect("read outbox")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +199,22 @@ mod tests {
             params![k, v],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn spawn_participates_in_transaction() {
+        setup();
+        let failed: Result<(), &str> = try_call("kv", "a", || {
+            crate::spawn::send("app", "worker", "k", "run", "[]").unwrap();
+            Err("rollback")
+        });
+        assert!(failed.is_err());
+        assert!(spawned("kv", "a").is_empty());
+        let id = call("kv", "a", || crate::spawn::send("app", "worker", "k", "run", "[]").unwrap());
+        assert_eq!(spawned("kv", "a")[0].id, id);
+        reactivate("kv", "a");
+        let next = call("kv", "a", || crate::spawn::send("app", "worker", "k", "run", "[]").unwrap());
+        assert_ne!(id, next);
     }
 
     #[test]

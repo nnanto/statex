@@ -81,6 +81,16 @@ interface actors {
   }
 }
 
+/// Transactional asynchronous actor calls. The host delivers a call only
+/// after the sender's transaction is durable. Delivery is at least once;
+/// stateless receivers must make external side effects idempotent.
+interface spawn {
+  /// Arguments use the same JSON representation as the actor HTTP API.
+  /// Returns a stable delivery id. Targets must be exported by this app or
+  /// declared through a client interface import.
+  send: func(app: string, actor-type: string, key: string, method: string, args-json: string) -> result<string, string>;
+}
+
 /// The actor's alarm: at most one scheduled wake-up per actor, stored in its
 /// database. When it is due, the host calls the actor type's alarm handler
 /// (`alarm: func(retry-count: u32)`, exported next to its methods), activating
@@ -113,5 +123,6 @@ world imports {
   import http-client;
   import log;
   import actors;
+  import spawn;
   import alarms;
 }

@@ -245,7 +245,7 @@ fn parse_client(rel: &Path, text: &str) -> Result<Callee> {
     let app = calls.first().map(|c| c.app.clone()).with_context(|| format!("{}: no interfaces", rel.display()))?;
     let types = calls
         .into_iter()
-        .map(|c| ActorType { name: c.actor_type, export: c.import, docs: None, methods: c.methods, alarm: None })
+        .map(|c| ActorType { name: c.actor_type, export: c.import, docs: None, methods: c.methods, alarm: None, stateless: false, group_commit: false })
         .collect();
     Ok(Callee { app, types })
 }
@@ -725,6 +725,8 @@ mod tests {
                     },
                 ],
                 alarm: None,
+                stateless: false,
+                group_commit: false,
             }],
         }
     }

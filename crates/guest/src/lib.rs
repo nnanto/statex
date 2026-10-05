@@ -393,6 +393,30 @@ pub mod actors {
 
 pub use actors::CallError;
 
+/// Durable asynchronous calls. Scheduling participates in the current
+/// transaction; an error or trap rolls the scheduled call back.
+pub mod spawn {
+    use super::{backend, Result};
+
+    pub const MAX_ARGS_BYTES: usize = 1024 * 1024;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct Request {
+        pub id: String,
+        pub app: String,
+        pub actor_type: String,
+        pub key: String,
+        pub method: String,
+        pub args_json: String,
+    }
+
+    /// Targets must be local exports or declared client interfaces. Stateless
+    /// receivers are delivered at least once and must tolerate duplicate effects.
+    pub fn send(app: &str, actor_type: &str, key: &str, method: &str, args_json: &str) -> Result<String> {
+        backend::spawn_send(app, actor_type, key, method, args_json)
+    }
+}
+
 /// The actor's alarm: one scheduled wake-up, stored in its database.
 ///
 /// When the alarm is due, the host calls the actor type's alarm handler, a

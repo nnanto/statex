@@ -34,6 +34,7 @@ host before every test.
 """
 
 import importlib
+import json
 import inspect
 import os
 import sqlite3
@@ -41,7 +42,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__all__ = ["call", "stub", "clear_stubs", "mock_http", "logs", "alarm", "reactivate", "reset", "set_app", "project_root"]
+__all__ = ["call", "stub", "clear_stubs", "mock_http", "logs", "alarm", "spawned", "reactivate", "reset", "set_app", "project_root"]
 
 
 def project_root() -> Path:
@@ -70,7 +71,7 @@ except ImportError as e:  # pragma: no cover
         "(or `statex build`) to create them" % _BINDINGS
     ) from e
 
-_HOST = ("context", "sql", "http_client", "log", "actors", "alarms")
+_HOST = ("context", "sql", "http_client", "log", "actors", "alarms", "spawn")
 
 
 def _module(name: str) -> Optional[Any]:
@@ -183,6 +184,17 @@ def alarm(actor_type: str, key: str) -> Optional[int]:
     None. To test the handler, call it like a method:
     `call("counter", "alice", Counter().alarm, 0)`."""
     return _read_alarm(_db((actor_type, key)))
+
+
+def spawned(actor_type: str, key: str) -> List[Dict[str, Any]]:
+    """Committed asynchronous calls; the mock records but does not dispatch them."""
+    conn = _db((actor_type, key))
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE name='_statex_outbox'").fetchone():
+        return []
+    names = ("id", "app", "actor_type", "key", "method", "args_json")
+    return [dict(zip(names, row)) for row in conn.execute(
+        "SELECT id,app,actor_type,actor_key,method,args_json FROM _statex_outbox ORDER BY rowid"
+    )]
 
 
 # ---- clients of other actors ------------------------------------------------
@@ -342,6 +354,28 @@ def _install() -> None:
         alarms.set = set_alarm
         alarms.get = lambda: _read_alarm(_db(_current()))
         alarms.clear = clear_alarm
+
+    spawn = _module("spawn")
+    if spawn is not None:
+        def spawn_send(app: str, actor_type: str, key: str, method: str, args_json: str) -> str:
+            json.loads(args_json)
+            if not key or len(key.encode()) > 512 or len(args_json.encode()) > 1024 * 1024:
+                raise Err("spawn key or arguments exceed limit")
+            who = _current()
+            conn = _db(who)
+            conn.execute("""CREATE TABLE IF NOT EXISTS _statex_outbox(
+                id TEXT PRIMARY KEY,app TEXT,actor_type TEXT,actor_key TEXT,method TEXT,args_json TEXT)""")
+            conn.execute("CREATE TABLE IF NOT EXISTS _statex_outbox_seq(id INTEGER PRIMARY KEY,seq INTEGER)")
+            if conn.execute("SELECT count(*) FROM _statex_outbox").fetchone()[0] >= 256:
+                raise Err("spawn outbox is full (256 pending deliveries)")
+            seq = conn.execute("""INSERT INTO _statex_outbox_seq(id,seq) VALUES(0,1)
+                ON CONFLICT(id) DO UPDATE SET seq=seq+1 RETURNING seq""").fetchone()[0]
+            delivery_id = "e%d-%d" % (_state.epochs.get(who, 1), seq)
+            conn.execute("INSERT INTO _statex_outbox VALUES(?,?,?,?,?,?)",
+                         (delivery_id, app, actor_type, key, method, args_json))
+            return delivery_id
+
+        spawn.send = spawn_send
 
     log = _module("log")
     if log is not None:

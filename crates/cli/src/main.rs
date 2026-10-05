@@ -139,6 +139,9 @@ enum Cmd {
         /// Seconds of inactivity after which an actor is released.
         #[arg(long, default_value_t = 300)]
         idle_timeout: u64,
+        /// Maximum simultaneous stateless invocations on this node.
+        #[arg(long, env = "STATEX_MAX_STATELESS_CALLS", default_value_t = 64)]
+        max_stateless_calls: usize,
     },
     /// Call a method: statex call counter alice increment '{"by": 2}'
     Call {
@@ -437,7 +440,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("wrote {dir}/ ({n} app{})", if n == 1 { "" } else { "s" });
             }
         }
-        Cmd::Node { store, listen, internal_listen, advertise, node_id, data_dir, lease_ttl, idle_timeout } => {
+        Cmd::Node { store, listen, internal_listen, advertise, node_id, data_dir, lease_ttl, idle_timeout, max_stateless_calls } => {
             let node_id = node_id.unwrap_or_else(|| {
                 let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "node".into());
                 format!("{host}-{}", listen.port())
@@ -447,6 +450,7 @@ async fn run(cli: Cli) -> Result<()> {
             cfg.internal_listen = internal_listen;
             cfg.advertise = advertise;
             cfg.lease_ttl = Duration::from_secs(lease_ttl);
+            cfg.max_stateless_calls = max_stateless_calls;
             cfg.idle_timeout = Duration::from_secs(idle_timeout);
             cfg.exit_on_fence = true;
             let mut h = statex_node::start(cfg).await?;

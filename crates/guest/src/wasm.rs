@@ -89,3 +89,7 @@ pub fn alarm_get() -> Option<u64> {
 pub fn alarm_clear() {
     a::clear()
 }
+
+pub fn spawn_send(app: &str, actor_type: &str, key: &str, method: &str, args_json: &str) -> Result<String> {
+    statex::host::spawn::send(app, actor_type, key, method, args_json).map_err(Error)
+}

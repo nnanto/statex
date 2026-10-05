@@ -2061,6 +2061,7 @@ name = "statex-guest"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "serde_json",
  "wit-bindgen",
 ]
 
@@ -2079,6 +2080,7 @@ name = "statex-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "bytes",
  "hex",
@@ -2106,6 +2108,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "hex",
+ "rand 0.8.8",
  "rusqlite",
  "serde",
  "serde_json",

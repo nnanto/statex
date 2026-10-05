@@ -23,5 +23,6 @@ statex-ltx.workspace = true
 statex-runtime.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true

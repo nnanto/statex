@@ -28,6 +28,12 @@ Actors can also schedule an **alarm**: the host calls their `alarm` handler at
 the given time, waking the actor on some node if it is not loaded (see the
 [developer guide](docs/developer-guide.md#8-alarms)).
 
+Actor types can opt into fresh, **stateless** execution or **group commit**.
+Stateful actors can schedule transactional asynchronous calls using
+`statex_guest::spawn::send`. These primitives power the ordinary Wasm
+[queue application](examples/queue), whose consumers run outside the queue's
+transaction and lock.
+
 ## Quick start
 
 ```sh
@@ -65,7 +71,7 @@ See [Monorepo workspaces](docs/developer-guide.md#monorepo-workspaces).
 
 | Path | What |
 |---|---|
-| `wit/statex-host.wit` | The host contract (`context`, `sql`, `http-client`, `log`, `actors`) |
+| `wit/statex-host.wit` | The host contract (`context`, `sql`, `http-client`, `log`, `actors`, `alarms`, `spawn`) |
 | `crates/store` | `ObjectStore` trait with conditional writes; local-fs and Azure Blob backends |
 | `crates/ltx` | WAL-frame capture, segment codec, restore planning |
 | `crates/runtime` | wasmtime host: WIT/JSON mapping, limits, host imports, compatibility rules |
@@ -75,6 +81,8 @@ See [Monorepo workspaces](docs/developer-guide.md#monorepo-workspaces).
 | `sdk/python` | Generic Python client runtime (also embedded in generated clients) |
 | `examples/counter` | Rust: two actor types, `counter` and `account` (records, enums, variants, results) |
 | `examples/caller` | Rust: typed calls to another app (`counter`) and its own actors, with native stubs |
+| `examples/queue` | Rust: a Wasm queue using SQL, alarms, durable spawn, stateless consumers and group commit |
+| `examples/stateless` | Rust: fresh-instance execution without durable actor storage |
 | `examples/python-caller` | Python: typed calls to a Rust app and between its own actors, tested with `statex test` stubs |
 | `examples/python-counter` | Python (componentize-py): `counter` and `profile` actor types |
 | `sdk/python-guest/` | Python guest helper (`statex.py`) and mock host for tests (`statex_testing.py`); `statex new --lang python` vendors them into standalone projects and links them in workspaces |

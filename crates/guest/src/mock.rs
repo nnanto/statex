@@ -187,3 +187,33 @@ pub fn alarm_clear() {
         c.execute("UPDATE _statex_alarm SET at_ms = NULL, retry = 0 WHERE id = 0", []).map(|_| ())
     });
 }
+
+pub fn spawn_send(app: &str, actor_type: &str, key: &str, method: &str, args_json: &str) -> Result<String> {
+    if key.is_empty() || key.len() > 512 {
+        return Err(Error("spawn target key must be 1..=512 bytes".into()));
+    }
+    if args_json.len() > 1024 * 1024 {
+        return Err(Error("spawn arguments exceed 1048576 bytes".into()));
+    }
+    serde_json::from_str::<serde_json::Value>(args_json).map_err(|e| Error(format!("invalid spawn arguments: {e}")))?;
+    let epoch = epoch();
+    with_conn(|c| {
+        c.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _statex_outbox(
+                id TEXT PRIMARY KEY, app TEXT NOT NULL, actor_type TEXT NOT NULL,
+                actor_key TEXT NOT NULL, method TEXT NOT NULL, args_json TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS _statex_outbox_seq(id INTEGER PRIMARY KEY CHECK(id=0),seq INTEGER NOT NULL);",
+        )?;
+        let count: i64 = c.query_row("SELECT count(*) FROM _statex_outbox", [], |r| r.get(0))?;
+        if count >= 256 || args_json.len() > 1024 * 1024 {
+            return Err(rusqlite::Error::InvalidParameterName("spawn outbox or arguments exceed limit".into()));
+        }
+        let seq: i64 = c.query_row(
+            "INSERT INTO _statex_outbox_seq(id,seq) VALUES(0,1) ON CONFLICT(id) DO UPDATE SET seq=seq+1 RETURNING seq",
+            [], |r| r.get(0),
+        )?;
+        let id = format!("e{epoch}-{seq}");
+        c.execute("INSERT INTO _statex_outbox VALUES(?1,?2,?3,?4,?5,?6)", rusqlite::params![id,app,actor_type,key,method,args_json])?;
+        Ok(id)
+    })
+}

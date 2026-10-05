@@ -8,6 +8,7 @@ pub mod compat;
 pub mod host;
 pub mod json;
 pub mod manifest;
+pub mod spawn;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -70,6 +71,7 @@ impl Runtime {
     /// Compiles and links an app. Fails if the component imports anything the
     /// host does not provide or does not export what the manifest describes.
     pub fn load(&self, wasm: &[u8], manifest: Manifest) -> Result<Arc<AppCode>> {
+        manifest.validate_actor_options()?;
         let component = Component::new(&self.engine, wasm).map_err(anyhow::Error::from).context("compile component")?;
         let linker = if manifest.calls.is_empty() {
             self.linker.clone()
@@ -116,6 +118,36 @@ pub struct AppCode {
 }
 
 impl AppCode {
+    /// Instantiates a stateless type with an ephemeral database used only by
+    /// host plumbing. Stateful host capabilities remain disabled.
+    pub fn instantiate_stateless(
+        self: &Arc<Self>,
+        identity: ActorIdentity,
+        caller: Option<Arc<dyn ActorCaller>>,
+    ) -> Result<ActorInstance> {
+        anyhow::ensure!(
+            self.manifest.actor_type(&identity.actor_type).is_some_and(|t| t.stateless),
+            "actor type {} is not stateless", identity.actor_type
+        );
+        self.instantiate_with(identity, Arc::new(Mutex::new(Connection::open_in_memory()?)), caller)
+    }
+
+    /// Runs exactly one call in a fresh instance, discarding all instance state.
+    pub fn call_stateless(
+        self: &Arc<Self>,
+        identity: ActorIdentity,
+        method: &str,
+        args: &J,
+        chain: &[ActorRef],
+        caller: Option<Arc<dyn ActorCaller>>,
+    ) -> Result<CallOutput, CallError> {
+        let actor_type = identity.actor_type.clone();
+        resolve_method(&self.manifest, &actor_type, method)?;
+        let mut instance = self.instantiate_stateless(identity, caller)
+            .map_err(|e| CallError::Trap(format!("{e:#}")))?;
+        instance.call_with(&actor_type, method, args, chain)
+    }
+
     /// Instantiates the component for one actor, without actor-to-actor calls
     /// (they fail with `call-error::unavailable`).
     pub fn instantiate(self: &Arc<Self>, identity: ActorIdentity, db: Arc<Mutex<Connection>>) -> Result<ActorInstance> {
@@ -132,6 +164,7 @@ impl AppCode {
     ) -> Result<ActorInstance> {
         let limits = &self.manifest.limits;
         let has_alarm = self.alarm_exports.contains_key(&identity.actor_type);
+        let stateless = self.manifest.actor_type(&identity.actor_type).is_some_and(|t| t.stateless);
         let state = HostState {
             wasi: WasiCtxBuilder::new().inherit_stdout().inherit_stderr().build(),
             table: Default::default(),
@@ -144,6 +177,12 @@ impl AppCode {
             chain: Vec::new(),
             deadline: None,
             has_alarm,
+            stateless,
+            spawn_methods: self.manifest.types.iter().flat_map(|t| {
+                t.methods.iter().map(|m| (self.manifest.app.clone(), t.name.clone(), m.clone()))
+            }).chain(self.manifest.calls.iter().flat_map(|c| {
+                c.methods.iter().map(|m| (c.app.clone(), c.actor_type.clone(), m.clone()))
+            })).collect(),
         };
         let mut store = Store::new(&self.engine, state);
         store.limiter(|s| &mut s.limits);

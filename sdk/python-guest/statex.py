@@ -29,6 +29,7 @@ as `alarm: func(retry-count: u32);`):
 """
 
 import time
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from componentize_py_types import Err, Ok, Some  # noqa: F401  (re-exported)
@@ -43,6 +44,22 @@ try:
     from wit_world.imports import alarms as _alarms_import
 except ImportError:  # the world does not import statex:host/alarms
     _alarms_import = None
+
+try:
+    from wit_world.imports import spawn as _spawn_import
+except ImportError:  # the world does not import statex:host/spawn
+    _spawn_import = None
+
+
+def spawn(app: str, actor_type: str, key: str, method: str, args: Any) -> str:
+    """Schedules a durable asynchronous call in this actor's transaction.
+
+    Delivery starts after commit. Stateless receivers must tolerate duplicates.
+    Arguments use the HTTP API's JSON representation (including base64 bytes).
+    """
+    if _spawn_import is None:
+        raise RuntimeError("spawn needs `import statex:host/spawn@0.1.0;` in the app's world")
+    return _spawn_import.send(app, actor_type, key, method, json.dumps(args))
 
 
 def _to_value(v: Any) -> Any:

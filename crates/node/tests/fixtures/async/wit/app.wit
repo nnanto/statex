@@ -1,0 +1,23 @@
+package test:dispatch;
+
+interface source {
+  submit: func(target: string, fail: bool) -> result<string, string>;
+  value: func() -> s64;
+}
+
+interface target {
+  increment: func() -> s64;
+  value: func() -> s64;
+}
+
+interface worker {
+  fresh: func() -> u32;
+  storage: func() -> result<_, string>;
+  spawn-call: func() -> result<string, string>;
+}
+
+world app {
+  export source;
+  export target;
+  export worker;
+}

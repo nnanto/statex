@@ -39,6 +39,7 @@ actors/<app>/<type>/<key>/ltx/e<epoch>/snapshot-<txid>.db
 actors/<app>/<type>/<key>/ltx/e<epoch>/<txid>.ltx      WAL page segment of one transaction
 fleet/waker.json                             lease of the node that wakes idle actors' alarms
 wake/<minute>/<app>/<type>/<key>/<at_ms>-<epoch>-<seq>   alarm wake hint (empty object)
+outbox/<app>/<type>/<key>/<task-id>           asynchronous call wake hint
 ```
 
 App names are `app` or `team/app`, where each segment is `[a-z0-9-]` and
@@ -195,3 +196,57 @@ callers listed in the manifest's `calls`.
 - Imports are allowlisted to `statex:host/*`, WASI p2 and client interfaces of other apps (routed as actor calls). Nothing is granted beyond that: no preopened directories, no environment and no sockets. Guest stdout and stderr go to the node log.
 - Outbound HTTP goes through `statex:host/http-client` and is restricted to `[http] allow` hosts.
 - The guest `sql` interface rejects transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`, ...) as well as `ATTACH`, `VACUUM` and `PRAGMA`, because the host owns the transaction.
+
+## Transactional spawn
+
+`statex:host/spawn.send` records a target and JSON arguments in the sender's
+`_statex_outbox` table inside its current transaction. It returns a task id, not
+the callee's result. Only local exported methods and methods declared by client
+imports can be targeted. A stateless actor cannot schedule a durable spawn,
+because it has no durable transaction.
+
+Each newly created task gets an `outbox/<app>/<type>/<key>/<task-id>` hint before
+the sender's WAL segment is uploaded (each component is percent-encoded,
+including `/` in app names). Task ids contain fresh nonces, so a stale
+hint from an abandoned write cannot name a later task. The fleet waker scans
+these hints every `wake_tick`, with up to 16 asynchronous deliveries in flight.
+It routes an internal claim to the sender, committing a two-minute task lease
+before dispatch. It then releases the sender's lock and calls the destination.
+The destination can therefore call back to the sender without re-entering its
+original invocation.
+
+After success, a separate sender transaction removes the task. Failed or
+unknown-outcome deliveries are retried indefinitely with exponential delay,
+capped at 60 seconds; errors are logged and stored on the outbox row. A lost
+dispatcher leaves its task eligible after the task lease expires. Attempts are
+numbered, and a late attempt cannot settle a newer one. The hint is removed
+only after the durable sender state proves the task absent. Deleted senders
+discard their pending tasks.
+
+A stateful destination records successful delivery ids and results in
+`_statex_inbox` in the same transaction as its method. Re-delivery returns that
+receipt instead of re-running the method, including after failover. Receipts
+are retained without automatic expiry. Stateless destinations have no receipt
+store: they can run repeatedly and must make side effects idempotent. A new
+`spawn.send` is a new task, so application-level retries of the producer method
+still need their own idempotency key.
+
+The queue in `examples/queue` is application code, not a host queue service.
+It uses its SQL database for messages and batch leases, alarms for delivery
+times, and spawn to call a stateless consumer after the lease is durable.
+Consumer settlement returns through an ordinary actor call.
+
+## Stateless execution
+
+An actor type configured with `[actors.<type>] stateless = true` runs in a fresh
+component instance on the receiving node for each call. It does not acquire an
+owner record or persist a database. SQL storage, alarm scheduling and durable
+spawn are unavailable, but ordinary typed actor calls and allowed outbound
+HTTP remain available. Stateless types cannot declare migrations, an alarm
+handler or group commit.
+
+Each node admits at most 64 simultaneous stateless calls by default
+(`statex node --max-stateless-calls`, or `STATEX_MAX_STATELESS_CALLS`).
+Excess calls return 503. The slot remains occupied until the blocking Wasm
+execution ends, even if the requesting future is cancelled. Stateless calls
+still obey memory, execution-time and actor call-chain limits.

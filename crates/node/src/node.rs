@@ -1,7 +1,7 @@
 //! The node: routing, actor lifecycle and the call path
 //! (transaction -> segment upload -> ownership check -> ack).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -18,7 +18,7 @@ use statex_runtime::{
     resolve_method, ActorCaller, ActorRef, AppCode, CallError, CallFailure, CallReply, CallRequest, Runtime,
 };
 use statex_store::{get_json, to_json_bytes, DynStore, StoreError};
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::actor::{self, Actor, Op};
 use crate::deploy;
@@ -53,6 +53,8 @@ pub struct NodeConfig {
     /// How often the waker rescans all wake hints, picking up ones whose
     /// earlier attempts failed.
     pub wake_full_scan: Duration,
+    /// Concurrent fresh stateless instances permitted on this node.
+    pub max_stateless_calls: usize,
 }
 
 impl NodeConfig {
@@ -71,6 +73,7 @@ impl NodeConfig {
             exit_on_fence: false,
             wake_tick: Duration::from_secs(1),
             wake_full_scan: Duration::from_secs(30),
+            max_stateless_calls: 64,
         }
     }
 }
@@ -99,6 +102,11 @@ pub enum InvOp {
     /// Fire the actor's alarm if it is due (internal: issued by alarm timers
     /// and the waker, never by the public API). Never creates the actor.
     Alarm,
+    /// Internal asynchronous delivery; stateful receivers record a receipt.
+    Deliver { method: String, args: J, delivery_id: String },
+    /// Internal outbox operations, never exposed by the public API.
+    OutboxPoll { id: String },
+    OutboxSettle { id: String, attempt: u32, error: Option<String> },
 }
 
 /// HTTP status + JSON body, identical whether produced locally or by a peer.
@@ -122,6 +130,25 @@ impl Outcome {
 
 type Slot = Arc<AsyncMutex<Option<Actor>>>;
 
+const GROUP_PENDING_LIMIT: usize = 128;
+const GROUP_BATCH_LIMIT: usize = 64;
+
+#[cfg(test)]
+#[path = "stateless_admission_tests.rs"]
+mod stateless_admission_tests;
+
+struct PendingCall {
+    inv: Invocation,
+    hops: u32,
+    code: Arc<AppCode>,
+    reply: oneshot::Sender<Retry>,
+}
+
+#[derive(Default)]
+struct GroupQueue {
+    pending: Mutex<VecDeque<PendingCall>>,
+}
+
 pub struct Node {
     pub cfg: NodeConfig,
     pub store: DynStore,
@@ -130,6 +157,9 @@ pub struct Node {
     apps: RwLock<HashMap<String, Arc<AppCode>>>,
     deployed: Mutex<HashMap<String, deploy::Current>>,
     actors: Mutex<HashMap<ActorId, Slot>>,
+    groups: Mutex<HashMap<ActorId, Arc<GroupQueue>>>,
+    me_weak: Weak<Node>,
+    stateless_slots: Arc<tokio::sync::Semaphore>,
     secret: Vec<u8>,
     client: reqwest::Client,
     caller: Arc<dyn ActorCaller>,
@@ -222,6 +252,8 @@ pub fn norm(s: &str) -> String {
 impl Node {
     /// Acquires the lease, starts renewing it, then loads deployments.
     pub(crate) async fn new(cfg: NodeConfig, advertise: String) -> Result<(Arc<Node>, tokio::task::JoinHandle<()>)> {
+        anyhow::ensure!(cfg.max_stateless_calls > 0, "max_stateless_calls must be greater than zero");
+        let stateless_slots = Arc::new(tokio::sync::Semaphore::new(cfg.max_stateless_calls));
         let store = cfg.store.clone();
         let runtime = Runtime::shared()?;
         let lease = Lease::acquire(store.clone(), &cfg.node_id, &advertise, cfg.lease_ttl).await?;
@@ -243,9 +275,12 @@ impl Node {
             apps: Default::default(),
             deployed: Default::default(),
             actors: Default::default(),
+            groups: Default::default(),
+            me_weak: me.clone(),
             secret,
             client,
             caller: Arc::new(NodeCaller { node: me.clone(), rt }),
+            stateless_slots,
             timers: Default::default(),
             timers_changed: Default::default(),
         });
@@ -319,7 +354,7 @@ impl Node {
     /// Routes and runs an invocation. Any node accepts any call.
     pub async fn invoke(&self, mut inv: Invocation, hops: u32) -> Outcome {
         inv.ty = norm(&inv.ty);
-        if let InvOp::Call { method, .. } = &mut inv.op {
+        if let InvOp::Call { method, .. } | InvOp::Deliver { method, .. } = &mut inv.op {
             *method = norm(method);
         }
         let deadline = Instant::now() + self.cfg.lease_ttl * 2;
@@ -343,7 +378,7 @@ impl Node {
         let Some(code) = self.app(&inv.app) else {
             return Done(Outcome::err(404, "not_found", format!("app {:?} is not deployed", inv.app)));
         };
-        if let InvOp::Call { method, .. } = &inv.op {
+        if let InvOp::Call { method, .. } | InvOp::Deliver { method, .. } = &inv.op {
             if let Err(e) = resolve_method(&code.manifest, &inv.ty, method) {
                 return Done(Outcome::err(404, "not_found", e.to_string()));
             }
@@ -363,18 +398,97 @@ impl Node {
         if inv.chain.len() >= MAX_CALL_DEPTH {
             return Done(Outcome::err(508, "cycle", format!("call chain deeper than {MAX_CALL_DEPTH}")));
         }
+        if code.manifest.actor_type(&inv.ty).is_some_and(|t| t.stateless) {
+            return Done(self.run_stateless(inv, code).await);
+        }
+        if matches!(inv.op, InvOp::Call { .. } | InvOp::Deliver { .. })
+            && code.manifest.actor_type(&inv.ty).is_some_and(|ty| ty.group_commit)
+        {
+            // Serial forwarding at an ingress would prevent concurrent sends
+            // from accumulating in the actual owner's writer queue.
+            match owner::remote_owner(&self.store, &id, &self.me()).await {
+                Ok(Some(peer)) => {
+                    if hops >= MAX_HOPS {
+                        return Done(Outcome::unavailable("too many forwarding hops"));
+                    }
+                    return match self.forward(&peer.advertise, inv, hops + 1).await {
+                        Ok(outcome) => Done(outcome),
+                        Err(e) => Retry::Again(format!("owner {} unreachable: {e}", peer.node_id)),
+                    };
+                }
+                Ok(None) => {}
+                Err(e) => return Retry::Again(format!("read owner for group admission: {e:#}")),
+            }
+            return self.group_call(&id, inv, hops, code).await;
+        }
+        self.try_invoke_serial(inv, hops, code, &id, None).await
+    }
+
+    async fn group_call(&self, id: &ActorId, inv: &Invocation, hops: u32, code: Arc<AppCode>) -> Retry {
+        let (reply, received) = oneshot::channel();
+        {
+            let mut groups = self.groups.lock().unwrap();
+            let start = !groups.contains_key(id);
+            let queue = groups.entry(id.clone()).or_default().clone();
+            let mut pending = queue.pending.lock().unwrap();
+            if pending.len() >= GROUP_PENDING_LIMIT {
+                return Retry::Done(Outcome::unavailable("actor pending call limit reached"));
+            }
+            pending.push_back(PendingCall { inv: inv.clone(), hops, code, reply });
+            drop(pending);
+            if start {
+                let node = self.me_weak.upgrade().expect("live node");
+                let id = id.clone();
+                tokio::spawn(async move { node.drain_group(id, queue).await });
+            }
+        }
+        received.await.unwrap_or_else(|_| Retry::Done(Outcome::unavailable("actor writer stopped")))
+    }
+
+    async fn drain_group(self: Arc<Self>, id: ActorId, queue: Arc<GroupQueue>) {
+        loop {
+            let first = {
+                // Admission and removal use the same lock order, so an idle
+                // queue cannot lose a call or elect two writers.
+                let mut groups = self.groups.lock().unwrap();
+                let mut pending = queue.pending.lock().unwrap();
+                match pending.pop_front() {
+                    Some(first) => first,
+                    None => {
+                        groups.remove(&id);
+                        return;
+                    }
+                }
+            };
+            let outcome = self.try_invoke_serial(&first.inv, first.hops, first.code, &id, Some(&queue)).await;
+            let _ = first.reply.send(outcome);
+        }
+    }
+
+    async fn try_invoke_serial(
+        &self,
+        inv: &Invocation,
+        hops: u32,
+        code: Arc<AppCode>,
+        id: &ActorId,
+        group: Option<&Arc<GroupQueue>>,
+    ) -> Retry {
+        use Retry::*;
+        if !self.lease.valid() {
+            return Done(Outcome::unavailable("node is fenced or its lease is not current"));
+        }
         let slot = self.slot(&id);
         let mut guard = slot.clone().lock_owned().await;
         let mut created = false;
         if guard.is_none() {
-            if matches!(inv.op, InvOp::Delete | InvOp::Alarm) {
+            if matches!(inv.op, InvOp::Delete | InvOp::Alarm | InvOp::OutboxPoll { .. } | InvOp::OutboxSettle { .. }) {
                 match owner::read(&self.store, &id).await {
                     Ok(Some((r, _))) if r.state != OwnerState::Deleted => {}
                     Ok(_) => {
                         drop(guard);
                         self.drop_slot_if_empty(&id);
                         // `gone` tells the waker the actor no longer exists.
-                        let code = if matches!(inv.op, InvOp::Alarm) { "gone" } else { "not_found" };
+                        let code = if matches!(inv.op, InvOp::Delete) { "not_found" } else { "gone" };
                         return Done(Outcome::err(404, code, format!("actor {id} does not exist")));
                     }
                     Err(e) => return Again(format!("read owner: {e}")),
@@ -426,8 +540,70 @@ impl Node {
                 Op::Call { method: method.clone(), args: args.clone(), chain: inv.chain.clone() }
             }
             InvOp::Alarm => Op::Alarm { now_ms: now_ms() },
+            InvOp::Deliver { method, args, delivery_id } => Op::Deliver {
+                method: method.clone(), args: args.clone(), delivery_id: delivery_id.clone(),
+            },
+            InvOp::OutboxPoll { id } => Op::OutboxPoll { id: id.clone(), now_ms: now_ms() },
+            InvOp::OutboxSettle { id, attempt, error } => Op::OutboxSettle {
+                id: id.clone(), attempt: *attempt, error: error.clone(), now_ms: now_ms(),
+            },
         };
-        Done(self.run(guard, &id, code, op, matches!(inv.op, InvOp::Create)).await)
+        if let Some(queue) = group {
+            let mut replies = Vec::new();
+            let mut ops = vec![op];
+            {
+                let mut pending = queue.pending.lock().unwrap();
+                while ops.len() < GROUP_BATCH_LIMIT
+                    && pending.front().is_some_and(|p| Arc::ptr_eq(&p.code, &code))
+                {
+                    let call = pending.pop_front().unwrap();
+                    ops.push(match call.inv.op {
+                        InvOp::Call { method, args } => Op::Call { method, args, chain: call.inv.chain },
+                        InvOp::Deliver { method, args, delivery_id } => Op::Deliver { method, args, delivery_id },
+                        _ => unreachable!("only calls and deliveries enter the group writer"),
+                    });
+                    replies.push(call.reply);
+                }
+            }
+            let mut outcomes = self.run_group(guard, id, code, ops).await.into_iter();
+            let first = outcomes.next().expect("first group outcome");
+            for (reply, outcome) in replies.into_iter().zip(outcomes) {
+                let _ = reply.send(Retry::Done(outcome));
+            }
+            Done(first)
+        } else {
+            Done(self.run(guard, &id, code, op, matches!(inv.op, InvOp::Create)).await)
+        }
+    }
+
+    async fn run_stateless(&self, inv: &Invocation, code: Arc<AppCode>) -> Outcome {
+        let (method, args) = match &inv.op {
+            InvOp::Call { method, args } | InvOp::Deliver { method, args, .. } => (method, args),
+            _ => return Outcome::err(400, "bad_request", "stateless actors do not support create, delete, alarms or outbox operations"),
+        };
+        let permit = match self.stateless_slots.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => return Outcome::unavailable("stateless invocation limit reached"),
+        };
+        let identity = statex_runtime::ActorIdentity {
+            app: inv.app.clone(), actor_type: inv.ty.clone(), key: inv.key.clone(), epoch: 0,
+        };
+        let (method, args, chain, caller) = (method.clone(), args.clone(), inv.chain.clone(), self.caller.clone());
+        let res = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            code.call_stateless(identity, &method, &args, &chain, Some(caller))
+        }).await;
+        match res {
+            Err(e) => Outcome::err(500, "internal", format!("execute task: {e}")),
+            Ok(Ok(out)) if out.is_err => Outcome {
+                status: 422,
+                body: json!({ "error": { "code": "method_error", "message": "method returned an error", "detail": out.value } }),
+            },
+            Ok(Ok(out)) => Outcome::ok(out.value),
+            Ok(Err(CallError::NotFound(m))) => Outcome::err(404, "not_found", m),
+            Ok(Err(CallError::BadArgs(m))) => Outcome::err(400, "bad_request", m),
+            Ok(Err(CallError::Trap(m))) => Outcome::err(500, "trap", m),
+        }
     }
 
     async fn run(
@@ -438,13 +614,58 @@ impl Node {
         op: Op,
         is_create: bool,
     ) -> Outcome {
-        let (mut guard, res) = tokio::task::spawn_blocking(move || {
+        let (guard, res) = tokio::task::spawn_blocking(move || {
             let mut guard = guard;
             let res = guard.as_mut().expect("resident").execute(&code, op);
             (guard, res)
         })
         .await
         .expect("execute task panicked");
+        self.finish_execution(guard, res, id, is_create, false).await
+    }
+
+    async fn run_group(
+        &self,
+        guard: tokio::sync::OwnedMutexGuard<Option<Actor>>,
+        id: &ActorId,
+        code: Arc<AppCode>,
+        ops: Vec<Op>,
+    ) -> Vec<Outcome> {
+        let count = ops.len();
+        let (guard, res) = tokio::task::spawn_blocking(move || {
+            let mut guard = guard;
+            let res = guard.as_mut().expect("resident").execute_group(&code, ops);
+            (guard, res)
+        })
+        .await
+        .expect("execute group task panicked");
+        let (outcomes, executed) = match res {
+            Ok(group) => (
+                Some(group.outcomes),
+                Ok(actor::Executed {
+                    outcome: Ok(statex_runtime::CallOutput { value: J::Null, is_err: false }),
+                    segment: group.segment,
+                    alarm: group.alarm,
+                    outbox: group.outbox,
+                }),
+            ),
+            Err(e) => (None, Err(e)),
+        };
+        let durability = self.finish_execution(guard, executed, id, false, true).await;
+        if durability.status != 200 {
+            return vec![durability; count];
+        }
+        outcomes.expect("successful group").into_iter().map(call_outcome).collect()
+    }
+
+    async fn finish_execution(
+        &self,
+        mut guard: tokio::sync::OwnedMutexGuard<Option<Actor>>,
+        res: Result<actor::Executed>,
+        id: &ActorId,
+        is_create: bool,
+        fence_reads: bool,
+    ) -> Outcome {
         let executed = match res {
             Ok(x) => x,
             Err(e) => {
@@ -453,6 +674,11 @@ impl Node {
                 return Outcome::err(500, "internal", format!("{e:#}"));
             }
         };
+        if let Err(e) = self.write_outbox_hints(id, &executed.outbox).await {
+            *guard = None;
+            self.set_timer(id, None);
+            return Outcome::unavailable(format!("spawn was not made durable ({e}); sender write did not apply"));
+        }
         // A new alarm's wake hint is written before the transaction becomes
         // durable, so a durable alarm always has one.
         if let Some(a) = executed.alarm.and_then(|c| c.after) {
@@ -460,6 +686,16 @@ impl Node {
                 *guard = None;
                 self.set_timer(id, None);
                 return Outcome::unavailable(format!("write was not made durable ({e}); it did not apply"));
+            }
+        }
+        if fence_reads && executed.segment.is_none() {
+            let epoch = guard.as_ref().unwrap().epoch;
+            if !matches!(owner::still_owner(&self.store, id, &self.me(), epoch).await, Ok(true))
+                || !self.lease.valid()
+            {
+                *guard = None;
+                self.set_timer(id, None);
+                return Outcome::unavailable("actor ownership moved; group not acknowledged");
             }
         }
         if let Some(seg) = executed.segment {
@@ -474,8 +710,8 @@ impl Node {
                 self.set_timer(id, None);
                 return Outcome::unavailable(format!("write was not made durable ({e}); it may or may not have applied"));
             }
-            let owned = self.lease.valid()
-                && matches!(owner::still_owner(&self.store, id, &self.me(), epoch).await, Ok(true));
+            let owned = matches!(owner::still_owner(&self.store, id, &self.me(), epoch).await, Ok(true))
+                && self.lease.valid();
             if !owned {
                 tracing::warn!(actor = %id, epoch, "lost ownership; not acknowledging");
                 *guard = None;
@@ -527,16 +763,7 @@ impl Node {
         if is_create {
             return Outcome { status: 201, body: json!({ "result": { "created": true } }) };
         }
-        match executed.outcome {
-            Ok(out) if out.is_err => Outcome {
-                status: 422,
-                body: json!({ "error": { "code": "method_error", "message": "method returned an error", "detail": out.value } }),
-            },
-            Ok(out) => Outcome::ok(out.value),
-            Err(CallError::NotFound(m)) => Outcome::err(404, "not_found", m),
-            Err(CallError::BadArgs(m)) => Outcome::err(400, "bad_request", m),
-            Err(CallError::Trap(m)) => Outcome::err(500, "trap", m),
-        }
+        call_outcome(executed.outcome)
     }
 
     async fn delete(&self, mut guard: tokio::sync::OwnedMutexGuard<Option<Actor>>, id: &ActorId) -> Outcome {
@@ -663,7 +890,24 @@ impl Node {
     }
 }
 
+fn call_outcome(outcome: Result<statex_runtime::CallOutput, CallError>) -> Outcome {
+    match outcome {
+        Ok(out) if out.is_err => Outcome {
+            status: 422,
+            body: json!({ "error": { "code": "method_error", "message": "method returned an error", "detail": out.value } }),
+        },
+        Ok(out) => Outcome::ok(out.value),
+        Err(CallError::NotFound(m)) => Outcome::err(404, "not_found", m),
+        Err(CallError::BadArgs(m)) => Outcome::err(400, "bad_request", m),
+        Err(CallError::Trap(m)) => Outcome::err(500, "trap", m),
+    }
+}
+
 enum Retry {
     Done(Outcome),
     Again(String),
 }
+
+#[cfg(test)]
+#[path = "group_commit_tests.rs"]
+mod group_commit_tests;
