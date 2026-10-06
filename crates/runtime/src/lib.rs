@@ -11,6 +11,7 @@ pub mod invocation;
 pub mod json;
 pub mod limits;
 pub mod manifest;
+pub mod outbox;
 pub mod services;
 pub mod sqlite;
 
@@ -437,6 +438,7 @@ impl AppCode {
             log_sink: self.log_sink.clone(),
             capability_error: None,
             invocation_context: None,
+            initializing: true,
         };
         for initialize in &self.initializers {
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| initialize(&mut state)))
@@ -454,6 +456,7 @@ impl AppCode {
         store.set_epoch_deadline(u64::MAX / 2);
         store.set_fuel(0)?;
         let state = store.data_mut();
+        state.initializing = false;
         state.deadline = None;
         state.invocation_context = None;
         state.chain.clear();

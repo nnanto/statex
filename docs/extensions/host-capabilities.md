@@ -48,3 +48,20 @@ It is recreated after traps, eviction, or code changes, and is **not**
 transactional or durable. Store recoverable state through the actor database.
 Host side effects cannot be undone by rolling back an actor transaction.
 Engine tuning uses `configure_engine`; epoch interruption remains enabled.
+
+The standard `statex:host/actors` interface also supplies durable scheduling.
+Its `spawn` import accepts an app, actor type, key, method, positional JSON
+arguments, and a delay in milliseconds; it returns an outbox job ID.
+`job` inspects that ID in the current actor's outbox. Guest SDKs expose
+`spawn` and `spawn_after` over the same scheduling import.
+The SQLite outbox is host-owned: guest SQL and migrations cannot read or
+modify its bookkeeping. Use `job` for inspection instead of querying the
+internal table.
+
+Scheduling requires an executing actor transaction, a supporting state
+backend, and a node actor caller. It is unavailable during component
+initialization and in runtime-only embeddings without actor routing.
+Enqueue errors are explicit `call-error` values. A successful enqueue is
+transactional state, not an immediate external effect: rollback removes it,
+and the node dispatches only after durability. See
+[background calls](../developer-guide.md#durable-background-calls).

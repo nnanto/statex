@@ -33,7 +33,7 @@ class CapabilityTests(unittest.TestCase):
         for name in ["wit_world", "wit_world.imports", "componentize_py_types",
                      "wit_world.imports.context", "wit_world.imports.sql",
                      "wit_world.imports.http_client", "wit_world.imports.log",
-                     "wit_world.imports.alarms"]:
+                     "wit_world.imports.alarms", "wit_world.imports.actors"]:
             modules[name] = types.ModuleType(name)
         modules["wit_world"].__path__ = []
         imports = modules["wit_world.imports"]
@@ -94,6 +94,81 @@ class CapabilityTests(unittest.TestCase):
         unavailable = type("CallError_Unavailable", (), {})()
         unavailable.value = "lost owner"
         self.assertTrue(self.guest.outcome_unknown(unavailable))
+
+    def test_optional_actors_import_preserves_existing_worlds(self):
+        root = Path(__file__).resolve().parents[1]
+        imports = sys.modules["wit_world.imports"]
+        actors = imports.actors
+        del imports.actors
+        try:
+            with patch.dict(sys.modules, {"wit_world.imports.actors": None}):
+                guest = load("_statex_without_actors", root / "statex.py")
+        finally:
+            imports.actors = actors
+        self.testing.call("kv", "legacy", guest.execute, "CREATE TABLE legacy(v INTEGER)")
+        with self.assertRaisesRegex(RuntimeError, "import statex:host/actors"):
+            guest.spawn("counters", "counter", "alice", "increment", [2])
+
+    def test_nested_committed_actor_jobs_survive_outer_rollback(self):
+        t, g = self.testing, self.guest
+        ids, seen = {}, []
+        t.mock_spawn("counters", "counter", "increment",
+                     lambda key, by: seen.append((key, by)) or by)
+        def source():
+            ids["source"] = g.spawn("counters", "counter", "alice", "increment", [1])
+            ids["target"] = t.call("target", "b", g.spawn,
+                                   "counters", "counter", "bob", "increment", [2])
+            raise Err("outer rollback")
+        with self.assertRaises(Err):
+            t.call("source", "a", source)
+        self.assertIsNone(t.call("source", "a", g.job, ids["source"]))
+        self.assertEqual(t.call("target", "b", g.job, ids["target"])["status"], "pending")
+        self.assertEqual(t.drain_jobs(), 1)
+        self.assertEqual(seen, [("bob", 2)])
+
+    def test_spawn_is_deferred_transactional_and_inspectable(self):
+        t, g = self.testing, self.guest
+        seen = []
+        t.mock_spawn("counters", "counter", "increment",
+                     lambda key, by: seen.append((key, by)) or by)
+        id = t.call("caller", "bob", g.spawn_after, 30000,
+                    "counters", "counter", "alice", "increment", [2])
+        self.assertEqual(seen, [])
+        self.assertEqual(t.drain_jobs(29999), 0)
+        self.assertEqual(t.drain_jobs(1), 1)
+        self.assertEqual(seen, [("alice", 2)])
+        self.assertEqual(t.call("caller", "bob", g.job, id)["status"], "succeeded")
+        self.assertEqual(t.call("caller", "bob", g.job, id)["target"],
+                         {"app": "counters", "type": "counter", "key": "alice"})
+        self.assertIsNone(t.call("caller", "other", g.job, id))
+        removed = []
+        def fail():
+            removed.append(g.spawn("counters", "counter", "alice", "increment", [3]))
+            raise Err("rollback")
+        with self.assertRaises(Err):
+            t.call("caller", "bob", fail)
+        self.assertIsNone(t.call("caller", "bob", g.job, removed[0]))
+        self.assertEqual(t.drain_jobs(), 0)
+        for invalid_delay in [-1, 0.5, True, 2**64]:
+            with self.subTest(delay=invalid_delay):
+                with self.assertRaises(ValueError):
+                    g.spawn_after(invalid_delay, "c", "t", "k", "m", [])
+        with self.assertRaises(TypeError):
+            g.spawn("c", "t", "k", "m", {})
+        with self.assertRaises(ValueError):
+            g.spawn("c", "t", "k", "m", [float("nan")])
+        with t.capabilities():
+            with self.assertRaisesRegex(RuntimeError, "does not support"):
+                t.call("caller", "bob", g.spawn, "c", "t", "k", "m", [])
+        def failed_job(key):
+            g.execute("CREATE TABLE rolled_back(v INTEGER)")
+            raise Err("method error")
+        t.mock_spawn("counters", "counter", "fail", failed_job)
+        failed_id = t.call("caller", "bob", g.spawn, "counters", "counter", "alice", "fail", [])
+        self.assertEqual(t.drain_jobs(), 1)
+        self.assertEqual(t.call("caller", "bob", g.job, failed_id)["status"], "failed")
+        with self.assertRaises(Err):
+            t.call("counter", "alice", g.query, "SELECT * FROM rolled_back")
 
     def test_transactions_and_actor_isolation_with_adapters(self):
         t, g = self.testing, self.guest

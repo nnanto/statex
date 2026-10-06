@@ -7,7 +7,30 @@ wit_bindgen::generate!({
     world: "imports",
 });
 
-use statex::host::{alarms as a, context as c, http_client as h, log as l, sql as s};
+use statex::host::{actors, alarms as a, context as c, http_client as h, log as l, sql as s};
+
+pub fn actors_spawn(
+    app: &str,
+    ty: &str,
+    key: &str,
+    method: &str,
+    args: &str,
+    delay_ms: u64,
+) -> Result<String, crate::CallError> {
+    actors::spawn(app, ty, key, method, args, delay_ms).map_err(|error| match error {
+        actors::CallError::Rejected(s) => crate::CallError::Rejected(s),
+        actors::CallError::NotFound(s) => crate::CallError::NotFound(s),
+        actors::CallError::Incompatible(s) => crate::CallError::Incompatible(s),
+        actors::CallError::Trap(s) => crate::CallError::Trap(s),
+        actors::CallError::Unavailable(s) => crate::CallError::Unavailable(s),
+        actors::CallError::Cycle(s) => crate::CallError::Cycle(s),
+        actors::CallError::Timeout => crate::CallError::Timeout,
+    })
+}
+
+pub fn actors_job(id: &str) -> Result<Option<String>> {
+    actors::job(id).map_err(Error)
+}
 
 pub fn app() -> String {
     c::app()
@@ -52,7 +75,11 @@ pub fn sql_query(stmt: &str, params: &[Value]) -> Result<Rows> {
     let r = s::query(stmt, &p).map_err(Error)?;
     Ok(Rows {
         columns: r.columns,
-        rows: r.rows.into_iter().map(|row| row.into_iter().map(from_wit).collect()).collect(),
+        rows: r
+            .rows
+            .into_iter()
+            .map(|row| row.into_iter().map(from_wit).collect())
+            .collect(),
     })
 }
 
@@ -64,7 +91,11 @@ pub fn http_send(req: http::Request) -> Result<http::Response> {
         body: req.body,
     })
     .map_err(Error)?;
-    Ok(http::Response { status: r.status, headers: r.headers, body: r.body })
+    Ok(http::Response {
+        status: r.status,
+        headers: r.headers,
+        body: r.body,
+    })
 }
 
 pub fn log(level: Level, msg: &str) {

@@ -32,6 +32,12 @@ Actors can also schedule an **alarm**: the host calls their `alarm` handler at
 the given time, waking the actor on some node if it is not loaded (see the
 [developer guide](docs/developer-guide.md#8-alarms)).
 
+Actors can enqueue **durable background calls** with `spawn`, or delay them
+with `spawn_after`. Jobs commit with the calling actor's state and are delivered
+at least once through normal actor routing, including after owner crashes.
+Unlike an alarm, each job is independent; scheduling another does not replace
+it. See [background calls](docs/developer-guide.md#durable-background-calls).
+
 ## Quick start
 
 ```sh
@@ -113,7 +119,7 @@ into transactions. See [guarantees](docs/guarantees.md).
 | `crates/ltx` | WAL-frame capture, segment codec, restore planning |
 | `crates/runtime` | wasmtime host: WIT/JSON mapping, limits, host imports, compatibility rules |
 | `crates/node` | Leases, ownership, durability, routing, HTTP API |
-| `crates/guest` | Rust guest SDK (`sql`, `http`, `log`, `context`, `testing`) |
+| `crates/guest` | Rust guest SDK (`sql`, `http`, `log`, `context`, `actors`, `alarm`, `testing`) |
 | `crates/cli` | The `statex` CLI and node binary: scaffolding, workspaces, `check`, registry, Python codegen |
 | `sdk/python` | Generic Python client runtime (also embedded in generated clients) |
 | `examples/counter` | Rust: two actor types, `counter` and `account` (records, enums, variants, results) |

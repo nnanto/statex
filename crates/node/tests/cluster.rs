@@ -111,7 +111,10 @@ impl Fleet {
             .with_env_filter("statex=debug,info")
             .with_test_writer()
             .try_init();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("cluster-test-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))
+            .unwrap();
         let store = statex_store::open(dir.path().join("bucket").to_str().unwrap()).unwrap();
         let (wasm, m) = counter();
         deploy::deploy(&store, wasm, m, &deploy::DeployOptions::default())
@@ -166,6 +169,682 @@ async fn get(n: &NodeHandle, key: &str) -> i64 {
     .await;
     assert_eq!(s, 200, "{b}");
     b["result"].as_i64().unwrap()
+}
+
+async fn outbox_job(n: &NodeHandle, key: &str, id: &str) -> J {
+    let (status, body) = post(
+        n,
+        &format!("/v1/apps/counter/actors/counter/{key}/job"),
+        json!({ "id": id }),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    serde_json::from_str(body["result"].as_str().expect("queued job")).unwrap()
+}
+
+async fn wait_outbox(n: &NodeHandle, key: &str, id: &str) -> J {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let job = outbox_job(n, key, id).await;
+            if job["status"] == "succeeded" || job["status"] == "failed" {
+                return job;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("outbox job completed")
+}
+
+async fn wait_outbox_target(n: &NodeHandle, key: &str, expected: i64) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while get(n, key).await != expected {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("outbox target delivered without source polling");
+}
+
+// Concurrent component compilation can starve these deliberately short leases.
+static OUTBOX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct OutboxGateStore {
+    inner: DynStore,
+    block_segment: AtomicBool,
+    fail_marker: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl statex_store::ObjectStore for OutboxGateStore {
+    async fn get(&self, key: &str) -> statex_store::Result<Option<statex_store::Object>> {
+        self.inner.get(key).await
+    }
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        len: u64,
+    ) -> statex_store::Result<Option<bytes::Bytes>> {
+        self.inner.get_range(key, start, len).await
+    }
+    async fn put(&self, key: &str, data: bytes::Bytes) -> statex_store::Result<statex_store::ETag> {
+        if key.starts_with("outbox/") && self.fail_marker.load(Ordering::SeqCst) {
+            return Err(statex_store::StoreError::Other(anyhow::anyhow!(
+                "injected marker failure"
+            )));
+        }
+        if key.starts_with("actors/counter/counter/source/ltx/")
+            && key.ends_with(".ltx")
+            && self.block_segment.swap(false, Ordering::SeqCst)
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        self.inner.put(key, data).await
+    }
+    async fn put_if_absent(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+    ) -> statex_store::Result<statex_store::ETag> {
+        self.inner.put_if_absent(key, data).await
+    }
+    async fn put_if_match(
+        &self,
+        key: &str,
+        data: bytes::Bytes,
+        etag: &str,
+    ) -> statex_store::Result<statex_store::ETag> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+    async fn put_file(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+    ) -> statex_store::Result<statex_store::ETag> {
+        self.inner.put_file(key, path).await
+    }
+    async fn get_to_file(&self, key: &str, path: &std::path::Path) -> statex_store::Result<bool> {
+        self.inner.get_to_file(key, path).await
+    }
+    async fn list(&self, prefix: &str) -> statex_store::Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> statex_store::Result<()> {
+        self.inner.delete(key).await
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_marker_precedes_source_publication_and_dispatch_waits_for_durability() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let gate = Arc::new(OutboxGateStore {
+        inner: f.store.clone(),
+        block_segment: AtomicBool::new(true),
+        fail_marker: AtomicBool::new(false),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut cfg = f.cfg("outbox-durability");
+    cfg.store = gate.clone();
+    let a = start(cfg).await.unwrap();
+    let node = a.node.clone();
+    let enqueue = tokio::spawn(async move {
+        node.invoke(
+            Invocation {
+                app: "counter".into(),
+                ty: "counter".into(),
+                key: "source".into(),
+                op: InvOp::Call {
+                    method: "enqueue".into(),
+                    args: json!({"key": "target", "by": 9, "delay-ms": 0, "fail": false}),
+                },
+                chain: vec![],
+            },
+            0,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), gate.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        f.store.list("outbox/").await.unwrap().len(),
+        1,
+        "marker must precede segment publication"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        get(&a, "target").await,
+        0,
+        "target must not execute before source state is durable"
+    );
+    gate.release.notify_one();
+    let result = enqueue.await.unwrap();
+    assert_eq!(result.status, 200, "{}", result.body);
+    let id = result.body["result"].as_str().unwrap();
+    assert_eq!(wait_outbox(&a, "source", id).await["status"], "succeeded");
+    assert_eq!(get(&a, "target").await, 9);
+    a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_marker_failure_prevents_source_commit_publication() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let gate = Arc::new(OutboxGateStore {
+        inner: f.store.clone(),
+        block_segment: AtomicBool::new(false),
+        fail_marker: AtomicBool::new(true),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let mut cfg = f.cfg("outbox-index-failure");
+    cfg.store = gate;
+    let a = start(cfg).await.unwrap();
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/source/enqueue",
+        json!({"key": "target", "by": 100, "delay-ms": 0, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+    assert!(f.store.list("outbox/").await.unwrap().is_empty());
+    assert!(f
+        .store
+        .list("actors/counter/counter/source/ltx/")
+        .await
+        .unwrap()
+        .iter()
+        .all(|key| !key.ends_with(".ltx")));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(get(&a, "target").await, 0);
+    a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_delayed_self_dispatch_and_rollback() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let a = f.node("outbox-self").await;
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/self/enqueue",
+        json!({"key": "self", "by": 7, "delay-ms": 700, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["result"].as_str().unwrap();
+    let pending = outbox_job(&a, "self", id).await;
+    assert_eq!(pending["status"], "pending");
+    assert_eq!(pending["attempts"], 0);
+    assert_eq!(get(&a, "self").await, 0);
+    let job = wait_outbox(&a, "self", id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(job["result"], 7);
+    assert_eq!(get(&a, "self").await, 7);
+    assert_eq!(f.store.list("outbox/").await.unwrap().len(), 1);
+
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/rollback/enqueue",
+        json!({"key": "self", "by": 100, "delay-ms": 0, "fail": true}),
+    )
+    .await;
+    assert_eq!(status, 422, "{body}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        get(&a, "self").await,
+        7,
+        "rolled-back job must never dispatch"
+    );
+    assert_eq!(f.store.list("outbox/").await.unwrap().len(), 1);
+    // Public method routing cannot execute source maintenance operations.
+    let (status, _) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/self/outboxclaim",
+        J::Null,
+    )
+    .await;
+    assert_eq!(status, 404);
+    a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_committed_job_recovers_after_source_owner_crash() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let a = f.node("outbox-owner").await;
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/recover/enqueue",
+        json!({"key": "recover-target", "by": 11, "delay-ms": 5000, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["result"].as_str().unwrap().to_owned();
+    assert_eq!(f.store.list("outbox/").await.unwrap().len(), 1);
+    a.kill();
+    let b = f.node("outbox-takeover").await;
+    wait_outbox_target(&b, "recover-target", 11).await;
+    let job = wait_outbox(&b, "recover", &id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(get(&b, "recover-target").await, 11);
+    assert_eq!(
+        f.store.list("outbox/").await.unwrap().len(),
+        1,
+        "discovery markers remain permanent"
+    );
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_durable_running_claim_recovers_after_dispatcher_crash() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let mut cfg = f.cfg("outbox-claim-owner");
+    cfg.wake_tick = Duration::from_secs(30);
+    let a = start(cfg).await.unwrap();
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/claimed/enqueue",
+        json!({"key": "claim-target", "by": 17, "delay-ms": 0, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["result"].as_str().unwrap().to_owned();
+    let now = statex_node::layout::now_ms();
+    let claim = a
+        .node
+        .invoke(
+            Invocation {
+                app: "counter".into(),
+                ty: "counter".into(),
+                key: "claimed".into(),
+                op: InvOp::OutboxClaim {
+                    now_ms: now,
+                    retry_at_ms: now + 500,
+                },
+                chain: vec![],
+            },
+            0,
+        )
+        .await;
+    assert_eq!(claim.status, 200, "{}", claim.body);
+    assert_eq!(claim.body["result"]["status"], "running");
+    assert_eq!(claim.body["result"]["attempts"], 1);
+    a.kill();
+    let b = f.node("outbox-claim-takeover").await;
+    wait_outbox_target(&b, "claim-target", 17).await;
+    let job = wait_outbox(&b, "claimed", &id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    assert_eq!(job["attempts"], 2);
+    assert_eq!(get(&b, "claim-target").await, 17);
+    b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_committed_job_recovers_after_source_eviction() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let mut cfg = f.cfg("outbox-idle");
+    cfg.wake_tick = Duration::from_secs(30);
+    let a = start(cfg).await.unwrap();
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/evicted/enqueue",
+        json!({"key": "evicted-target", "by": 3, "delay-ms": 1500, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["result"].as_str().unwrap().to_owned();
+    a.node.evict_idle(Duration::ZERO).await;
+    assert!(
+        a.node.resident_actors().is_empty(),
+        "source should be evicted before delivery"
+    );
+    let b = f.node("outbox-idle-waker").await;
+    wait_outbox_target(&b, "evicted-target", 3).await;
+    assert_eq!(
+        get(&b, "evicted-target").await,
+        3,
+        "discovery scan must deliver without source polling"
+    );
+    let job = wait_outbox(&b, "evicted", &id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    b.shutdown().await;
+    a.shutdown().await;
+}
+
+struct OutboxIdentityHook(Arc<Mutex<Option<InvocationMetadata>>>);
+
+struct OutboxEvictionHook(Arc<AtomicUsize>);
+
+#[async_trait::async_trait]
+impl InvocationExtension for OutboxEvictionHook {
+    async fn lifecycle(&self, event: &LifecycleEvent) -> Result<(), HookError> {
+        if event.actor.key == "finished-source" && event.kind == LifecycleKind::Evicted {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_completed_markers_do_not_keep_source_continuously_resident() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let evictions = Arc::new(AtomicUsize::new(0));
+    let mut cfg = f.cfg("outbox-completed-idle");
+    cfg.idle_timeout = Duration::from_millis(150);
+    cfg.wake_tick = Duration::from_millis(25);
+    cfg.extensions
+        .push(Arc::new(OutboxEvictionHook(evictions.clone())));
+    let a = start(cfg).await.unwrap();
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/finished-source/enqueue",
+        json!({"key": "finished-target", "by": 1, "delay-ms": 0, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let id = body["result"].as_str().unwrap();
+    assert_eq!(
+        wait_outbox(&a, "finished-source", id).await["status"],
+        "succeeded"
+    );
+    let before = evictions.load(Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while evictions.load(Ordering::SeqCst) == before {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("frequent no-op marker scans must allow idle eviction");
+    assert_eq!(f.store.list("outbox/").await.unwrap().len(), 1);
+    a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_empty_claim_does_not_reset_source_idle_time() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let mut cfg = f.cfg("outbox-idle-claim");
+    cfg.wake_tick = Duration::from_secs(30);
+    cfg.idle_timeout = Duration::from_secs(30);
+    let a = start(cfg).await.unwrap();
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/idle-source/enqueue",
+        json!({"key": "later", "by": 1, "delay-ms": 5000, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let now = statex_node::layout::now_ms();
+    let outcome = a
+        .node
+        .invoke(
+            Invocation {
+                app: "counter".into(),
+                ty: "counter".into(),
+                key: "idle-source".into(),
+                op: InvOp::OutboxClaim {
+                    now_ms: now,
+                    retry_at_ms: now + 60_000,
+                },
+                chain: vec![],
+            },
+            0,
+        )
+        .await;
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+    assert!(outcome.body["result"].is_null());
+    a.node.evict_idle(Duration::from_millis(50)).await;
+    assert!(
+        a.node.resident_actors().is_empty(),
+        "empty scans must not keep the source active"
+    );
+    a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_completion_compacts_without_another_guest_call() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let mut cfg = f.cfg("outbox-completion-compact");
+    cfg.wake_tick = Duration::from_secs(30);
+    cfg.snapshot_every = 2;
+    let a = start(cfg).await.unwrap();
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/compact-source/enqueue",
+        json!({"key": "later", "by": 1, "delay-ms": 0, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let source = |op| Invocation {
+        app: "counter".into(),
+        ty: "counter".into(),
+        key: "compact-source".into(),
+        op,
+        chain: vec![],
+    };
+    let now = statex_node::layout::now_ms();
+    let claimed = a
+        .node
+        .invoke(
+            source(InvOp::OutboxClaim {
+                now_ms: now,
+                retry_at_ms: now + 60_000,
+            }),
+            0,
+        )
+        .await;
+    assert_eq!(claimed.status, 200, "{}", claimed.body);
+    let mut job: statex_runtime::outbox::Job =
+        serde_json::from_value(claimed.body["result"].clone()).unwrap();
+    job.status = statex_runtime::outbox::JobStatus::Succeeded;
+    job.result = Some(json!(1));
+    let completed = a
+        .node
+        .invoke(source(InvOp::OutboxComplete { job }), 0)
+        .await;
+    assert_eq!(completed.status, 200, "{}", completed.body);
+    let id = statex_node::ActorId {
+        app: "counter".into(),
+        ty: "counter".into(),
+        key: "compact-source".into(),
+    };
+    let snapshot = format!("{}{}", id.epoch_prefix(1), statex_ltx::snapshot_name(3));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if f.store.get(&snapshot).await.unwrap().is_some() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "completion must compact source state"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    a.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_discovery_uses_recreated_source_database_not_deleted_jobs() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let a = f.node("outbox-recreated").await;
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/recreated/enqueue",
+        json!({"key": "old-target", "by": 99, "delay-ms": 1000, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let old_id = body["result"].as_str().unwrap().to_owned();
+    let deleted = reqwest::Client::new()
+        .delete(format!(
+            "{}/v1/apps/counter/actors/counter/recreated",
+            a.url()
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(deleted.status().as_u16(), 200);
+    assert_eq!(inc(&a, "recreated", 2).await.0, 200);
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/recreated/job",
+        json!({"id": old_id}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body["result"].is_null(),
+        "deleted generation's receipt must not survive"
+    );
+    let (status, body) = post(
+        &a,
+        "/v1/apps/counter/actors/counter/recreated/enqueue",
+        json!({"key": "new-target", "by": 1, "delay-ms": 0, "fail": false}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let new_id = body["result"].as_str().unwrap();
+    assert_ne!(new_id, old_id);
+    assert_eq!(
+        wait_outbox(&a, "recreated", new_id).await["status"],
+        "succeeded"
+    );
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(get(&a, "old-target").await, 0);
+    assert_eq!(get(&a, "new-target").await, 1);
+    assert_eq!(get(&a, "recreated").await, 2);
+    a.shutdown().await;
+}
+
+#[async_trait::async_trait]
+impl InvocationExtension for OutboxIdentityHook {
+    async fn before_execute(&self, context: &InvocationContext) -> Result<(), HookError> {
+        if context.target.key == "identity-target"
+            && matches!(&context.operation, statex_runtime::invocation::InvocationOperation::Call { method, .. } if method == "increment")
+        {
+            *self.0.lock().unwrap() = Some(context.request.clone());
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_preserves_source_identity_and_principal_with_fresh_deadline() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let observed = Arc::new(Mutex::new(None));
+    let mut cfg = f.cfg("outbox-context");
+    cfg.extensions
+        .push(Arc::new(OutboxIdentityHook(observed.clone())));
+    let a = start(cfg).await.unwrap();
+    let mut metadata = InvocationMetadata::new(Caller::Embedded, Duration::from_secs(1)).unwrap();
+    metadata.principal = Some(Principal {
+        subject: "member".into(),
+        claims: BTreeMap::new(),
+    });
+    metadata
+        .attributes
+        .insert("tenant".into(), json!("payments"));
+    let original = metadata.clone();
+    let outcome = a.node.invoke_with_metadata(Invocation {
+        app: "counter".into(), ty: "counter".into(), key: "identity-source".into(),
+        op: InvOp::Call { method: "enqueue".into(),
+            args: json!({"key": "identity-target", "by": 5, "delay-ms": 1500, "fail": false}) },
+        chain: vec![],
+    }, metadata).await;
+    assert_eq!(outcome.status, 200, "{}", outcome.body);
+    let id = outcome.body["result"].as_str().unwrap();
+    let job = wait_outbox(&a, "identity-source", id).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let delivered = observed.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        delivered.caller,
+        Caller::Actor {
+            actor: statex_runtime::ActorRef {
+                app: "counter".into(),
+                actor_type: "counter".into(),
+                key: "identity-source".into(),
+            }
+        }
+    );
+    assert_eq!(delivered.principal, original.principal);
+    assert_eq!(delivered.attributes, original.attributes);
+    assert_eq!(
+        delivered.parent_request_id,
+        Some(job["context"]["request_id"].as_str().unwrap().to_owned())
+    );
+    assert_ne!(delivered.request_id, original.request_id);
+    assert!(delivered.deadline_unix_ms > original.deadline_unix_ms);
+    a.shutdown().await;
+}
+
+struct OutboxFailureHook(AtomicUsize);
+
+#[async_trait::async_trait]
+impl InvocationExtension for OutboxFailureHook {
+    async fn before_execute(&self, context: &InvocationContext) -> Result<(), HookError> {
+        if matches!(&context.operation, statex_runtime::invocation::InvocationOperation::Call { method, .. } if method == "increment")
+        {
+            if context.target.key == "retry-target" && self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(HookError::Unavailable(
+                    "transient delivery rejection".into(),
+                ));
+            }
+            if context.target.key == "denied-target" {
+                return Err(HookError::Denied("permanent delivery rejection".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_transient_failures_retry_and_permanent_failures_are_terminal() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let mut cfg = f.cfg("outbox-retries");
+    cfg.extensions
+        .push(Arc::new(OutboxFailureHook(AtomicUsize::new(0))));
+    let a = start(cfg).await.unwrap();
+    for (target, expected, attempts) in [
+        ("retry-target", "succeeded", 2),
+        ("denied-target", "failed", 1),
+    ] {
+        let (status, body) = post(
+            &a,
+            "/v1/apps/counter/actors/counter/retries/enqueue",
+            json!({"key": target, "by": 13, "delay-ms": 0, "fail": false}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let id = body["result"].as_str().unwrap();
+        let job = wait_outbox(&a, "retries", id).await;
+        assert_eq!(job["status"], expected, "{job}");
+        assert_eq!(job["attempts"], attempts, "{job}");
+        if expected == "failed" {
+            assert_eq!(job["error"]["code"], "forbidden");
+            assert!(job["result"].is_null());
+        } else {
+            assert_eq!(job["result"], 13);
+        }
+    }
+    a.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -626,6 +1305,27 @@ async fn typed_calls_across_apps_and_nodes() {
     assert_eq!(relay(&a, "r1", "calls", J::Null).await.1["result"], 3);
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn outbox_typed_wasm_call_is_encoded_by_the_host() {
+    let _serial = OUTBOX_TEST_LOCK.lock().await;
+    let f = Fleet::new().await;
+    let (wasm, manifest) = caller();
+    assert!(manifest.calls.iter().any(|import| import.spawns.iter()
+        .any(|spawn| spawn.delayed && spawn.method == "increment")));
+    deploy::deploy(&f.store, wasm, manifest, &deploy::DeployOptions::default())
+        .await.unwrap();
+    let mut cfg = f.cfg("typed-outbox");
+    cfg.lease_ttl = Duration::from_secs(10);
+    let a = start(cfg).await.unwrap();
+    let (status, body) = relay(&a, "typed-source", "enqueue",
+        json!({"key": "typed-target", "by": 5, "delay-ms": 1500})).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"].as_str().unwrap().len(), 32);
+    assert_eq!(get(&a, "typed-target").await, 0);
+    wait_outbox_target(&a, "typed-target", 5).await;
+    a.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

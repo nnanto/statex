@@ -5,6 +5,7 @@ package demo:db;
 /// Every key (e.g. "alice") is an independent actor with its own SQLite database.
 interface kv {
   use statex:host/actors@0.1.0.{call-error};
+  use statex:host/actors@0.1.0.{spawned-call as statex-spawned-call, delayed-call as statex-delayed-call};
 
   record entry {
     key: string,
@@ -18,6 +19,22 @@ interface kv {
   delete: func(actor: string, key: string) -> result<bool, call-error>;
 
   scan: func(actor: string, prefix: string) -> result<list<entry>, call-error>;
+
+  statex-spawn-delete: func(actor: string, key: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-delete: func(actor: string, statex-delay-ms: u64, key: string) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-get: func(actor: string, key: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-get: func(actor: string, statex-delay-ms: u64, key: string) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-put: func(actor: string, key: string, value: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-put: func(actor: string, statex-delay-ms: u64, key: string, value: string) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-scan: func(actor: string, prefix: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-scan: func(actor: string, statex-delay-ms: u64, prefix: string) -> result<statex-delayed-call, call-error>;
 }
 
 world statex-calls {

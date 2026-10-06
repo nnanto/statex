@@ -4,6 +4,7 @@ package statex:counter;
 /// A simple counter. Each key (e.g. "alice") is an independent actor.
 interface counter {
   use statex:host/actors@0.1.0.{call-error};
+  use statex:host/actors@0.1.0.{spawned-call as statex-spawned-call, delayed-call as statex-delayed-call};
 
   /// Adds `by` and returns the new value.
   increment: func(actor: string, by: s64) -> result<s64, call-error>;
@@ -13,6 +14,13 @@ interface counter {
 
   /// Resets to zero.
   reset: func(actor: string) -> result<_, call-error>;
+
+  /// Enqueues a durable increment on another counter (or this counter).
+  /// Returning an error when `fail` is true demonstrates outbox rollback.
+  enqueue: func(actor: string, key: string, by: s64, delay-ms: u64, fail: bool) -> result<result<string, string>, call-error>;
+
+  /// Inspect an outbox job belonging to this counter, as JSON.
+  job: func(actor: string, id: string) -> result<result<option<string>, string>, call-error>;
 
   /// Schedules the alarm `delay-ms` from now. Its first `fail-times`
   /// attempts fail, to show retries.
@@ -26,11 +34,48 @@ interface counter {
 
   /// How often the alarm has fired successfully.
   fired: func(actor: string) -> result<s64, call-error>;
+
+  statex-spawn-alarm-at: func(actor: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-alarm-at: func(actor: string, statex-delay-ms: u64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-cancel: func(actor: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-cancel: func(actor: string, statex-delay-ms: u64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-enqueue: func(actor: string, key: string, by: s64, delay-ms: u64, fail: bool) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-enqueue: func(actor: string, statex-delay-ms: u64, key: string, by: s64, delay-ms: u64, fail: bool) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-fired: func(actor: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-fired: func(actor: string, statex-delay-ms: u64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-get: func(actor: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-get: func(actor: string, statex-delay-ms: u64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-increment: func(actor: string, by: s64) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-increment: func(actor: string, statex-delay-ms: u64, by: s64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-job: func(actor: string, id: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-job: func(actor: string, statex-delay-ms: u64, id: string) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-reset: func(actor: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-reset: func(actor: string, statex-delay-ms: u64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-schedule: func(actor: string, delay-ms: u64, fail-times: u32) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-schedule: func(actor: string, statex-delay-ms: u64, delay-ms: u64, fail-times: u32) -> result<statex-delayed-call, call-error>;
 }
 
 /// A tiny ledger showing records, enums, variants, options and results.
 interface account {
   use statex:host/actors@0.1.0.{call-error};
+  use statex:host/actors@0.1.0.{spawned-call as statex-spawned-call, delayed-call as statex-delayed-call};
 
   variant tx-error {
     insufficient-funds(u64),
@@ -56,6 +101,22 @@ interface account {
   balance: func(actor: string) -> result<u64, call-error>;
 
   history: func(actor: string, limit: u32) -> result<list<entry>, call-error>;
+
+  statex-spawn-balance: func(actor: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-balance: func(actor: string, statex-delay-ms: u64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-deposit: func(actor: string, amount: u64, memo: option<string>) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-deposit: func(actor: string, statex-delay-ms: u64, amount: u64, memo: option<string>) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-history: func(actor: string, limit: u32) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-history: func(actor: string, statex-delay-ms: u64, limit: u32) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-withdraw: func(actor: string, amount: u64) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-withdraw: func(actor: string, statex-delay-ms: u64, amount: u64) -> result<statex-delayed-call, call-error>;
 }
 
 world statex-calls {

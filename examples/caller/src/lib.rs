@@ -34,6 +34,11 @@ impl Guest for App {
         track(counter::increment(&key, by))
     }
 
+    fn enqueue(key: String, by: i64, delay_ms: u64) -> Result<String, String> {
+        counter::spawn_after::increment(std::time::Duration::from_millis(delay_ms), &key, by)
+            .map_err(|error| error.to_string())
+    }
+
     fn deposit(key: String, amount: u64, memo: Option<String>) -> Result<u64, String> {
         // The outer result is the call, the inner one the callee's own result.
         match track(account::deposit(&key, amount, memo.as_deref()))? {

@@ -133,6 +133,14 @@ pub enum InvOp {
     /// Fire the actor's alarm if it is due (internal: issued by alarm timers
     /// and the waker, never by the public API). Never creates the actor.
     Alarm,
+    /// Trusted peer-only source database maintenance.
+    OutboxClaim {
+        now_ms: u64,
+        retry_at_ms: u64,
+    },
+    OutboxComplete {
+        job: statex_runtime::outbox::Job,
+    },
 }
 
 /// HTTP status + JSON body, identical whether produced locally or by a peer.
@@ -415,7 +423,14 @@ impl Node {
 
     /// Routes and runs an invocation. Any node accepts any call.
     pub async fn invoke(&self, inv: Invocation, hops: u32) -> Outcome {
-        let caller = if matches!(inv.op, InvOp::Alarm) {
+        let caller = if matches!(
+            inv.op,
+            InvOp::OutboxClaim { .. } | InvOp::OutboxComplete { .. }
+        ) {
+            Caller::System {
+                name: "outbox".into(),
+            }
+        } else if matches!(inv.op, InvOp::Alarm) {
             Caller::System {
                 name: "alarm".into(),
             }
@@ -704,7 +719,13 @@ impl Node {
             };
         let mut created = false;
         if guard.is_none() {
-            if matches!(inv.op, InvOp::Delete | InvOp::Alarm) {
+            if matches!(
+                inv.op,
+                InvOp::Delete
+                    | InvOp::Alarm
+                    | InvOp::OutboxClaim { .. }
+                    | InvOp::OutboxComplete { .. }
+            ) {
                 match owner::read(&self.store, &id).await {
                     Ok(Some((r, _))) if r.state != OwnerState::Deleted => {}
                     Ok(_) => {
@@ -836,6 +857,14 @@ impl Node {
                 chain: inv.chain.clone(),
             },
             InvOp::Alarm => Op::Alarm { now_ms: now_ms() },
+            InvOp::OutboxClaim {
+                now_ms,
+                retry_at_ms,
+            } => Op::OutboxClaim {
+                now_ms: *now_ms,
+                retry_at_ms: *retry_at_ms,
+            },
+            InvOp::OutboxComplete { job } => Op::OutboxComplete { job: job.clone() },
         };
         Done(
             self.run(
@@ -863,6 +892,7 @@ impl Node {
         let extensions = self.cfg.extensions.clone();
         let context = context.clone();
         let lease = self.lease.clone();
+        let outbox_claim = matches!(&op, Op::OutboxClaim { .. });
         let execution = tokio::task::spawn_blocking(move || {
             let mut guard = guard;
             let res = if lease.valid() {
@@ -904,6 +934,22 @@ impl Node {
         if executed.code_changed {
             let epoch = guard.as_ref().expect("resident").epoch;
             self.lifecycle(id, epoch, LifecycleKind::CodeReplaced).await;
+        }
+        // A stale marker is harmless; a committed job without a marker is not.
+        if executed.outbox_pending {
+            if let Err(e) = self
+                .store
+                .put(
+                    &crate::outbox::marker_key(id),
+                    to_json_bytes(&json!({ "pending": true })),
+                )
+                .await
+            {
+                self.discard(&mut guard, id).await;
+                return Outcome::unavailable(format!(
+                    "outbox discovery marker was not made durable ({e}); write did not apply"
+                ));
+            }
         }
         // A new alarm's wake hint is written before the transaction becomes
         // durable, so a durable alarm always has one.
@@ -949,7 +995,9 @@ impl Node {
                     });
                 }
             }
-            if txid - snapshot_txid >= self.cfg.snapshot_every {
+            // Claim replies release the source before target execution;
+            // completion transactions can compact after the target returns.
+            if !outbox_claim && txid - snapshot_txid >= self.cfg.snapshot_every {
                 let store = self.store.clone();
                 let id = id.clone();
                 let node = self.self_ref.clone();
@@ -1288,6 +1336,10 @@ fn invocation_parts(inv: &Invocation) -> (ActorRef, InvocationOperation) {
         InvOp::Create => InvocationOperation::Create,
         InvOp::Delete => InvocationOperation::Delete,
         InvOp::Alarm => InvocationOperation::Alarm,
+        InvOp::OutboxClaim { .. } => InvocationOperation::OutboxClaim,
+        InvOp::OutboxComplete { job } => InvocationOperation::OutboxComplete {
+            job_id: job.id.clone(),
+        },
     };
     (
         ActorRef {

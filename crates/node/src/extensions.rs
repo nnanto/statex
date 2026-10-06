@@ -64,6 +64,7 @@ pub struct HttpRequestInfo {
 pub enum TransactionKind {
     Invocation,
     AlarmMaintenance,
+    OutboxMaintenance,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

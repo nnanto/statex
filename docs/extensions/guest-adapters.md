@@ -1,8 +1,8 @@
 # Guest capability adapters
 
 Guest helpers remain ordinary library defaults. Native adapters replace outbound
-HTTP and logging, not actor identity, SQL storage, migrations, or alarms. No
-adapter is installed by default.
+HTTP, logging, and actor scheduling/inspection, not actor identity, SQL
+storage, migrations, or alarms. No adapter is installed by default.
 
 The production guest SQL API is backend-neutral: SQLite is the default, while
 SQL dialect and migration support belong to the configured host state backend.
@@ -12,8 +12,11 @@ select or replace that host state backend.
 ## Rust native
 
 Implement `statex_guest::adapters::Capabilities` and scope it with
-`with_capabilities`. Both trait methods have defaults: HTTP uses
-`testing::mock_http`, and logging uses the mock's log collector.
+`with_capabilities`. HTTP uses `testing::mock_http` by default, and logging uses
+the mock's log collector. Replacement adapters must explicitly implement
+`actors_spawn` and `actors_job` to support scheduling and inspection; otherwise
+those operations return unsupported errors. With no replacement adapter,
+scheduling uses the transactional mock outbox.
 
 ```rust
 use std::rc::Rc;
@@ -73,7 +76,8 @@ lexical capability scope.
 
 Rust `testing::call` rolls back panics; `try_call` also rolls back returned
 `Err`. Python `call` rolls back exceptions, including `statex.Err`. SQL and alarm
-mutations still share that transaction and remain isolated per `(actor type, key)`.
+mutations and default mock outbox jobs share that transaction and remain
+isolated per `(actor type, key)`.
 Adapters do not begin or commit transactions. HTTP/logging side effects remain
 non-transactional, so adapters must not assume rollback undoes them. Capability
 adapters are trusted application code, not a sandbox/security boundary.

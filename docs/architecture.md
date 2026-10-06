@@ -123,6 +123,54 @@ node until that node goes idle on it (`--idle-timeout`), shuts down
 gracefully, or dies. Clients may talk to any node, for example through a plain
 L4 load balancer.
 
+## Durable outbox dispatch
+
+Background calls belong to the source actor's transactional state. `spawn`
+records a ready job; `spawn_after` records the same job with a future
+not-before timestamp. Scheduling never directly starts the target.
+
+Generated client interfaces include typed scheduling helpers. Their return
+types reference the host's `spawned-call` or `delayed-call` receipt, allowing
+the runtime to identify them even when a compiled component omits WIT docs.
+The host serializes their typed arguments through the existing WIT/JSON
+mapper. Native test doubles encode through a shared SDK test utility; there
+is no application-side production JSON serializer.
+
+Before publishing a source change containing pending jobs, the node publishes
+a persistent discovery marker in the object store. Background scanning uses
+these markers to reach the source through normal ownership routing, including
+when it is evicted or its previous owner has died. A marker is not the job:
+only the source database can authoritatively claim committed work.
+
+```mermaid
+sequenceDiagram
+  participant A as source actor
+  participant S as object store
+  participant D as dispatcher
+  participant B as target actor
+  A->>A: state update + enqueue job
+  A->>S: discovery marker, then durable change
+  D->>A: claim eligible job
+  A->>S: persist claim and attempt
+  A-->>D: job (source lock released)
+  D->>B: normal routed method call
+  B->>S: persist target transaction
+  B-->>D: result or error
+  D->>A: record completion or retry
+  A->>S: persist outbox update
+```
+
+Claims carry an attempt number and a recovery deadline. An interrupted claim
+becomes eligible again; a late completion from an earlier attempt must not
+overwrite a newer claim. Transient failures use bounded retries and backoff.
+Terminal outcomes remain in the source database for inspection.
+
+Source and target transactions are independent. In particular, there is no
+atomic target-commit/outbox-completion operation, so delivery is at least once.
+The dispatcher does not hold the source lock while calling the target; a job
+may target its own source actor. Jobs do not establish a per-target FIFO queue,
+and a future job does not prevent ready jobs from running.
+
 ## Activation with the default state backend
 
 1. Clear the local directory for the actor.

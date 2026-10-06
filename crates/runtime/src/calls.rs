@@ -116,8 +116,73 @@ pub(crate) fn link(linker: &mut Linker<HostState>, calls: &[CallImport]) -> Resu
                 Ok(())
             })?;
         }
+        for spawn in &c.spawns {
+            let method = c.methods.iter().find(|method| method.name == spawn.method)
+                .ok_or_else(|| anyhow::anyhow!("unknown deferred method {}", spawn.method))?.clone();
+            let c = c.clone();
+            let delayed = spawn.delayed;
+            inst.func_new(&spawn.name, move |mut store, _ty, params, results| {
+                results[0] = enqueue_typed(store.data_mut(), &c, &method, params, delayed);
+                Ok(())
+            })?;
+        }
     }
     Ok(())
+}
+
+fn finite(value: &Val) -> bool {
+    match value {
+        Val::Float32(value) => value.is_finite(),
+        Val::Float64(value) => value.is_finite(),
+        Val::List(values) | Val::Tuple(values) => values.iter().all(finite),
+        Val::Record(fields) => fields.iter().all(|(_, value)| finite(value)),
+        Val::Option(value) | Val::Variant(_, value) => value.as_deref().is_none_or(finite),
+        Val::Result(Ok(value) | Err(value)) => value.as_deref().is_none_or(finite),
+        _ => true,
+    }
+}
+
+fn enqueue_typed(state: &mut HostState, c: &CallImport, method: &Method, params: &[Val], delayed: bool) -> Val {
+    let Some(Val::String(key)) = params.first() else {
+        return failed(CallFailure::Incompatible("the actor key must be a string".into()));
+    };
+    let (delay, arguments) = if delayed {
+        let Some(Val::U64(delay)) = params.get(1) else {
+            return failed(CallFailure::Incompatible("delay-ms must be u64".into()));
+        };
+        (*delay, &params[2..])
+    } else {
+        (0, &params[1..])
+    };
+    if arguments.len() != method.params.len() || !arguments.iter().all(finite) {
+        return failed(CallFailure::Incompatible("invalid deferred arguments or non-finite float".into()));
+    }
+    let args = J::Array(method.params.iter().zip(arguments)
+        .map(|(parameter, value)| json::val_to_json(&parameter.ty, value)).collect());
+    let args = match serde_json::to_string(&args) {
+        Ok(args) => args,
+        Err(error) => return failed(CallFailure::Incompatible(error.to_string())),
+    };
+    use crate::host::statex::host::actors::Host;
+    match state.spawn(c.app.clone(), c.actor_type.clone(), key.clone(), method.name.clone(), args, delay) {
+        Ok(id) => {
+            let mut fields = vec![("id".into(), Val::String(id))];
+            if delayed { fields.push(("delay-ms".into(), Val::U64(delay))); }
+            Val::Result(Ok(Some(Box::new(Val::Record(fields)))))
+        }
+        Err(error) => {
+            use crate::host::statex::host::actors::CallError;
+            failed(match error {
+                CallError::Rejected(message) => CallFailure::Rejected(message),
+                CallError::NotFound(message) => CallFailure::NotFound(message),
+                CallError::Incompatible(message) => CallFailure::Incompatible(message),
+                CallError::Trap(message) => CallFailure::Trap(message),
+                CallError::Unavailable(message) => CallFailure::Unavailable(message),
+                CallError::Cycle(message) => CallFailure::Cycle(message),
+                CallError::Timeout => CallFailure::Timeout,
+            })
+        }
+    }
 }
 
 fn failed(f: CallFailure) -> Val {
@@ -210,7 +275,7 @@ mod tests {
         context.request.principal = Some(Principal { subject: "alice".into(), claims: BTreeMap::from([("role".into(), json!("admin"))]) });
         context.request.attributes.insert("trace".into(), json!("test"));
         let capture = Arc::new(Capture(Mutex::new(None)));
-        let state = HostState {
+        let mut state = HostState {
             wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
             table: Default::default(),
             limits: Default::default(),
@@ -227,9 +292,10 @@ mod tests {
             log_sink: Arc::new(crate::TracingLogSink),
             capability_error: None,
             invocation_context: Some(context.clone()),
+            initializing: false,
         };
         let method = Method { name: "get".into(), params: vec![], result: None, docs: None };
-        let import = CallImport { import: "target:app/counter".into(), app: "target".into(), actor_type: "counter".into(), methods: vec![method.clone()] };
+        let import = CallImport { import: "target:app/counter".into(), app: "target".into(), actor_type: "counter".into(), methods: vec![method.clone()], spawns: vec![], docs: None };
         let result = dispatch(&state, &import, &method, &[Val::String("b".into())]);
         let Val::Result(Err(Some(error))) = result else { panic!("expected rejected"); };
         let Val::Variant(name, _) = *error else { panic!("expected call-error"); };
@@ -243,5 +309,21 @@ mod tests {
         assert!(request.context.deadline_unix_ms < context.request.deadline_unix_ms);
         assert!(request.timeout < Duration::from_secs(2));
         assert_eq!(request.chain, vec![actor]);
+        state.db.lock().unwrap().begin().unwrap();
+        let before = crate::outbox::now_ms().unwrap();
+        let queued = enqueue_typed(&mut state, &import, &method,
+            &[Val::String("later".into()), Val::U64(1_000)], true);
+        let Val::Result(Ok(Some(id))) = queued else { panic!("expected queued job"); };
+        let Val::Record(fields) = *id else { panic!("expected job receipt"); };
+        let Val::String(id) = &fields[0].1 else { panic!("expected job ID"); };
+        let job = state.db.lock().unwrap().job(&id).unwrap().unwrap();
+        assert_eq!(job.method, "get");
+        assert_eq!(job.target.key, "later");
+        assert_eq!(job.args, json!([]));
+        assert!(job.not_before_ms >= before + 1_000);
+        assert!(capture.0.lock().unwrap().is_none(), "enqueue must not call the target");
+        state.db.lock().unwrap().rollback().unwrap();
+        assert!(state.db.lock().unwrap().job(&id).unwrap().is_none());
+        assert!(!finite(&Val::Option(Some(Box::new(Val::Float64(f64::NAN))))));
     }
 }

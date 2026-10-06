@@ -35,6 +35,7 @@ host before every test.
 
 import importlib
 import inspect
+import json
 import os
 import sqlite3
 import sys
@@ -43,7 +44,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__all__ = ["call", "stub", "clear_stubs", "mock_http", "capabilities", "logs", "alarm", "reactivate", "reset", "set_app", "project_root"]
+__all__ = ["call", "stub", "clear_stubs", "mock_http", "capabilities", "logs", "alarm", "reactivate", "reset", "set_app", "project_root", "drain_jobs", "mock_spawn"]
 
 
 def project_root() -> Path:
@@ -100,6 +101,10 @@ class _State:
         self.stack: List[Tuple[str, str]] = []
         self.logs: List[Tuple[Any, str]] = []
         self.http: Optional[Callable[[Any], Any]] = None
+        self.jobs: Dict[str, Dict[str, Any]] = {}
+        self.clock_ms = 0
+        self.next_job = 0
+        self.spawn_handlers: Dict[Tuple[str, str, str], Callable[..., Any]] = {}
 
 
 _state = _State()
@@ -108,19 +113,28 @@ _capabilities: ContextVar = ContextVar("statex_native_capabilities", default={})
 
 @contextmanager
 def capabilities(http: Optional[Callable[[Any], Any]] = None,
-                 log: Optional[Callable[[Any, str], None]] = None) -> Any:
-    """Temporarily adapts native HTTP/logging without replacing SQL or alarms.
+                 log: Optional[Callable[[Any, str], None]] = None,
+                 spawn: Optional[Callable[..., str]] = None,
+                 job: Optional[Callable[[str], Optional[str]]] = None) -> Any:
+    """Temporarily adapts native capabilities without replacing SQL or alarms.
 
     HTTP uses the same request/response contract as mock_http. Exceptions
     propagate unchanged. Omitted handlers inherit the enclosing scope/default.
+    Scheduling and job inspection require explicit handlers in this or an
+    enclosing scope; otherwise they raise unsupported errors.
     Nested scopes restore on exit, including exceptions; overrides are local
     to this execution context. The underlying test host remains single-threaded.
     """
     handlers = dict(_capabilities.get())
+    handlers["_adapter"] = True
     if http is not None:
         handlers["http"] = http
     if log is not None:
         handlers["log"] = log
+    if spawn is not None:
+        handlers["spawn"] = spawn
+    if job is not None:
+        handlers["job"] = job
     token = _capabilities.set(handlers)
     try:
         yield
@@ -158,16 +172,53 @@ def call(actor_type: str, key: str, fn: Callable[..., Any], *args: Any, **kwargs
     conn = _db(who)
     conn.execute("BEGIN IMMEDIATE")
     _state.stack.append(who)
+    jobs_before = set(_state.jobs)
     try:
         result = fn(*args, **kwargs)
     except BaseException:
         conn.execute("ROLLBACK")
+        for id in set(_state.jobs) - jobs_before:
+            if _state.jobs[id]["source"] == who:
+                del _state.jobs[id]
         raise
     else:
         conn.execute("COMMIT")
         return result
     finally:
         _state.stack.pop()
+
+
+def mock_spawn(app: str, actor_type: str, method: str, handler: Callable[..., Any]) -> None:
+    """Installs a deferred handler taking `(key, *JSON_args)`, not called until drain_jobs."""
+    _state.spawn_handlers[(app, actor_type, method)] = handler
+
+
+def drain_jobs(elapsed_ms: int = 0) -> int:
+    """Advances a virtual clock and delivers due jobs in their own transactions."""
+    if _state.stack:
+        raise RuntimeError("drain jobs outside statex_testing.call")
+    if isinstance(elapsed_ms, bool) or not isinstance(elapsed_ms, int) or elapsed_ms < 0:
+        raise ValueError("elapsed_ms must be a nonnegative integer")
+    _state.clock_ms += elapsed_ms
+    due = [j for j in _state.jobs.values()
+           if j["status"] == "pending" and j["due_ms"] <= _state.clock_ms]
+    for j in due:
+        j["status"] = "running"
+        j["attempts"] += 1
+        previous_app = _state.app
+        _state.app = j["app"]
+        try:
+            handler = _state.spawn_handlers.get((j["app"], j["actor_type"], j["method"]))
+            if handler is None:
+                raise RuntimeError("no native job handler installed; use mock_spawn")
+            j["result"] = call(j["actor_type"], j["key"], handler, j["key"], *j["args"])
+        except BaseException as e:
+            j["status"], j["error"] = "failed", dict(code="native", message=str(e))
+        else:
+            j["status"] = "succeeded"
+        finally:
+            _state.app = previous_app
+    return len(due)
 
 
 def reactivate(actor_type: str, key: str) -> None:
@@ -287,6 +338,48 @@ def _forbidden(stmt: str) -> Optional[str]:
 
 
 def _install() -> None:
+    actors = _module("actors")
+    if actors is not None:
+        def spawn(app: str, actor_type: str, key: str, method: str, args: str, delay_ms: int) -> str:
+            handler = _capabilities.get().get("spawn")
+            if handler is not None:
+                return handler(app, actor_type, key, method, args, delay_ms)
+            if _capabilities.get().get("_adapter"):
+                raise RuntimeError("adapter does not support actor scheduling")
+            source = _current()
+            parsed = json.loads(args)
+            if not isinstance(parsed, list):
+                raise ValueError("spawn arguments must be a positional array")
+            _state.next_job += 1
+            id = "mock-job-%s" % _state.next_job
+            _state.jobs[id] = dict(id=id, source=source, source_app=_state.app, app=app, actor_type=actor_type,
+                                   key=key, method=method, args=parsed,
+                                   due_ms=_state.clock_ms + delay_ms, status="pending",
+                                   result=None, error=None, attempts=0)
+            return id
+
+        def job(id: str) -> Optional[str]:
+            handler = _capabilities.get().get("job")
+            if handler is not None:
+                return handler(id)
+            if _capabilities.get().get("_adapter"):
+                raise RuntimeError("adapter does not support job inspection")
+            source = _current()
+            j = _state.jobs.get(id)
+            if j is None or j["source"] != source or j["source_app"] != _state.app:
+                return None
+            return json.dumps(dict(
+                id=j["id"], target={"app": j["app"], "type": j["actor_type"], "key": j["key"]},
+                method=j["method"], args=j["args"], status=j["status"],
+                not_before_ms=j["due_ms"], next_attempt_ms=j["due_ms"],
+                attempts=j["attempts"], result=j["result"], error=j["error"],
+                context=dict(request_id="mock-source-" + id, parent_request_id=None,
+                             caller=dict(kind="embedded"), principal=None,
+                             deadline_unix_ms=2**64 - 1, attributes={})))
+
+        actors.spawn = spawn
+        actors.job = job
+
     ctx = _module("context")
     if ctx is not None:
         def app() -> str:

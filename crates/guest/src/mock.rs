@@ -10,6 +10,8 @@ use rusqlite::Connection;
 use crate::{http, log::Level, sql::Rows, sql::Value, Error, Result};
 
 pub(crate) type HttpHandler = Box<dyn FnMut(&http::Request) -> Result<http::Response, String>>;
+pub(crate) type SpawnHandler =
+    std::rc::Rc<dyn Fn(&str, &[serde_json::Value]) -> Result<serde_json::Value, crate::CallError>>;
 
 pub(crate) struct MockActor {
     pub conn: Connection,
@@ -23,6 +25,27 @@ pub(crate) struct State {
     pub http: Option<HttpHandler>,
     pub migrations_dir: Option<PathBuf>,
     pub logs: Vec<(Level, String)>,
+    pub jobs: Vec<MockJob>,
+    pub clock_ms: u64,
+    pub next_job: u64,
+    pub spawn_handlers: HashMap<(String, String, String), SpawnHandler>,
+}
+
+pub(crate) struct MockJob {
+    pub id: String,
+    pub source: (String, String),
+    pub source_app: String,
+    pub app: String,
+    pub actor_type: String,
+    pub key: String,
+    pub method: String,
+    pub args: serde_json::Value,
+    pub due_ms: u64,
+    pub status: String,
+    pub attempts: u32,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<serde_json::Value>,
+    pub callback: Option<Box<dyn FnOnce() -> Result<serde_json::Value, crate::CallError>>>,
 }
 
 impl Default for State {
@@ -35,8 +58,79 @@ impl Default for State {
             migrations_dir: std::env::var_os("CARGO_MANIFEST_DIR")
                 .map(|d| PathBuf::from(d).join("migrations")),
             logs: Vec::new(),
+            jobs: Vec::new(),
+            clock_ms: 0,
+            next_job: 0,
+            spawn_handlers: HashMap::new(),
         }
     }
+}
+
+pub fn actors_spawn(
+    app: &str,
+    actor_type: &str,
+    key: &str,
+    method: &str,
+    args: &str,
+    delay_ms: u64,
+) -> Result<String, crate::CallError> {
+    let source = current();
+    let args: serde_json::Value =
+        serde_json::from_str(args).map_err(|e| crate::CallError::Rejected(e.to_string()))?;
+    if !args.is_array() {
+        return Err(crate::CallError::Rejected(
+            "spawn arguments must be a positional array".into(),
+        ));
+    }
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        s.next_job += 1;
+        let id = format!("mock-job-{}", s.next_job);
+        let due_ms = s.clock_ms.saturating_add(delay_ms);
+        let source_app = s.app.clone();
+        s.jobs.push(MockJob {
+            id: id.clone(),
+            source,
+            source_app,
+            app: app.into(),
+            actor_type: actor_type.into(),
+            key: key.into(),
+            method: method.into(),
+            args,
+            due_ms,
+            status: "pending".into(),
+            attempts: 0,
+            result: None,
+            error: None,
+            callback: None,
+        });
+        Ok(id)
+    })
+}
+
+pub fn actors_job(id: &str) -> Result<Option<String>> {
+    let source = current();
+    STATE.with(|s| {
+        Ok(s.borrow()
+            .jobs
+            .iter()
+            .find(|j| j.id == id && j.source == source && j.source_app == s.borrow().app)
+            .map(|j| {
+                serde_json::json!({
+                    "id": j.id, "target": {"app": j.app, "type": j.actor_type, "key": j.key},
+                    "method": j.method, "args": j.args,
+                    "status": j.status, "result": j.result, "error": j.error,
+                    "not_before_ms": j.due_ms, "next_attempt_ms": j.due_ms,
+                    "attempts": j.attempts,
+                    "context": {
+                        "request_id": format!("mock-source-{}", j.id), "parent_request_id": null,
+                        "caller": {"kind": "embedded"}, "principal": null,
+                        "deadline_unix_ms": u64::MAX, "attributes": {},
+                    },
+                })
+                .to_string()
+            }))
+    })
 }
 
 thread_local! {
@@ -69,8 +163,24 @@ pub fn epoch() -> u64 {
 /// Statements a guest may not run: the host owns transactions and the file.
 pub(crate) fn forbidden(stmt: &str) -> Option<&'static str> {
     let s = stmt.trim_start().to_ascii_uppercase();
-    for kw in ["BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "ATTACH", "DETACH", "VACUUM", "PRAGMA"] {
-        if s.starts_with(kw) && s[kw.len()..].chars().next().map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_') {
+    for kw in [
+        "BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RELEASE",
+        "ATTACH",
+        "DETACH",
+        "VACUUM",
+        "PRAGMA",
+    ] {
+        if s.starts_with(kw)
+            && s[kw.len()..]
+                .chars()
+                .next()
+                .map_or(true, |c| !c.is_ascii_alphanumeric() && c != '_')
+        {
             return Some(kw);
         }
     }
@@ -108,15 +218,22 @@ fn with_conn<T>(f: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T>
 
 pub fn sql_execute(stmt: &str, params: &[Value]) -> Result<u64> {
     if let Some(kw) = forbidden(stmt) {
-        return Err(Error(format!("{kw} is not allowed: the host manages transactions")));
+        return Err(Error(format!(
+            "{kw} is not allowed: the host manages transactions"
+        )));
     }
     let p: Vec<RV> = params.iter().map(to_rv).collect();
-    with_conn(|c| c.execute(stmt, rusqlite::params_from_iter(p.iter())).map(|n| n as u64))
+    with_conn(|c| {
+        c.execute(stmt, rusqlite::params_from_iter(p.iter()))
+            .map(|n| n as u64)
+    })
 }
 
 pub fn sql_query(stmt: &str, params: &[Value]) -> Result<Rows> {
     if let Some(kw) = forbidden(stmt) {
-        return Err(Error(format!("{kw} is not allowed: the host manages transactions")));
+        return Err(Error(format!(
+            "{kw} is not allowed: the host manages transactions"
+        )));
     }
     let p: Vec<RV> = params.iter().map(to_rv).collect();
     with_conn(|c| {
@@ -125,7 +242,9 @@ pub fn sql_query(stmt: &str, params: &[Value]) -> Result<Rows> {
         let n = columns.len();
         let rows = st
             .query_map(rusqlite::params_from_iter(p.iter()), |r| {
-                (0..n).map(|i| r.get::<_, RV>(i).map(from_rv)).collect::<rusqlite::Result<Vec<_>>>()
+                (0..n)
+                    .map(|i| r.get::<_, RV>(i).map(from_rv))
+                    .collect::<rusqlite::Result<Vec<_>>>()
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(Rows { columns, rows })
@@ -159,9 +278,17 @@ const ALARM_TABLE: &str = "CREATE TABLE IF NOT EXISTS _statex_alarm(
 
 pub(crate) fn read_alarm(c: &Connection) -> rusqlite::Result<Option<u64>> {
     c.execute_batch(ALARM_TABLE)?;
-    c.query_row("SELECT at_ms FROM _statex_alarm WHERE id = 0", [], |r| r.get::<_, Option<i64>>(0))
-        .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })
-        .map(|v| v.map(|v| v as u64))
+    c.query_row("SELECT at_ms FROM _statex_alarm WHERE id = 0", [], |r| {
+        r.get::<_, Option<i64>>(0)
+    })
+    .or_else(|e| {
+        if e == rusqlite::Error::QueryReturnedNoRows {
+            Ok(None)
+        } else {
+            Err(e)
+        }
+    })
+    .map(|v| v.map(|v| v as u64))
 }
 
 pub fn alarm_set(at_ms: u64) -> Result<()> {
@@ -184,6 +311,10 @@ pub fn alarm_get() -> Option<u64> {
 pub fn alarm_clear() {
     let _ = with_conn(|c| {
         c.execute_batch(ALARM_TABLE)?;
-        c.execute("UPDATE _statex_alarm SET at_ms = NULL, retry = 0 WHERE id = 0", []).map(|_| ())
+        c.execute(
+            "UPDATE _statex_alarm SET at_ms = NULL, retry = 0 WHERE id = 0",
+            [],
+        )
+        .map(|_| ())
     });
 }

@@ -107,6 +107,37 @@ pub struct CallImport {
     /// Callee actor type: `kv`.
     pub actor_type: String,
     pub methods: Vec<Method>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spawns: Vec<SpawnImport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docs: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpawnImport {
+    pub name: String,
+    pub method: String,
+    pub delayed: bool,
+}
+
+/// Allocate helper names without reserving any application method names.
+pub fn spawn_imports(methods: &[Method]) -> Vec<SpawnImport> {
+    let mut names: std::collections::BTreeSet<String> =
+        methods.iter().map(|method| method.name.clone()).collect();
+    let mut imports = Vec::new();
+    let mut ordered: Vec<_> = methods.iter().collect();
+    ordered.sort_by(|left, right| left.name.cmp(&right.name));
+    for method in ordered {
+        for delayed in [false, true] {
+            let prefix = if delayed { "statex-spawn-after" } else { "statex-spawn" };
+            let mut name = format!("{prefix}-{}", method.name);
+            while !names.insert(name.clone()) {
+                name.push_str("-x");
+            }
+            imports.push(SpawnImport { name, method: method.name.clone(), delayed });
+        }
+    }
+    imports
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -483,6 +514,7 @@ fn call_import(resolve: &Resolve, id: wit_parser::InterfaceId, import: &str) -> 
     let actor_type = iface.name.clone().ok_or_else(|| anyhow!("import {import}: unnamed interface; {hint}"))?;
     validate_app_name(&app).with_context(|| format!("import {import} does not name a statex app; {hint}"))?;
     let mut methods = Vec::new();
+    let mut spawns = Vec::new();
     for f in iface.functions.values() {
         let ctx = format!("{import}.{}", f.name);
         if !matches!(f.kind, wit_parser::FunctionKind::Freestanding) {
@@ -492,12 +524,20 @@ fn call_import(resolve: &Resolve, id: wit_parser::InterfaceId, import: &str) -> 
             Some(p) if p.ty == Type::String => {}
             _ => bail!("{ctx}: the first parameter must be the callee's actor key (`actor: string`); {hint}"),
         }
-        let result = match f.result.as_ref().map(|t| deref(resolve, t)) {
+        let (result, deferred) = match f.result.as_ref().map(|t| deref(resolve, t)) {
             Some(TypeDefKind::Result(r)) if r.err.as_ref().is_some_and(|e| is_call_error(resolve, e)) => {
-                r.ok.as_ref().map(|t| ty_of(resolve, t, &ctx)).transpose()?
+                let deferred = r.ok.as_ref().and_then(|ty| deferred_receipt(resolve, ty));
+                let result = if deferred.is_some() { None } else {
+                    r.ok.as_ref().map(|t| ty_of(resolve, t, &ctx)).transpose()?
+                };
+                (result, deferred)
             }
             _ => bail!("{ctx}: must return `result<T, call-error>` (call-error from statex:host/actors); {hint}"),
         };
+        if let Some(delayed) = deferred {
+            spawns.push(SpawnImport { name: f.name.clone(), method: String::new(), delayed });
+            continue;
+        }
         methods.push(Method {
             name: f.name.clone(),
             params: f.params[1..]
@@ -508,7 +548,47 @@ fn call_import(resolve: &Resolve, id: wit_parser::InterfaceId, import: &str) -> 
             docs: f.docs.contents.clone(),
         });
     }
-    Ok(Some(CallImport { import: import.to_string(), app, actor_type, methods }))
+    let expected = spawn_imports(&methods);
+    for spawn in &mut spawns {
+        spawn.method = expected.iter().find(|helper| helper.name == spawn.name && helper.delayed == spawn.delayed)
+            .with_context(|| format!("{import}.{}: invalid typed scheduling helper", spawn.name))?.method.clone();
+        let original = methods.iter().find(|method| method.name == spawn.method)
+            .with_context(|| format!("{import}.{}: unknown deferred target {}", spawn.name, spawn.method))?;
+        let function = &iface.functions[&spawn.name];
+        let offset = if spawn.delayed { 2 } else { 1 };
+        if spawn.delayed && function.params.get(1).is_none_or(|parameter| parameter.ty != Type::U64) {
+            bail!("{import}.{}: delayed calls require delay-ms: u64 after the actor key", spawn.name);
+        }
+        let params = function.params[offset..].iter()
+            .map(|parameter| Ok(Param { name: parameter.name.clone(), ty: ty_of(resolve, &parameter.ty, import)? }))
+            .collect::<Result<Vec<_>>>()?;
+        if params != original.params {
+            bail!("{import}.{}: deferred arguments differ from {}", spawn.name, spawn.method);
+        }
+    }
+    Ok(Some(CallImport {
+        import: import.to_string(), app, actor_type, methods, spawns,
+        docs: iface.docs.contents.clone(),
+    }))
+}
+
+fn deferred_receipt(resolve: &Resolve, ty: &Type) -> Option<bool> {
+    let Type::Id(id) = ty else { return None };
+    let definition = &resolve.types[*id];
+    if let TypeDefKind::Type(inner) = &definition.kind {
+        return deferred_receipt(resolve, inner);
+    }
+    let wit_parser::TypeOwner::Interface(interface) = definition.owner else { return None };
+    let interface = &resolve.interfaces[interface];
+    let package = &resolve.packages[interface.package?].name;
+    if package.namespace != "statex" || package.name != "host" || interface.name.as_deref() != Some("actors") {
+        return None;
+    }
+    match definition.name.as_deref() {
+        Some("spawned-call") => Some(false),
+        Some("delayed-call") => Some(true),
+        _ => None,
+    }
 }
 
 /// Follows type aliases (`use`, `type x = y`) to the defining type.

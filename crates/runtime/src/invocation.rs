@@ -76,6 +76,9 @@ pub enum InvocationOperation {
     Create,
     Delete,
     Alarm,
+    /// Source-local queue maintenance, not a guest method invocation.
+    OutboxClaim,
+    OutboxComplete { job_id: String },
 }
 
 /// Typed extension data is node-local and deliberately not forwarded. Use

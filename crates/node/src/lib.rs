@@ -8,6 +8,7 @@ pub mod extensions;
 pub mod layout;
 pub mod lease;
 pub mod node;
+mod outbox;
 pub mod owner;
 
 use std::net::SocketAddr;
@@ -140,6 +141,16 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
     }
     tasks.push(tokio::spawn(node.clone().run_timers()));
     tasks.push(tokio::spawn(node.clone().run_waker()));
+    {
+        let node = node.clone();
+        let mut rx = stop.subscribe();
+        tasks.push(tokio::spawn(async move {
+            tokio::select! {
+                _ = node.run_outbox() => {}
+                _ = rx.wait_for(|stopped| *stopped) => {}
+            }
+        }));
+    }
     let serve = |listener: tokio::net::TcpListener, router: axum::Router| {
         let mut rx = stop.subscribe();
         tokio::spawn(async move {

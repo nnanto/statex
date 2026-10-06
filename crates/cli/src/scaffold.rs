@@ -110,6 +110,7 @@ world app {{
   import statex:host/http-client@0.1.0;
   import statex:host/log@0.1.0;
   import statex:host/alarms@0.1.0;
+  import statex:host/actors@0.1.0;
 
   export {actor};
 }}
@@ -633,6 +634,7 @@ mod tests {
         assert_eq!(p.app(), "shop");
         assert!(root.join("statex.py").is_file());
         assert!(root.join("statex_testing.py").is_file());
+        assert!(std::fs::read_to_string(root.join("wit/app.wit")).unwrap().contains("import statex:host/actors@0.1.0;"));
         assert!(!std::fs::symlink_metadata(root.join("wit/deps/statex-host")).unwrap().file_type().is_symlink());
         assert!(check::check(&p, None, None, false).errors.is_empty());
     }

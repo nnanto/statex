@@ -25,6 +25,28 @@ impl counter::Guest for App {
         sql::execute("UPDATE counter SET value = 0 WHERE id = 0", &[]).unwrap();
     }
 
+    fn enqueue(key: String, by: i64, delay_ms: u64, fail: bool) -> Result<String, String> {
+        let id = statex_guest::actors::spawn_after(
+            std::time::Duration::from_millis(delay_ms),
+            &statex_guest::context::app(),
+            "counter",
+            &key,
+            "increment",
+            &[by.into()],
+        )
+        .map_err(|error| error.to_string())?;
+        if fail {
+            return Err("planned outbox rollback".into());
+        }
+        Ok(id)
+    }
+
+    fn job(id: String) -> Result<Option<String>, String> {
+        statex_guest::actors::job(&id)
+            .map(|job| job.map(|job| job.to_string()))
+            .map_err(|error| error.to_string())
+    }
+
     fn schedule(delay_ms: u64, fail_times: u32) {
         sql::execute("UPDATE alarm_demo SET fail_times = ?1 WHERE id = 0", params![fail_times]).unwrap();
         alarm::set_in(std::time::Duration::from_millis(delay_ms)).unwrap();
@@ -130,6 +152,56 @@ mod tests {
         assert_eq!(call("counter", "bob", App::get), 0);
         call("counter", "alice", App::reset);
         assert_eq!(call("counter", "alice", App::get), 0);
+    }
+
+    #[test]
+    fn background_call_is_recorded_without_running_target() {
+        let id = try_call("counter", "source", || {
+            App::enqueue("target".into(), 7, 30_000, false)
+        }).unwrap();
+        let record = call("counter", "source", || {
+            statex_guest::actors::job(&id).unwrap().unwrap()
+        });
+        assert_eq!(record["method"], "increment");
+        assert_eq!(record["target"]["type"], "counter");
+        assert_eq!(record["target"]["key"], "target");
+        assert_eq!(record["args"][0], 7);
+        assert_eq!(call("counter", "target", App::get), 0);
+        assert_eq!(call("counter", "target", || App::job(id.clone())), Ok(None));
+    }
+
+    #[test]
+    fn background_call_rolls_back_with_source_transaction() {
+        let mut id = String::new();
+        let result = try_call("counter", "source", || {
+            id = App::enqueue("target".into(), 7, 0, false).unwrap();
+            Err::<(), _>("planned rollback")
+        });
+        assert_eq!(result, Err("planned rollback"));
+        assert_eq!(call("counter", "source", || App::job(id)), Ok(None));
+    }
+
+    #[test]
+    fn delayed_background_call_waits_until_due() {
+        use statex_guest::testing::{drain_jobs, mock_spawn};
+        use std::time::Duration;
+
+        let app = call("counter", "source", statex_guest::context::app);
+        mock_spawn(&app, "counter", "increment", |_, args| {
+            Ok(App::increment(args[0].as_i64().unwrap()).into())
+        });
+        let id = try_call("counter", "source", || {
+            App::enqueue("target".into(), 7, 30_000, false)
+        }).unwrap();
+        assert_eq!(drain_jobs(Duration::from_millis(29_999)), 0);
+        assert_eq!(call("counter", "target", App::get), 0);
+        assert_eq!(drain_jobs(Duration::from_millis(1)), 1);
+        assert_eq!(call("counter", "target", App::get), 7);
+        let record = call("counter", "source", || {
+            statex_guest::actors::job(&id).unwrap().unwrap()
+        });
+        assert_eq!(record["status"], "succeeded");
+        assert_eq!(drain_jobs(Duration::ZERO), 0);
     }
 
     #[test]

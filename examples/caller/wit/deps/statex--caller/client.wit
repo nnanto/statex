@@ -4,9 +4,13 @@ package statex:caller;
 /// Calls actors of the `counter` example app, and other relays.
 interface relay {
   use statex:host/actors@0.1.0.{call-error};
+  use statex:host/actors@0.1.0.{spawned-call as statex-spawned-call, delayed-call as statex-delayed-call};
 
   /// Increments counter `key` of app counter by `by`; returns its new value.
   bump: func(actor: string, key: string, by: s64) -> result<result<s64, string>, call-error>;
+
+  /// Schedules a typed durable increment and returns its job ID.
+  enqueue: func(actor: string, key: string, by: s64, delay-ms: u64) -> result<result<string, string>, call-error>;
 
   /// Deposits into account `key` of app counter. A refused deposit
   /// (the callee's own `tx-error`) is reported as `refused: ...`.
@@ -26,6 +30,38 @@ interface relay {
 
   /// Number of calls this relay has made that succeeded.
   calls: func(actor: string) -> result<u64, call-error>;
+
+  statex-spawn-bump: func(actor: string, key: string, by: s64) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-bump: func(actor: string, statex-delay-ms: u64, key: string, by: s64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-calls: func(actor: string) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-calls: func(actor: string, statex-delay-ms: u64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-deposit: func(actor: string, key: string, amount: u64, memo: option<string>) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-deposit: func(actor: string, statex-delay-ms: u64, key: string, amount: u64, memo: option<string>) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-enqueue: func(actor: string, key: string, by: s64, delay-ms: u64) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-enqueue: func(actor: string, statex-delay-ms: u64, key: string, by: s64, delay-ms: u64) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-memos: func(actor: string, key: string, limit: u32) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-memos: func(actor: string, statex-delay-ms: u64, key: string, limit: u32) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-ping: func(actor: string, path: list<string>) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-ping: func(actor: string, statex-delay-ms: u64, path: list<string>) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-spin: func(actor: string, ms: u32) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-spin: func(actor: string, statex-delay-ms: u64, ms: u32) -> result<statex-delayed-call, call-error>;
+
+  statex-spawn-spin-on: func(actor: string, key: string, ms: u32) -> result<statex-spawned-call, call-error>;
+
+  statex-spawn-after-spin-on: func(actor: string, statex-delay-ms: u64, key: string, ms: u32) -> result<statex-delayed-call, call-error>;
 }
 
 world statex-calls {

@@ -11,11 +11,34 @@ pub(crate) use crate::mock::{
 };
 
 /// Native capabilities that may be replaced without replacing transactional
-/// storage. Unimplemented methods retain the mock host's behavior.
+/// storage. Unimplemented HTTP/log methods retain the mock host's behavior;
+/// scheduling and job inspection require explicit overrides and otherwise
+/// return unsupported errors.
 ///
 /// Implementations may call SQL/context/alarm APIs inside `testing::call`.
 /// HTTP and logging are not rolled back when an actor call fails.
 pub trait Capabilities {
+    /// Scheduling is unsupported by replacement adapters unless explicitly implemented.
+    fn actors_spawn(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: u64,
+    ) -> Result<String, crate::CallError> {
+        Err(crate::CallError::Rejected(
+            "adapter does not support actor scheduling".into(),
+        ))
+    }
+
+    fn actors_job(&self, _: &str) -> Result<Option<String>> {
+        Err(crate::Error(
+            "adapter does not support job inspection".into(),
+        ))
+    }
+
     fn http_send(&self, request: http::Request) -> Result<http::Response> {
         crate::mock::http_send(request)
     }
@@ -52,6 +75,27 @@ pub fn with_capabilities<R>(capabilities: Rc<dyn Capabilities>, f: impl FnOnce()
 
 fn current() -> Option<Rc<dyn Capabilities>> {
     CURRENT.with(|current| current.borrow().clone())
+}
+
+pub(crate) fn actors_spawn(
+    app: &str,
+    ty: &str,
+    key: &str,
+    method: &str,
+    args: &str,
+    delay_ms: u64,
+) -> Result<String, crate::CallError> {
+    match current() {
+        Some(adapter) => adapter.actors_spawn(app, ty, key, method, args, delay_ms),
+        None => crate::mock::actors_spawn(app, ty, key, method, args, delay_ms),
+    }
+}
+
+pub(crate) fn actors_job(id: &str) -> Result<Option<String>> {
+    match current() {
+        Some(adapter) => adapter.actors_job(id),
+        None => crate::mock::actors_job(id),
+    }
 }
 
 pub(crate) fn http_send(request: http::Request) -> Result<http::Response> {
@@ -164,7 +208,9 @@ mod tests {
             })
         });
         with_capabilities(Rc::new(Defaults), || {
-            assert_eq!(request().unwrap().status, 204)
+            assert_eq!(request().unwrap().status, 204);
+            assert!(matches!(crate::actors::spawn("app", "kv", "a", "put", &[]), Err(crate::CallError::Rejected(_))));
+            assert!(crate::actors::job("missing").is_err());
         });
     }
 

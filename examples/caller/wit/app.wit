@@ -4,6 +4,8 @@ package example:caller@0.1.0;
 interface relay {
   /// Increments counter `key` of app counter by `by`; returns its new value.
   bump: func(key: string, by: s64) -> result<s64, string>;
+  /// Schedules a typed durable increment and returns its job ID.
+  enqueue: func(key: string, by: s64, delay-ms: u64) -> result<string, string>;
   /// Deposits into account `key` of app counter. A refused deposit
   /// (the callee's own `tx-error`) is reported as `refused: ...`.
   deposit: func(key: string, amount: u64, memo: option<string>) -> result<u64, string>;

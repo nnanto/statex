@@ -49,6 +49,7 @@ pub struct HostState {
     /// Failures of capabilities whose WIT signatures cannot return errors.
     pub(crate) capability_error: Option<String>,
     pub(crate) invocation_context: Option<crate::invocation::InvocationContext>,
+    pub(crate) initializing: bool,
 }
 
 impl HostState {
@@ -62,7 +63,42 @@ impl HostState {
     }
 }
 
-impl actors::Host for HostState {}
+impl actors::Host for HostState {
+    fn spawn(
+        &mut self,
+        app: String,
+        actor_type: String,
+        key: String,
+        method: String,
+        args: String,
+        delay_ms: u64,
+    ) -> Result<String, actors::CallError> {
+        let context = self.invocation_context.as_ref()
+            .filter(|_| !self.initializing)
+            .ok_or_else(|| actors::CallError::Rejected("spawn requires an active invocation; component initialization cannot enqueue jobs".into()))?;
+        if self.caller.is_none() {
+            return Err(actors::CallError::Rejected("durable actor calls are not available in this host".into()));
+        }
+        if context.check_deadline().is_err() {
+            return Err(actors::CallError::Timeout);
+        }
+        let args = serde_json::from_str(&args)
+            .map_err(|error| actors::CallError::Incompatible(format!("invalid outbox arguments: {error}")))?;
+        let job = crate::outbox::Job::new(
+            ActorRef { app, actor_type, key }, method, args, delay_ms, context.request.clone(),
+        ).map_err(|error| actors::CallError::Incompatible(error.to_string()))?;
+        crate::outbox::enqueue(self.db.lock().unwrap().as_mut(), &job)
+            .map_err(|error| actors::CallError::Rejected(error.to_string()))?;
+        Ok(job.id)
+    }
+
+    fn job(&mut self, id: String) -> Result<Option<String>, String> {
+        self.db.lock().unwrap().job(&id)
+            .map_err(|error| error.to_string())?
+            .map(|job| serde_json::to_string(&job).map_err(|error| error.to_string()))
+            .transpose()
+    }
+}
 
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
@@ -342,6 +378,7 @@ mod tests {
             http_timeout: Duration::from_secs(1),
             caller: None,
             invocation_context: None,
+            initializing: false,
             chain: vec![],
             deadline: None,
             has_alarm: false,
@@ -363,6 +400,61 @@ mod tests {
         assert_eq!(alarms::Host::get(&mut s), Some(10));
         alarms::Host::clear(&mut s);
         assert_eq!(alarms::Host::get(&mut s), None);
+    }
+
+    struct NoDispatch;
+
+    impl ActorCaller for NoDispatch {
+        fn call(&self, _: crate::CallRequest) -> crate::CallReply {
+            panic!("enqueue must not invoke the callee");
+        }
+    }
+
+    fn spawn_test_job(state: &mut HostState, args: &str, delay: u64) -> Result<String, actors::CallError> {
+        actors::Host::spawn(state, "shop".into(), "counter".into(), "alice".into(),
+            "add".into(), args.into(), delay)
+    }
+
+    #[test]
+    fn spawn_requires_invocation_dispatcher_and_transaction() {
+        use crate::invocation::{Caller, InvocationContext, InvocationOperation};
+        let mut state = host_state();
+        state.caller = Some(Arc::new(NoDispatch));
+        assert!(matches!(spawn_test_job(&mut state, "[]", 0), Err(actors::CallError::Rejected(_))));
+        let source = ActorRef {
+            app: state.identity.app.clone(), actor_type: state.identity.actor_type.clone(), key: state.identity.key.clone(),
+        };
+        let context = InvocationContext::new(source, InvocationOperation::Create, Caller::Embedded,
+            Duration::from_secs(30)).unwrap();
+        state.invocation_context = Some(context.clone());
+        state.initializing = true;
+        assert!(matches!(spawn_test_job(&mut state, "[]", 0), Err(actors::CallError::Rejected(_))));
+        state.initializing = false;
+        state.caller = None;
+        assert!(matches!(spawn_test_job(&mut state, "[]", 0), Err(actors::CallError::Rejected(_))));
+        state.caller = Some(Arc::new(NoDispatch));
+        assert!(matches!(spawn_test_job(&mut state, "[]", 0), Err(actors::CallError::Rejected(_))));
+        state.db.lock().unwrap().begin().unwrap();
+        for args in ["", "[", "{}", "null", "\"[]\""] {
+            assert!(matches!(spawn_test_job(&mut state, args, 0), Err(actors::CallError::Incompatible(_))));
+        }
+        assert!(matches!(spawn_test_job(&mut state, "[]", u64::MAX), Err(actors::CallError::Incompatible(_))));
+        let before = crate::outbox::now_ms().unwrap();
+        let id = spawn_test_job(&mut state, "[1,\"two\"]", 1000).unwrap();
+        let json = actors::Host::job(&mut state, id.clone()).unwrap().unwrap();
+        let job: crate::outbox::Job = serde_json::from_str(&json).unwrap();
+        assert_eq!(job.id, id);
+        assert_eq!(job.context, context.request);
+        assert_eq!(job.args, serde_json::json!([1, "two"]));
+        assert!(job.not_before_ms >= before + 1000);
+        assert_eq!(job.next_attempt_ms, job.not_before_ms);
+        state.db.lock().unwrap().rollback().unwrap();
+        assert_eq!(actors::Host::job(&mut state, id).unwrap(), None);
+        state.db.lock().unwrap().begin().unwrap();
+        let id = spawn_test_job(&mut state, "[]", 0).unwrap();
+        state.db.lock().unwrap().commit().unwrap();
+        assert!(actors::Host::job(&mut state, id).unwrap().is_some());
+        assert_eq!(actors::Host::job(&mut state, "missing".into()).unwrap(), None);
     }
 
     #[test]

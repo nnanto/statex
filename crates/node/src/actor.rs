@@ -10,6 +10,7 @@ use serde_json::Value as J;
 use statex_ltx::{plan_restore, segment_name, snapshot_name, LogEntry};
 use statex_runtime::alarm::{self, Alarm};
 use statex_runtime::database::{BackendIdentity, DatabaseHandle, DynDatabaseFactory};
+use statex_runtime::outbox::Job;
 use statex_runtime::{
     ActorCaller, ActorIdentity, ActorInstance, ActorRef, AppCode, CallError, CallOutput,
     ExecutionAdmission,
@@ -56,7 +57,16 @@ pub enum Op {
     /// Fire the alarm if it is due at `now_ms`: run the handler, or schedule
     /// a retry if it fails. Answers `{"fired": bool, "error"?: string,
     /// "armed"?: wake name}`, `armed` naming the alarm still scheduled.
-    Alarm { now_ms: u64 },
+    Alarm {
+        now_ms: u64,
+    },
+    OutboxClaim {
+        now_ms: u64,
+        retry_at_ms: u64,
+    },
+    OutboxComplete {
+        job: Job,
+    },
 }
 
 pub struct Executed {
@@ -67,6 +77,8 @@ pub struct Executed {
     pub segment: Option<DurableChange>,
     /// Set when the committed transaction changed the scheduled alarm.
     pub alarm: Option<AlarmChange>,
+    /// A permanent discovery marker must precede publication of this change.
+    pub outbox_pending: bool,
 }
 
 pub struct DurableChange {
@@ -211,6 +223,10 @@ impl Actor {
             },
             Op::Touch => InvocationOperation::Create,
             Op::Alarm { .. } => InvocationOperation::Alarm,
+            Op::OutboxClaim { .. } => InvocationOperation::OutboxClaim,
+            Op::OutboxComplete { job } => InvocationOperation::OutboxComplete {
+                job_id: job.id.clone(),
+            },
         };
         let context = InvocationContext::new(
             ActorRef {
@@ -241,6 +257,8 @@ impl Actor {
         }
         let before = self.alarm;
         let is_alarm = matches!(op, Op::Alarm { .. });
+        let is_outbox_maintenance =
+            matches!(op, Op::OutboxClaim { .. } | Op::OutboxComplete { .. });
         let (mut outcome, segment) = match op {
             Op::Touch => {
                 self.transaction(context, extensions, TransactionKind::Invocation, |_| {
@@ -264,6 +282,29 @@ impl Actor {
                 Ok(instance.call_admitted(&ty, &method, &args, &chain, context, admission))
             })?,
             Op::Alarm { now_ms } => self.fire_alarm(now_ms, context, extensions)?,
+            Op::OutboxClaim {
+                now_ms,
+                retry_at_ms,
+            } => self.transaction(
+                context,
+                extensions,
+                TransactionKind::OutboxMaintenance,
+                |a| {
+                    let mut db = a.db.lock().unwrap();
+                    let job = crate::outbox::claim_job(&mut **db, now_ms, retry_at_ms)?;
+                    Ok(ok(serde_json::to_value(job)?))
+                },
+            )?,
+            Op::OutboxComplete { job } => self.transaction(
+                context,
+                extensions,
+                TransactionKind::OutboxMaintenance,
+                |a| {
+                    let mut db = a.db.lock().unwrap();
+                    let applied = crate::outbox::complete_job(&mut **db, job)?;
+                    Ok(ok(serde_json::json!({ "applied": applied })))
+                },
+            )?,
         };
         if segment.is_some() {
             self.alarm = self.db.lock().unwrap().alarm()?;
@@ -279,16 +320,21 @@ impl Actor {
                 }
             }
         }
-        self.last_used = Instant::now();
+        // Polling a permanent marker without changing state is not activity.
+        if !is_outbox_maintenance || segment.is_some() {
+            self.last_used = Instant::now();
+        }
         let alarm = (self.alarm != before).then_some(AlarmChange {
             before,
             after: self.alarm,
         });
+        let outbox_pending = segment.is_some() && self.db.lock().unwrap().has_pending_jobs()?;
         Ok(Executed {
             code_changed,
             outcome,
             segment,
             alarm,
+            outbox_pending,
         })
     }
 

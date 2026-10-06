@@ -85,7 +85,7 @@ pub fn local_types(p: &Project, ws: Option<&Workspace>, app: &str) -> Option<Res
 /// Exported actor types of a WIT directory, ignoring client imports (which
 /// may not have been generated yet).
 fn exported_types(wit: &Path) -> Result<Vec<ActorType>> {
-    let dir = tempfile::tempdir()?;
+    let dir = tempfile::tempdir_in(".")?;
     copy_dir(wit, dir.path())?;
     for e in std::fs::read_dir(dir.path())? {
         let path = e?.path();
@@ -252,7 +252,7 @@ pub fn sync_local(p: &Project, ws: Option<&Workspace>) -> Result<Vec<String>> {
 /// Reads a generated client WIT back into the callee's actor types (as the
 /// caller sees them; enough to regenerate the Rust shim).
 fn parse_client(rel: &Path, text: &str) -> Result<Callee> {
-    let dir = tempfile::tempdir()?;
+    let dir = tempfile::tempdir_in(".")?;
     std::fs::create_dir_all(dir.path().join("deps/statex-host"))?;
     std::fs::write(dir.path().join("deps/statex-host/statex-host.wit"), crate::scaffold::HOST_WIT)?;
     std::fs::write(dir.path().join("client.wit"), text)?;
@@ -260,7 +260,7 @@ fn parse_client(rel: &Path, text: &str) -> Result<Callee> {
     let app = calls.first().map(|c| c.app.clone()).with_context(|| format!("{}: no interfaces", rel.display()))?;
     let types = calls
         .into_iter()
-        .map(|c| ActorType { name: c.actor_type, export: c.import, docs: None, methods: c.methods, alarm: None })
+        .map(|c| ActorType { name: c.actor_type, export: c.import, docs: c.docs, methods: c.methods, alarm: None })
         .collect();
     Ok(Callee { app, types })
 }
@@ -393,6 +393,11 @@ fn client_wit(c: &Callee) -> Result<String> {
         } else {
             let _ = writeln!(s, "  use {HOST_ACTORS}.{{call-error as {ce}}};");
         }
+        let mut receipt = "statex-spawned-call".to_string();
+        while defs.iter().any(|ty| named(ty) == Some(receipt.as_str())) { receipt.push_str("-x"); }
+        let mut delayed_receipt = "statex-delayed-call".to_string();
+        while defs.iter().any(|ty| named(ty) == Some(delayed_receipt.as_str())) { delayed_receipt.push_str("-x"); }
+        let _ = writeln!(s, "  use {HOST_ACTORS}.{{spawned-call as {receipt}, delayed-call as {delayed_receipt}}};");
         for d in &defs {
             s.push('\n');
             match d {
@@ -434,6 +439,21 @@ fn client_wit(c: &Callee) -> Result<String> {
             params.extend(m.params.iter().map(|p| format!("{}: {}", wid(&p.name), wit_ty(&p.ty))));
             let ok = m.result.as_ref().map_or("_".into(), wit_ty);
             let _ = writeln!(s, "  {}: func({}) -> result<{ok}, {ce}>;", wid(&m.name), params.join(", "));
+        }
+        for spawn in statex_runtime::manifest::spawn_imports(&t.methods) {
+            let method = t.methods.iter().find(|method| method.name == spawn.method).unwrap();
+            let mut params = vec![format!("{}: string", key_param(method))];
+            if spawn.delayed {
+                let mut delay = "statex-delay-ms".to_string();
+                while method.params.iter().any(|parameter| parameter.name == delay) {
+                    delay.push_str("-x");
+                }
+                params.push(format!("{delay}: u64"));
+            }
+            params.extend(method.params.iter().map(|parameter| format!("{}: {}", wid(&parameter.name), wit_ty(&parameter.ty))));
+            let reply = if spawn.delayed { &delayed_receipt } else { &receipt };
+            let _ = writeln!(s, "\n  {}: func({}) -> result<{reply}, {ce}>;",
+                wid(&spawn.name), params.join(", "));
         }
         s.push_str("}\n");
     }
@@ -552,6 +572,117 @@ fn rust_fns(t: &ActorType) -> Vec<RFn> {
         .collect()
 }
 
+fn rust_test_json(s: &mut String, definitions: &[&Ty]) {
+    for definition in definitions {
+        let Some(name) = named(definition) else { continue };
+        let _ = writeln!(s, "\n            #[cfg(not(target_arch = \"wasm32\"))]\n            impl statex_guest::testing::ToJson for {} {{\n                fn to_json(&self) -> Result<statex_guest::serde_json::Value, {CALL_ERROR}> {{\n                    use statex_guest::{{serde_json::{{Value, json}}, testing::to_json}};", pascal(name));
+        match definition {
+            Ty::Record { fields, .. } => {
+                s.push_str("                    Ok(Value::Object([\n");
+                for field in fields {
+                    let _ = writeln!(s, "                        ({:?}.into(), to_json(&self.{})?),", field.name, rid(&field.name));
+                }
+                s.push_str("                    ].into_iter().collect()))\n");
+            }
+            Ty::Enum { cases, .. } => {
+                s.push_str("                    Ok(Value::String(match self {\n");
+                for case in cases {
+                    let _ = writeln!(s, "                        Self::{} => {:?},", pascal(case), case);
+                }
+                s.push_str("                    }.into()))\n");
+            }
+            Ty::Variant { cases, .. } => {
+                s.push_str("                    Ok(match self {\n");
+                for case in cases {
+                    if case.ty.is_some() {
+                        let _ = writeln!(s, "                        Self::{}(value) => json!({{\"tag\": {:?}, \"value\": to_json(value)?}}),", pascal(&case.name), case.name);
+                    } else {
+                        let _ = writeln!(s, "                        Self::{} => json!({{\"tag\": {:?}}}),", pascal(&case.name), case.name);
+                    }
+                }
+                s.push_str("                    })\n");
+            }
+            Ty::Flags { flags, .. } => {
+                s.push_str("                    let mut flags = Vec::new();\n");
+                for flag in flags {
+                    let _ = writeln!(s, "                    if self.contains(Self::{}) {{ flags.push(Value::String({:?}.into())); }}", flag.replace('-', "_").to_ascii_uppercase(), flag);
+                }
+                s.push_str("                    Ok(Value::Array(flags))\n");
+            }
+            _ => unreachable!(),
+        }
+        s.push_str("                }\n            }\n");
+    }
+}
+
+fn own_expr(t: &Ty, value: &str) -> String {
+    match t {
+        Ty::String => format!("({value}).to_string()"),
+        Ty::List { .. } => format!("({value}).to_vec()"),
+        Ty::Option { inner } => format!("({value}).map(|v| {})", own_expr(inner, "v")),
+        Ty::Result { ok, err } => format!("({value}).map(|v| {}).map_err(|v| {})", ok.as_deref().map_or("v".into(), |t| own_expr(t, "v")), err.as_deref().map_or("v".into(), |t| own_expr(t, "v"))),
+        Ty::Tuple { items } => tuple(items.iter().enumerate().map(|(i, t)| own_expr(t, &format!("({value}).{i}"))).collect()),
+        Ty::Record { .. } | Ty::Variant { .. } if borrows(t) => format!("(*({value})).clone()"),
+        _ => format!("({value}).clone()"),
+    }
+}
+
+fn borrow_expr(t: &Ty, value: &str) -> String {
+    match t {
+        Ty::String => format!("({value}).as_str()"),
+        Ty::List { .. } => format!("({value}).as_slice()"),
+        Ty::Option { inner } => format!("({value}).as_ref().map(|v| {})", borrow_expr(inner, "v")),
+        Ty::Result { ok, err } => format!("({value}).as_ref().map(|v| {}).map_err(|v| {})", ok.as_deref().map_or("()".into(), |t| borrow_expr(t, "v")), err.as_deref().map_or("()".into(), |t| borrow_expr(t, "v"))),
+        Ty::Tuple { items } => tuple(items.iter().enumerate().map(|(i, t)| borrow_expr(t, &format!("&({value}).{i}"))).collect()),
+        Ty::Record { .. } | Ty::Variant { .. } if borrows(t) => value.into(),
+        _ => format!("({value}).clone()"),
+    }
+}
+
+fn rust_spawn(s: &mut String, c: &Callee, t: &ActorType) {
+    let imports = statex_runtime::manifest::spawn_imports(&t.methods);
+    for delayed in [false, true] {
+        let module = if delayed { "spawn_after" } else { "spawn" };
+        let _ = writeln!(s, "\n            /// Transactional deferred calls; returns a job ID, not the method result.\n            pub mod {module} {{\n                use super::*;");
+        for m in &t.methods {
+            let import = imports.iter().find(|import| import.method == m.name && import.delayed == delayed).unwrap();
+            let key = rid(key_param(m));
+            let mut ps = vec![format!("{key}: &str")];
+            ps.extend(m.params.iter().map(|p| format!("{}: {}", rid(&p.name), param(&p.ty))));
+            let mut delay = "__statex_delay".to_string();
+            while m.params.iter().any(|p| rid(&p.name) == delay) || key == delay {
+                delay.push('_');
+            }
+            if delayed { ps.insert(0, format!("{delay}: std::time::Duration")); }
+            let _ = writeln!(s, "                pub fn {}({}) -> Result<String, {CALL_ERROR}> {{", rid(&m.name), ps.join(", "));
+            let mut raw_args = vec![key.clone()];
+            if delayed {
+                raw_args.push(format!("statex_guest::actors::delay_ms({delay})?"));
+            }
+            raw_args.extend(m.params.iter().map(|parameter| rid(&parameter.name)));
+            let _ = writeln!(s, "                    #[cfg(target_arch = \"wasm32\")]\n                    {{ raw::{}({}).map(|reply| reply.id) }}", rid(&import.name), raw_args.join(", "));
+            s.push_str("                    #[cfg(not(target_arch = \"wasm32\"))]\n                    {\n");
+            let args = m.params.iter().map(|parameter| format!("statex_guest::testing::to_json(&{})?", rid(&parameter.name))).collect::<Vec<_>>().join(", ");
+            let _ = writeln!(s, "                        let __statex_args = vec![{args}];\n                        let __statex_id = statex_guest::actors::spawn_after({}, {:?}, {:?}, {key}, {:?}, &__statex_args)?;", if delayed { delay.as_str() } else { "std::time::Duration::ZERO" }, c.app, t.name, m.name);
+            let _ = writeln!(s, "                        let __statex_key = {key}.to_string();");
+            for (i, p) in m.params.iter().enumerate() {
+                let _ = writeln!(s, "                        let __statex_arg{i} = {};", own_expr(&p.ty, &rid(&p.name)));
+            }
+            let mut call_args = vec!["&__statex_key".into()];
+            call_args.extend(m.params.iter().enumerate().map(|(i, p)| borrow_expr(&p.ty, &format!("&__statex_arg{i}"))));
+            let _ = writeln!(s, "                        statex_guest::testing::attach_job(&__statex_id, move || {{\n                            let value = native::current().{}({})?;", rid(&m.name), call_args.join(", "));
+            let result = "statex_guest::testing::to_json(&value)?";
+            let _ = writeln!(s, "                            let __statex_result = {result};");
+            if matches!(m.result, Some(Ty::Result { .. })) {
+                let _ = writeln!(s, "                            if value.is_err() {{ return Err({CALL_ERROR}::Rejected(format!(\"callee returned a method error: {{}}\", __statex_result[\"err\"]))); }}");
+                s.push_str("                            let __statex_result = __statex_result[\"ok\"].clone();\n");
+            }
+            let _ = writeln!(s, "                            Ok(__statex_result)\n                        }});\n                        Ok(__statex_id)\n                    }}\n                }}");
+        }
+        s.push_str("            }\n");
+    }
+}
+
 fn rust_shim(callees: &[Callee]) -> Result<String> {
     let mut s = format!(
         "// {HEADER}. Do not edit.\n\
@@ -630,7 +761,7 @@ fn rust_shim(callees: &[Callee]) -> Result<String> {
                 s.push_str("            }\n");
                 let _ = writeln!(
                     s,
-                    "\n            #[cfg(not(target_arch = \"wasm32\"))]\n            mod native {{\n                use super::*;\n                use std::{{cell::RefCell, rc::Rc}};\n\n                thread_local! {{\n                    static STUB: RefCell<Option<Rc<dyn {tr}>>> = RefCell::new(None);\n                }}\n\n                /// Routes calls on this thread to `s`.\n                pub fn stub(s: impl {tr} + 'static) {{\n                    STUB.with(|c| *c.borrow_mut() = Some(Rc::new(s)));\n                }}\n\n                /// Removes this thread's stub.\n                pub fn clear_stub() {{\n                    STUB.with(|c| *c.borrow_mut() = None);\n                }}\n\n                fn current() -> Rc<dyn {tr}> {{\n                    STUB.with(|c| c.borrow().clone()).unwrap_or_else(|| {{\n                        panic!(\"{app} {ty} was called without a stub; call statex_calls::{path}::stub(..) first\")\n                    }})\n                }}",
+                    "\n            #[cfg(not(target_arch = \"wasm32\"))]\n            mod native {{\n                use super::*;\n                use std::{{cell::RefCell, rc::Rc}};\n\n                thread_local! {{\n                    static STUB: RefCell<Option<Rc<dyn {tr}>>> = RefCell::new(None);\n                }}\n\n                /// Routes calls on this thread to `s`.\n                pub fn stub(s: impl {tr} + 'static) {{\n                    STUB.with(|c| *c.borrow_mut() = Some(Rc::new(s)));\n                }}\n\n                /// Removes this thread's stub.\n                pub fn clear_stub() {{\n                    STUB.with(|c| *c.borrow_mut() = None);\n                }}\n\n                pub(super) fn current() -> Rc<dyn {tr}> {{\n                    STUB.with(|c| c.borrow().clone()).unwrap_or_else(|| {{\n                        panic!(\"{app} {ty} was called without a stub; call statex_calls::{path}::stub(..) first\")\n                    }})\n                }}",
                     app = c.app,
                     ty = t.name,
                     path = module_path(&c.app, &t.name).trim_start_matches("statex_calls::"),
@@ -656,7 +787,10 @@ fn rust_shim(callees: &[Callee]) -> Result<String> {
                     }
                     s.push_str("                };\n");
                 }
-                s.push_str("            }\n\n            #[cfg(not(target_arch = \"wasm32\"))]\n            pub use native::*;\n        }\n");
+                s.push_str("            }\n\n            #[cfg(not(target_arch = \"wasm32\"))]\n            pub use native::*;\n");
+                rust_test_json(&mut s, &defs);
+                rust_spawn(&mut s, c, t);
+                s.push_str("        }\n");
             }
             s.push_str("    }\n");
         }
@@ -745,6 +879,22 @@ mod tests {
                 alarm: None,
             }],
         }
+
+    }
+
+    #[test]
+    fn deferred_helpers_do_not_reserve_application_method_names() {
+        let mut callee = kv();
+        callee.types[0].methods.push(Method {
+            name: "statex-spawn-put".into(), params: vec![], result: None, docs: None,
+        });
+        let wit = client_wit(&callee).unwrap();
+        assert!(wit.contains("statex-spawn-put-x: func("));
+        let parsed = parse_client(Path::new("client.wit"), &wit).unwrap();
+        assert_eq!(parsed.types[0].methods, callee.types[0].methods);
+        let forward = statex_runtime::manifest::spawn_imports(&callee.types[0].methods);
+        callee.types[0].methods.reverse();
+        assert_eq!(statex_runtime::manifest::spawn_imports(&callee.types[0].methods), forward);
     }
 
     #[test]
@@ -767,6 +917,136 @@ mod tests {
         assert_eq!(f[0].ret, format!("Result<(), {CALL_ERROR}>"));
         assert_eq!(f[1].params[0].0, "actor_key");
         assert_eq!(f[1].ret, format!("Result<Result<Option<Entry>, KvError>, {CALL_ERROR}>"));
+    }
+
+    #[test]
+    fn typed_spawn_compiles_and_preserves_complex_json_without_user_serde() {
+        let mut c = kv();
+        let actor = &mut c.types[0];
+        actor.methods[0].params[0].name = "args".into();
+        actor.methods.push(Method {
+            name: "complex".into(),
+            params: vec![
+                Param { name: "number".into(), ty: Ty::U64 },
+                Param { name: "pair".into(), ty: Ty::Tuple { items: vec![Ty::String, Ty::Bool] } },
+                Param { name: "choice".into(), ty: Ty::Enum { name: "choice".into(), cases: vec!["first".into(), "second".into()] } },
+                Param { name: "mode".into(), ty: Ty::Flags { name: "mode".into(), flags: vec!["read".into(), "write".into()] } },
+                Param { name: "value".into(), ty: Ty::Result { ok: Some(Box::new(Ty::Option { inner: Box::new(Ty::String) })), err: Some(Box::new(Ty::String)) } },
+                Param { name: "error".into(), ty: Ty::Variant { name: "detail".into(), cases: vec![Case { name: "absent".into(), ty: None }, Case { name: "message".into(), ty: Some(Ty::String) }] } },
+            ],
+            result: None, docs: None,
+        });
+        actor.methods.push(Method {
+            name: "primitives".into(),
+            params: vec![
+                Param { name: "a".into(), ty: Ty::Bool },
+                Param { name: "b".into(), ty: Ty::U8 },
+                Param { name: "c".into(), ty: Ty::U16 },
+                Param { name: "d".into(), ty: Ty::U32 },
+                Param { name: "e".into(), ty: Ty::S8 },
+                Param { name: "f".into(), ty: Ty::S16 },
+                Param { name: "g".into(), ty: Ty::S32 },
+                Param { name: "h".into(), ty: Ty::S64 },
+                Param { name: "i".into(), ty: Ty::F32 },
+                Param { name: "j".into(), ty: Ty::F64 },
+                Param { name: "k".into(), ty: Ty::Char },
+                Param { name: "l".into(), ty: Ty::List { element: Box::new(Ty::F64) } },
+                Param { name: "m".into(), ty: Ty::Option { inner: Box::new(Ty::Tuple { items: vec![Ty::String, Ty::U32] }) } },
+            ],
+            result: Some(Ty::F64), docs: None,
+        });
+        let d = tempfile::tempdir_in(".").unwrap();
+        let root = d.path().canonicalize().unwrap();
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(root.join("wit/deps/statex-host")).unwrap();
+        std::fs::write(root.join("wit/deps/statex-host/host.wit"), include_str!("../../../wit/statex-host.wit")).unwrap();
+        std::fs::write(root.join("wit/client.wit"), client_wit(&c).unwrap()).unwrap();
+        std::fs::write(root.join("src/statex_calls.rs"), rust_shim(&[c]).unwrap()).unwrap();
+        std::fs::write(root.join("Cargo.toml"), format!(
+            "[package]\nname = \"spawn-codegen-test\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n[dependencies]\nstatex-guest = {{ path = {:?} }}\nwit-bindgen = \"0.62\"\n",
+            repo.join("crates/guest")
+        )).unwrap();
+        std::fs::write(root.join("src/lib.rs"), r#"
+mod statex_calls;
+#[cfg(test)]
+mod tests {
+    use super::statex_calls::demo::db::kv;
+    use statex_guest::{testing, actors, serde_json::json};
+    use std::{cell::Cell, rc::Rc, time::Duration};
+    struct Stub(Rc<Cell<u32>>);
+    impl kv::Kv for Stub {
+        fn get(&self, _: &str, entry: &str) -> Result<Result<Option<kv::Entry>, kv::KvError>, kv::CallError> {
+            if entry == "good" {
+                return Ok(Ok(Some(kv::Entry { key: "good".into(), value: vec![3] })));
+            }
+            statex_guest::sql::execute("CREATE TABLE rolled_back(v INTEGER)", &[]).unwrap();
+            Ok(Err(kv::KvError::Other("specific callee detail".into())))
+        }
+        fn put(&self, key: &str, e: &kv::Entry, at: kv::Point) -> Result<(), kv::CallError> {
+            assert_eq!((key, e.key.as_str(), e.value.as_slice(), at.x), ("alice", "x", &[1, 2][..], 7));
+            self.0.set(self.0.get() + 1); Ok(())
+        }
+        fn complex(&self, key: &str, number: u64, pair: (&str, bool), choice: kv::Choice,
+                   mode: kv::Mode, value: Result<Option<&str>, &str>, error: &kv::Detail) -> Result<(), kv::CallError> {
+            assert_eq!((key, number, pair), ("alice", u64::MAX, ("hello", true)));
+            assert_eq!(choice, kv::Choice::Second);
+            assert!(mode.contains(kv::Mode::READ | kv::Mode::WRITE));
+            assert_eq!(value, Ok(Some("yes")));
+            assert_eq!(error, &kv::Detail::Message("oops".into()));
+            self.0.set(self.0.get() + 1); Ok(())
+        }
+    }
+    #[test] fn queues_typed_calls() {
+        testing::reset();
+        let hits = Rc::new(Cell::new(0));
+        kv::stub(Stub(hits.clone()));
+        let id = testing::call("caller", "bob", || kv::spawn_after::complex(
+            Duration::from_secs(30), "alice", u64::MAX, ("hello", true), kv::Choice::Second,
+            kv::Mode::READ | kv::Mode::WRITE, Ok(Some("yes")), &kv::Detail::Message("oops".into())
+        ).unwrap());
+        assert_eq!(hits.get(), 0);
+        let pending = testing::call("caller", "bob", || actors::job(&id).unwrap().unwrap());
+        assert_eq!(pending["args"], json!([u64::MAX, ["hello", true], "second", ["read", "write"], {"ok":"yes"}, {"tag":"message","value":"oops"}]));
+        assert_eq!(testing::drain_jobs(Duration::from_secs(29)), 0);
+        assert_eq!(testing::drain_jobs(Duration::from_secs(1)), 1);
+        assert_eq!(hits.get(), 1);
+        testing::call("caller", "bob", || kv::spawn::put("alice", &kv::Entry { key:"x".into(), value:vec![1,2] }, kv::Point{x:7}).unwrap());
+        assert_eq!(testing::drain_jobs(Duration::ZERO), 1);
+        assert_eq!(hits.get(), 2);
+        let failed = testing::call("caller", "bob", || kv::spawn::get("alice", "entry").unwrap());
+        assert_eq!(testing::drain_jobs(Duration::ZERO), 1);
+        assert_eq!(testing::call("caller", "bob", || actors::job(&failed).unwrap().unwrap()["status"].clone()), "failed");
+        assert!(testing::call("caller", "bob", || actors::job(&failed).unwrap().unwrap()["error"]["message"].as_str().unwrap().contains("specific callee detail")));
+        assert!(testing::call("kv", "alice", || statex_guest::sql::query("SELECT * FROM rolled_back", &[])).is_err());
+        let succeeded = testing::call("caller", "bob", || kv::spawn::get("alice", "good").unwrap());
+        assert_eq!(testing::drain_jobs(Duration::ZERO), 1);
+        let receipt = testing::call("caller", "bob", || actors::job(&succeeded).unwrap().unwrap());
+        assert_eq!(receipt["status"], "succeeded");
+        assert_eq!(receipt["result"], json!({"key":"good", "value":[3]}));
+        let result = testing::call("caller", "bob", || kv::spawn::primitives(
+            "alice", true, 1, 2, 3, -1, -2, -3, i64::MIN, 1.0, 2.0, 'é', &[f64::NAN], Some(("x", 1))
+        ));
+        assert!(matches!(result, Err(kv::CallError::Rejected(_))));
+    }
+}
+"#).unwrap();
+        let output = std::process::Command::new("cargo")
+            .args(["test", "--offline", "--quiet"])
+            .current_dir(&root)
+            .env("CARGO_TARGET_DIR", repo.join("target/spawn-codegen-tests"))
+            .output().unwrap();
+        assert!(output.status.success(), "generated typed spawn failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        if std::process::Command::new("rustup").args(["target", "list", "--installed"])
+            .output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).lines().any(|t| t == "wasm32-wasip2"))
+        {
+            let output = std::process::Command::new("cargo")
+                .args(["check", "--offline", "--quiet", "--target", "wasm32-wasip2"])
+                .current_dir(&root)
+                .env("CARGO_TARGET_DIR", repo.join("target/spawn-codegen-tests"))
+                .output().unwrap();
+            assert!(output.status.success(), "generated typed spawn WASM failed:\n{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        }
     }
 
     #[test]

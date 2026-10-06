@@ -48,6 +48,20 @@ fn configure(mut config: NodeConfig, backend: Arc<dyn DatabaseFactory>) -> NodeC
 - `checkpoint` writes one complete snapshot file and resets the capture
   baseline. Multi-file engines must package their state into that image.
 
+Backends can also implement the durable outbox operations: `enqueue_job`,
+`claim_job`, `update_job`, `job`, and `has_pending_jobs`. Enqueue, claims, and
+completion updates must participate in the current transaction and its normal
+capture/replay path. Claims include overdue running jobs so an interrupted
+dispatcher cannot strand work. Completion updates must reject stale attempts
+instead of overwriting a newer claim. Backends without outbox support must
+reject scheduling explicitly; their ordinary actor calls remain supported.
+Job payloads must not turn guest-controlled SQL into trusted invocation
+identity. Protect host-owned outbox bookkeeping from guest SQL and migrations:
+dispatch derives the actor caller from the authenticated source, but preserves
+the job's trusted originating principal and attributes. SQLite enforces this
+through its parser authorizer; a custom outbox backend must provide equivalent
+protection.
+
 All backend calls are synchronous and run on blocking threads. `Database`
 must be `Send`, and the factory must be `Send + Sync`. Local working files
 must stay in the directory supplied to `open`; activation replaces that

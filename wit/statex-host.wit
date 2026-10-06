@@ -17,6 +17,8 @@ interface context {
 /// runs inside one transaction managed by the host: a trap or method-level
 /// result::err rolls back, a successful return commits. SQL dialect and
 /// migration support belong to the configured state backend.
+/// Host outbox records are reserved: guest SQL cannot read or alter their
+/// tables; use actors.job for inspection.
 interface sql {
   variant value {
     null,
@@ -65,6 +67,11 @@ interface http-client {
 /// The callee runs in its own transaction, which commits independently of the
 /// caller's.
 interface actors {
+  /// Typed client helpers return these host-owned receipts. The runtime
+  /// recognizes their type identity even when component metadata omits docs.
+  record spawned-call { id: string }
+  record delayed-call { id: string, delay-ms: u64 }
+
   variant call-error {
     /// The callee app, actor type or method does not exist.
     not-found(string),
@@ -83,6 +90,15 @@ interface actors {
     /// The caller's time budget ran out before the callee answered. The outcome is unknown.
     timeout,
   }
+
+  /// Enqueues a durable deferred call in the caller's transaction. Arguments
+  /// are a positional JSON array. Delivery is at-least-once after commit,
+  /// including across restarts; use idempotent target methods. The job ID is
+  /// local to the source actor. No callee runs before the caller commits.
+  spawn: func(app: string, actor-type: string, key: string, method: string, args: string, delay-ms: u64) -> result<string, call-error>;
+  /// Inspects a source-local job as JSON, including status, attempts, and
+  /// result/error. Unknown IDs return none; terminal records remain readable.
+  job: func(id: string) -> result<option<string>, string>;
 }
 
 /// The actor's alarm: at most one scheduled wake-up per actor, stored in its

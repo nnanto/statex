@@ -11,6 +11,9 @@
 
 use std::fmt;
 
+/// JSON values used by generated scheduling clients; callers need no direct dependency.
+pub use serde_json;
+
 #[cfg(target_arch = "wasm32")]
 mod wasm;
 #[cfg(target_arch = "wasm32")]
@@ -318,7 +321,11 @@ pub mod http {
 
     impl Request {
         pub fn new(method: &str, url: &str) -> Self {
-            Self { method: method.into(), url: url.into(), ..Default::default() }
+            Self {
+                method: method.into(),
+                url: url.into(),
+                ..Default::default()
+            }
         }
         pub fn get(url: &str) -> Self {
             Self::new("GET", url)
@@ -353,8 +360,69 @@ pub mod http {
 ///
 /// The callee runs in its own transaction, which commits independently of the
 /// caller's: if the caller later traps, the callee's changes stay.
+///
+/// Generated clients also expose `counter::spawn::increment("alice", 2)` and
+/// `counter::spawn_after::increment(Duration::from_secs(30), "alice", 2)`.
+/// These return a job ID and only enqueue: enqueue rolls back with the caller,
+/// while delivery runs later in a separate callee transaction, at least once.
+/// Use [`job`] to inspect progress. Native tests explicitly advance delivery
+/// with `testing::drain_jobs`; they never sleep or execute the stub inline.
 pub mod actors {
+    use serde_json::Value;
+
+    #[doc(hidden)]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct SpawnedCall { pub id: String }
+    #[doc(hidden)]
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct DelayedCall { pub id: String, pub delay_ms: u64 }
     use std::fmt;
+    use std::time::Duration;
+
+    /// Enqueues a call atomically with the caller's transaction. Arguments are
+    /// positional JSON values using the statex WIT JSON representation.
+    pub fn spawn(
+        app: &str,
+        actor_type: &str,
+        key: &str,
+        method: &str,
+        args: &[Value],
+    ) -> Result<String, CallError> {
+        spawn_after(Duration::ZERO, app, actor_type, key, method, args)
+    }
+
+    /// Enqueues a call for delivery after `delay`; this does not execute it inline.
+    pub fn spawn_after(
+        delay: Duration,
+        app: &str,
+        actor_type: &str,
+        key: &str,
+        method: &str,
+        args: &[Value],
+    ) -> Result<String, CallError> {
+        let delay_ms = delay_ms(delay)?;
+        super::backend::actors_spawn(
+            app,
+            actor_type,
+            key,
+            method,
+            &serde_json::to_string(args).unwrap(),
+            delay_ms,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn delay_ms(delay: Duration) -> Result<u64, CallError> {
+        u64::try_from(delay.as_millis())
+            .map_err(|_| CallError::Rejected("delay exceeds u64 milliseconds".into()))
+    }
+
+    /// Inspects a job belonging to the current actor. Missing jobs return `None`.
+    pub fn job(id: &str) -> super::Result<Option<Value>> {
+        super::backend::actors_job(id)?
+            .map(|json| serde_json::from_str(&json).map_err(|e| super::Error(e.to_string())))
+            .transpose()
+    }
 
     /// Why a call to another actor did not return the callee's result. This
     /// is `statex:host/actors.call-error`; generated client bindings map to it.
@@ -446,7 +514,10 @@ pub mod alarm {
 
     /// The current Unix time in milliseconds.
     pub fn now_ms() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
     }
 }
 

@@ -65,7 +65,7 @@ pub mod demo {
                     STUB.with(|c| *c.borrow_mut() = None);
                 }
 
-                fn current() -> Rc<dyn Kv> {
+                pub(super) fn current() -> Rc<dyn Kv> {
                     STUB.with(|c| c.borrow().clone()).unwrap_or_else(|| {
                         panic!("demo/db kv was called without a stub; call statex_calls::demo::db::kv::stub(..) first")
                     })
@@ -98,6 +98,165 @@ pub mod demo {
 
             #[cfg(not(target_arch = "wasm32"))]
             pub use native::*;
+
+            #[cfg(not(target_arch = "wasm32"))]
+            impl statex_guest::testing::ToJson for Entry {
+                fn to_json(&self) -> Result<statex_guest::serde_json::Value, statex_guest::actors::CallError> {
+                    use statex_guest::{serde_json::{Value, json}, testing::to_json};
+                    Ok(Value::Object([
+                        ("key".into(), to_json(&self.key)?),
+                        ("value".into(), to_json(&self.value)?),
+                    ].into_iter().collect()))
+                }
+            }
+
+            /// Transactional deferred calls; returns a job ID, not the method result.
+            pub mod spawn {
+                use super::*;
+                pub fn put(actor: &str, key: &str, value: &str) -> Result<String, statex_guest::actors::CallError> {
+                    #[cfg(target_arch = "wasm32")]
+                    { raw::statex_spawn_put(actor, key, value).map(|reply| reply.id) }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let __statex_args = vec![statex_guest::testing::to_json(&key)?, statex_guest::testing::to_json(&value)?];
+                        let __statex_id = statex_guest::actors::spawn_after(std::time::Duration::ZERO, "demo/db", "kv", actor, "put", &__statex_args)?;
+                        let __statex_key = actor.to_string();
+                        let __statex_arg0 = (key).to_string();
+                        let __statex_arg1 = (value).to_string();
+                        statex_guest::testing::attach_job(&__statex_id, move || {
+                            let value = native::current().put(&__statex_key, (&__statex_arg0).as_str(), (&__statex_arg1).as_str())?;
+                            let __statex_result = statex_guest::testing::to_json(&value)?;
+                            Ok(__statex_result)
+                        });
+                        Ok(__statex_id)
+                    }
+                }
+                pub fn get(actor: &str, key: &str) -> Result<String, statex_guest::actors::CallError> {
+                    #[cfg(target_arch = "wasm32")]
+                    { raw::statex_spawn_get(actor, key).map(|reply| reply.id) }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let __statex_args = vec![statex_guest::testing::to_json(&key)?];
+                        let __statex_id = statex_guest::actors::spawn_after(std::time::Duration::ZERO, "demo/db", "kv", actor, "get", &__statex_args)?;
+                        let __statex_key = actor.to_string();
+                        let __statex_arg0 = (key).to_string();
+                        statex_guest::testing::attach_job(&__statex_id, move || {
+                            let value = native::current().get(&__statex_key, (&__statex_arg0).as_str())?;
+                            let __statex_result = statex_guest::testing::to_json(&value)?;
+                            Ok(__statex_result)
+                        });
+                        Ok(__statex_id)
+                    }
+                }
+                pub fn delete(actor: &str, key: &str) -> Result<String, statex_guest::actors::CallError> {
+                    #[cfg(target_arch = "wasm32")]
+                    { raw::statex_spawn_delete(actor, key).map(|reply| reply.id) }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let __statex_args = vec![statex_guest::testing::to_json(&key)?];
+                        let __statex_id = statex_guest::actors::spawn_after(std::time::Duration::ZERO, "demo/db", "kv", actor, "delete", &__statex_args)?;
+                        let __statex_key = actor.to_string();
+                        let __statex_arg0 = (key).to_string();
+                        statex_guest::testing::attach_job(&__statex_id, move || {
+                            let value = native::current().delete(&__statex_key, (&__statex_arg0).as_str())?;
+                            let __statex_result = statex_guest::testing::to_json(&value)?;
+                            Ok(__statex_result)
+                        });
+                        Ok(__statex_id)
+                    }
+                }
+                pub fn scan(actor: &str, prefix: &str) -> Result<String, statex_guest::actors::CallError> {
+                    #[cfg(target_arch = "wasm32")]
+                    { raw::statex_spawn_scan(actor, prefix).map(|reply| reply.id) }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let __statex_args = vec![statex_guest::testing::to_json(&prefix)?];
+                        let __statex_id = statex_guest::actors::spawn_after(std::time::Duration::ZERO, "demo/db", "kv", actor, "scan", &__statex_args)?;
+                        let __statex_key = actor.to_string();
+                        let __statex_arg0 = (prefix).to_string();
+                        statex_guest::testing::attach_job(&__statex_id, move || {
+                            let value = native::current().scan(&__statex_key, (&__statex_arg0).as_str())?;
+                            let __statex_result = statex_guest::testing::to_json(&value)?;
+                            Ok(__statex_result)
+                        });
+                        Ok(__statex_id)
+                    }
+                }
+            }
+
+            /// Transactional deferred calls; returns a job ID, not the method result.
+            pub mod spawn_after {
+                use super::*;
+                pub fn put(__statex_delay: std::time::Duration, actor: &str, key: &str, value: &str) -> Result<String, statex_guest::actors::CallError> {
+                    #[cfg(target_arch = "wasm32")]
+                    { raw::statex_spawn_after_put(actor, statex_guest::actors::delay_ms(__statex_delay)?, key, value).map(|reply| reply.id) }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let __statex_args = vec![statex_guest::testing::to_json(&key)?, statex_guest::testing::to_json(&value)?];
+                        let __statex_id = statex_guest::actors::spawn_after(__statex_delay, "demo/db", "kv", actor, "put", &__statex_args)?;
+                        let __statex_key = actor.to_string();
+                        let __statex_arg0 = (key).to_string();
+                        let __statex_arg1 = (value).to_string();
+                        statex_guest::testing::attach_job(&__statex_id, move || {
+                            let value = native::current().put(&__statex_key, (&__statex_arg0).as_str(), (&__statex_arg1).as_str())?;
+                            let __statex_result = statex_guest::testing::to_json(&value)?;
+                            Ok(__statex_result)
+                        });
+                        Ok(__statex_id)
+                    }
+                }
+                pub fn get(__statex_delay: std::time::Duration, actor: &str, key: &str) -> Result<String, statex_guest::actors::CallError> {
+                    #[cfg(target_arch = "wasm32")]
+                    { raw::statex_spawn_after_get(actor, statex_guest::actors::delay_ms(__statex_delay)?, key).map(|reply| reply.id) }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let __statex_args = vec![statex_guest::testing::to_json(&key)?];
+                        let __statex_id = statex_guest::actors::spawn_after(__statex_delay, "demo/db", "kv", actor, "get", &__statex_args)?;
+                        let __statex_key = actor.to_string();
+                        let __statex_arg0 = (key).to_string();
+                        statex_guest::testing::attach_job(&__statex_id, move || {
+                            let value = native::current().get(&__statex_key, (&__statex_arg0).as_str())?;
+                            let __statex_result = statex_guest::testing::to_json(&value)?;
+                            Ok(__statex_result)
+                        });
+                        Ok(__statex_id)
+                    }
+                }
+                pub fn delete(__statex_delay: std::time::Duration, actor: &str, key: &str) -> Result<String, statex_guest::actors::CallError> {
+                    #[cfg(target_arch = "wasm32")]
+                    { raw::statex_spawn_after_delete(actor, statex_guest::actors::delay_ms(__statex_delay)?, key).map(|reply| reply.id) }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let __statex_args = vec![statex_guest::testing::to_json(&key)?];
+                        let __statex_id = statex_guest::actors::spawn_after(__statex_delay, "demo/db", "kv", actor, "delete", &__statex_args)?;
+                        let __statex_key = actor.to_string();
+                        let __statex_arg0 = (key).to_string();
+                        statex_guest::testing::attach_job(&__statex_id, move || {
+                            let value = native::current().delete(&__statex_key, (&__statex_arg0).as_str())?;
+                            let __statex_result = statex_guest::testing::to_json(&value)?;
+                            Ok(__statex_result)
+                        });
+                        Ok(__statex_id)
+                    }
+                }
+                pub fn scan(__statex_delay: std::time::Duration, actor: &str, prefix: &str) -> Result<String, statex_guest::actors::CallError> {
+                    #[cfg(target_arch = "wasm32")]
+                    { raw::statex_spawn_after_scan(actor, statex_guest::actors::delay_ms(__statex_delay)?, prefix).map(|reply| reply.id) }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    {
+                        let __statex_args = vec![statex_guest::testing::to_json(&prefix)?];
+                        let __statex_id = statex_guest::actors::spawn_after(__statex_delay, "demo/db", "kv", actor, "scan", &__statex_args)?;
+                        let __statex_key = actor.to_string();
+                        let __statex_arg0 = (prefix).to_string();
+                        statex_guest::testing::attach_job(&__statex_id, move || {
+                            let value = native::current().scan(&__statex_key, (&__statex_arg0).as_str())?;
+                            let __statex_result = statex_guest::testing::to_json(&value)?;
+                            Ok(__statex_result)
+                        });
+                        Ok(__statex_id)
+                    }
+                }
+            }
         }
     }
 }

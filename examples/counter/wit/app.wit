@@ -9,6 +9,12 @@ interface counter {
   /// Resets to zero.
   reset: func();
 
+  /// Enqueues a durable increment on another counter (or this counter).
+  /// Returning an error when `fail` is true demonstrates outbox rollback.
+  enqueue: func(key: string, by: s64, delay-ms: u64, fail: bool) -> result<string, string>;
+  /// Inspect an outbox job belonging to this counter, as JSON.
+  job: func(id: string) -> result<option<string>, string>;
+
   /// Schedules the alarm `delay-ms` from now. Its first `fail-times`
   /// attempts fail, to show retries.
   schedule: func(delay-ms: u64, fail-times: u32);

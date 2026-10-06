@@ -46,6 +46,41 @@ Any write that was acknowledged therefore survives:
   the waker node within `wake_tick` (1 s), or within `wake_full_scan` (30 s)
   after the waker fails over, plus any failover time of the actor itself.
 
+## Durable background calls
+
+`spawn` and `spawn_after` record a job in the **calling actor's outbox**.
+Scheduling participates in that actor's transaction: a rollback removes the
+job, and delivery starts only after the caller's changes are durable.
+Returning a job ID from the host import is not itself a durable acknowledgement;
+the enclosing actor invocation must commit through the normal ack rule.
+An unavailable acknowledgement can still leave a committed job, just as an
+unacknowledged ordinary write can become visible after recovery.
+
+- Pending jobs, retry bookkeeping, and terminal results survive activation,
+  eviction, and owner crashes through the actor's normal snapshots and changes.
+- Discovery markers are published before the source change becomes durable.
+  A marker is only a hint: dispatch must claim an actual committed job from
+  the source actor, under its ownership and transaction rules.
+- The dispatcher releases the source actor before invoking the target. A job
+  may therefore call its own actor without re-entering a held source lock.
+- Each target call has its own transaction and execution deadline. It is not
+  cancelled when the originating invocation's deadline expires.
+- Delivery is **at least once**, not exactly once. A target can commit before
+  the dispatcher durably records completion. Recovery may call it again.
+  Use application-level idempotency keys for non-idempotent effects.
+- `spawn_after` is a not-before constraint, measured from enqueue time. It
+  does not promise exact execution time. Outages, actor lock contention, and
+  retries can delay delivery.
+- There is no per-target FIFO guarantee. A delayed job does not block a newer
+  job that is ready for delivery.
+- Failed jobs remain inspectable in the source actor. Delivery attempts are
+  bounded; a job can terminate without a successful target invocation.
+- Deleting the source actor deletes its outbox. This cannot undo a target call
+  that already started or committed.
+
+The durable outbox is separate from ordinary synchronous requests, whose
+in-memory lock waiters are not persisted.
+
 ## What is *not* guaranteed
 
 - **Unacknowledged writes may still become visible.** If the segment upload succeeded but the ownership check then failed or timed out, the client receives `503 unavailable`. A later owner may still restore that write, which also happens if the owner crashed between upload and response. Treat 503 as "unknown outcome". Methods that must not be applied twice should take an idempotency key and record it in the actor's database (a `UNIQUE` column makes this a one-line check).
@@ -86,8 +121,8 @@ Any write that was acknowledged therefore survives:
 
 ## Extension responsibilities
 
-Custom state backends must atomically commit or roll back SQL, migrations and
-alarms together and restore exactly the committed state represented by a
+Custom state backends must atomically commit or roll back SQL, migrations,
+alarms, and any supported outbox jobs together and restore exactly the committed state represented by a
 snapshot plus its ordered changes. A backend format mismatch is an activation
 failure, not permission to start a fresh actor. Changing engines requires an
 explicit data migration; using a different factory does not convert data.

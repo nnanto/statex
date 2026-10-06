@@ -30,7 +30,7 @@ pub struct Alarm {
 }
 
 fn exists(conn: &Connection) -> rusqlite::Result<bool> {
-    conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", [TABLE], |r| {
+    conn.query_row("SELECT count(*) FROM main.sqlite_master WHERE type = 'table' AND name = ?1", [TABLE], |r| {
         r.get::<_, i64>(0)
     })
     .map(|n| n > 0)
@@ -38,7 +38,7 @@ fn exists(conn: &Connection) -> rusqlite::Result<bool> {
 
 fn ensure(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS _statex_alarm(
+        "CREATE TABLE IF NOT EXISTS main._statex_alarm(
             id INTEGER PRIMARY KEY CHECK (id = 0),
             at_ms INTEGER,
             retry INTEGER NOT NULL DEFAULT 0,
@@ -53,7 +53,7 @@ pub fn read(conn: &Connection) -> rusqlite::Result<Option<Alarm>> {
         return Ok(None);
     }
     let row = conn
-        .query_row("SELECT at_ms, retry, epoch, seq FROM _statex_alarm WHERE id = 0", [], |r| {
+        .query_row("SELECT at_ms, retry, epoch, seq FROM main._statex_alarm WHERE id = 0", [], |r| {
             Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?))
         })
         .optional()?;
@@ -66,7 +66,7 @@ fn install(conn: &Connection, at_ms: u64, retry: u32, epoch: u64) -> rusqlite::R
     ensure(conn)?;
     let at = i64::try_from(at_ms).unwrap_or(i64::MAX);
     conn.execute(
-        "INSERT INTO _statex_alarm(id, at_ms, retry, epoch, seq) VALUES(0, ?1, ?2, ?3, 1)
+        "INSERT INTO main._statex_alarm(id, at_ms, retry, epoch, seq) VALUES(0, ?1, ?2, ?3, 1)
          ON CONFLICT(id) DO UPDATE SET at_ms = ?1, retry = ?2, epoch = ?3, seq = seq + 1",
         rusqlite::params![at, retry, epoch as i64],
     )?;
@@ -86,7 +86,7 @@ pub fn set_retry(conn: &Connection, at_ms: u64, retry: u32, epoch: u64) -> rusql
 /// Cancels the alarm. `seq` is kept so identities never repeat.
 pub fn clear(conn: &Connection) -> rusqlite::Result<()> {
     if exists(conn)? {
-        conn.execute("UPDATE _statex_alarm SET at_ms = NULL, retry = 0 WHERE id = 0", [])?;
+        conn.execute("UPDATE main._statex_alarm SET at_ms = NULL, retry = 0 WHERE id = 0", [])?;
     }
     Ok(())
 }

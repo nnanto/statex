@@ -30,6 +30,7 @@ as `alarm: func(retry-count: u32);`):
     statex.set_alarm_in(60_000)     # call alarm() in a minute
 """
 
+import json
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,6 +46,44 @@ try:
     from wit_world.imports import alarms as _alarms_import
 except ImportError:  # the world does not import statex:host/alarms
     _alarms_import = None
+
+try:
+    from wit_world.imports import actors as _actors_import
+except ImportError:
+    _actors_import = None
+
+
+def _actors() -> Any:
+    if _actors_import is None:
+        raise RuntimeError("scheduling needs `import statex:host/actors@0.1.0;` in the app's world")
+    return _actors_import
+
+
+def spawn(app: str, actor_type: str, key: str, method: str, args: List[Any]) -> str:
+    """Enqueues a call in the current transaction and returns its job ID.
+
+    Use positional JSON values in the WIT JSON representation, e.g.
+    `statex.spawn("counters", "counter", "alice", "increment", [2])`.
+    This generic API does not accept a typed client function.
+    """
+    return spawn_after(0, app, actor_type, key, method, args)
+
+
+def spawn_after(delay_ms: int, app: str, actor_type: str, key: str,
+                method: str, args: List[Any]) -> str:
+    """Like spawn, with a delay in milliseconds. No inline execution."""
+    if isinstance(delay_ms, bool) or not isinstance(delay_ms, int) or not 0 <= delay_ms < 2**64:
+        raise ValueError("delay_ms must be a u64 integer")
+    if not isinstance(args, (list, tuple)):
+        raise TypeError("spawn arguments must be a positional list")
+    return _actors().spawn(app, actor_type, key, method,
+                           json.dumps(args, allow_nan=False), delay_ms)
+
+
+def job(id: str) -> Optional[Dict[str, Any]]:
+    """Inspects a job owned by the current actor, or returns None if absent."""
+    value = _actors().job(id)
+    return None if value is None else json.loads(value)
 
 
 def _to_value(v: Any) -> Any:
@@ -100,8 +139,8 @@ _CALL_ERRORS = {
     "NotFound": "not found",
     "Incompatible": "incompatible",
     "Trap": "callee trapped",
-    "Unavailable": "unavailable",
     "Rejected": "rejected",
+    "Unavailable": "unavailable",
     "Cycle": "call cycle",
     "Timeout": "timed out",
 }
