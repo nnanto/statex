@@ -125,6 +125,13 @@ Points to keep in mind:
 
 ## 4. Test locally
 
+Guest execution budgets live in `[limits]`: `timeout_ms`, `memory_mb`, and
+optional `fuel`, `rps`, `burst`, and `max_concurrent`. Hosts may impose tighter
+ceilings. RPS and concurrency are shared per app on each execution owner;
+fuel resets per invocation. These are runtime limits, not simulated by the
+native guest mock. See [execution limits](extensions/execution-limits.md)
+for configuration, errors, and CPU/native-code boundaries.
+
 **Unit tests.** `statex_guest` ships with a mock host. Each `(type, key)`
 gets an in-memory SQLite database with your migrations applied. Run the tests with `cargo test` or `statex test`.
 Python actors have an equivalent harness; see [Testing Python actors](#testing-python-actors).

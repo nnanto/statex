@@ -65,7 +65,10 @@ async fn health(State(node): S) -> Json<J> {
         "session": me.session,
         "advertise": me.advertise,
         "fenced": node.lease.fenced(),
-        "apps": node.apps().iter().map(|a| json!({"app": a.manifest.app, "sha256": a.manifest.sha256})).collect::<Vec<_>>(),
+        "apps": node.apps().iter().map(|a| json!({
+            "app": a.manifest.app, "sha256": a.manifest.sha256,
+            "limits": a.effective_limits(),
+        })).collect::<Vec<_>>(),
         "resident_actors": node.resident_actors().iter().map(|c| c.to_string()).collect::<Vec<_>>(),
     }))
 }
@@ -76,6 +79,8 @@ async fn list_apps(State(node): S) -> Json<J> {
             "app": a.manifest.app,
             "sha256": a.manifest.sha256,
             "types": a.manifest.types.iter().map(|t| &t.name).collect::<Vec<_>>(),
+            "limits": a.effective_limits(),
+            "requested_limits": a.manifest.limits,
         })).collect::<Vec<_>>()
     }))
 }

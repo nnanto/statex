@@ -69,6 +69,7 @@ Any write that was acknowledged therefore survives:
 | 404 | `not_found` | Unknown app, actor type or method |
 | 409 | `conflict` | `_create` on an existing actor |
 | 422 | `method_error` | The method returned `err(E)`; `error.detail` holds E. The transaction is rolled back |
+| 429 | `rate_limited` / `overloaded` | Per-app/node guest admission budget exhausted; no guest execution |
 | 500 | `trap` / `internal` | The guest trapped (panic, timeout, out of memory); the transaction is rolled back |
 | 500 | `extension_error` | A critical hook failed or panicked; no guest transaction is committed |
 | 503 | `unavailable` | Ownership could not be established or confirmed; retry. The outcome of a write is unknown |
@@ -114,3 +115,10 @@ observers are non-vetoing, best-effort notifications, not a durable event bus.
 External hook effects and typed local data are not rolled back. See
 [invocation hooks](extensions/invocation-hooks.md) and
 [runtime hooks](extensions/runtime-hooks.md) for phase and trust boundaries.
+
+Guest budgets combine app settings with host ceilings. WASM memory and fuel,
+guest timeouts, and per-app/node rate/concurrency limits are enforced by the
+runtime. Quota rejection and guest budget failures do not commit actor state.
+Fuel is not exact CPU time and native callbacks cannot be forcibly interrupted;
+WASM memory accounting is not a process RSS limit. See
+[execution limits](extensions/execution-limits.md).

@@ -128,6 +128,8 @@ impl InvocationContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HookError {
+    RateLimited(String),
+    Overloaded(String),
     Unauthorized(String),
     Denied(String),
     Invalid(String),
@@ -139,6 +141,7 @@ pub enum HookError {
 impl HookError {
     pub fn status(&self) -> u16 {
         match self {
+            Self::RateLimited(_) | Self::Overloaded(_) => 429,
             Self::Unauthorized(_) => 401,
             Self::Denied(_) => 403,
             Self::Invalid(_) => 400,
@@ -150,6 +153,8 @@ impl HookError {
 
     pub fn code(&self) -> &'static str {
         match self {
+            Self::RateLimited(_) => "rate_limited",
+            Self::Overloaded(_) => "overloaded",
             Self::Unauthorized(_) => "unauthorized",
             Self::Denied(_) => "forbidden",
             Self::Invalid(_) => "extension_invalid",
@@ -164,7 +169,8 @@ impl std::fmt::Display for HookError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Unauthorized(message) | Self::Denied(message) | Self::Invalid(message)
-            | Self::Unavailable(message) | Self::Internal(message) => f.write_str(message),
+            | Self::Unavailable(message) | Self::Internal(message)
+            | Self::RateLimited(message) | Self::Overloaded(message) => f.write_str(message),
             Self::Timeout => f.write_str("invocation extension deadline expired"),
         }
     }

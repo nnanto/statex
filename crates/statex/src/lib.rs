@@ -16,6 +16,7 @@ pub use statex_runtime::invocation::{
     Caller, ExecutionExtension, HookError, InvocationContext, InvocationMetadata,
     InvocationOperation, Principal, TransactionState,
 };
+pub use statex_runtime::limits::HostLimits;
 pub use statex_store as store;
 pub use statex_store::{DynStore, ObjectStore, StoreRegistry};
 

@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use wasmtime::component::ResourceTable;
-use wasmtime::StoreLimits;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use crate::calls::{ActorCaller, ActorRef};
@@ -31,7 +30,7 @@ pub struct ActorIdentity {
 pub struct HostState {
     pub(crate) wasi: WasiCtx,
     pub(crate) table: ResourceTable,
-    pub(crate) limits: StoreLimits,
+    pub(crate) limits: crate::limits::MemoryEnvelope,
     pub identity: ActorIdentity,
     pub db: DatabaseHandle,
     pub(crate) http: HttpPolicy,

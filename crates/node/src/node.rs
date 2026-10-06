@@ -15,6 +15,7 @@ use serde_json::{json, Value as J};
 use sha2::Sha256;
 use statex_ltx::segment_name;
 use statex_runtime::database::{DynDatabaseFactory, SqliteFactory};
+use statex_runtime::limits::HostLimits;
 use statex_runtime::{
     resolve_method, ActorCaller, ActorRef, AppCode, CallError, CallFailure, CallReply, CallRequest,
     Runtime,
@@ -65,6 +66,9 @@ pub struct NodeConfig {
     /// Optional configured runtime (additional host capabilities and adapters).
     /// None uses the process-wide default runtime.
     pub runtime: Option<Runtime>,
+    /// Platform ceilings intersect app-requested guest budgets. Rate and
+    /// concurrency counters are isolated per app on this node.
+    pub guest_limits: HostLimits,
     /// Ordered invocation and lifecycle extensions. Empty means no hooks.
     pub extensions: Vec<Arc<dyn InvocationExtension>>,
     /// Maximum wait for each async hook. Critical hooks also share the
@@ -93,6 +97,7 @@ impl NodeConfig {
             wake_full_scan: Duration::from_secs(30),
             database_factory: Arc::new(SqliteFactory),
             runtime: None,
+            guest_limits: HostLimits::default(),
             extensions: Vec::new(),
             extension_timeout: Duration::from_secs(5),
             public_router: None,
@@ -229,7 +234,9 @@ pub fn reply_of(o: Outcome) -> CallReply {
             | "extension_invalid"
             | "extension_unavailable"
             | "extension_error"
-            | "extension_timeout",
+            | "extension_timeout"
+            | "rate_limited"
+            | "overloaded",
         ) => CallFailure::Rejected(msg),
         // The variant already says "cycle"; keep only the path.
         Some("cycle") => CallFailure::Cycle(msg.trim_start_matches("call cycle: ").to_string()),
@@ -290,7 +297,8 @@ impl Node {
         let runtime = match &cfg.runtime {
             Some(runtime) => runtime.clone(),
             None => Runtime::shared()?,
-        };
+        }
+        .for_node(cfg.guest_limits.clone())?;
         let lease = Lease::acquire(store.clone(), &cfg.node_id, &advertise, cfg.lease_ttl).await?;
         let renew = tokio::spawn(lease.clone().run());
         let secret = match peer_secret(&store).await {

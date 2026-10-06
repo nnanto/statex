@@ -68,6 +68,7 @@ impl Project {
                 let cfg: StatexToml =
                     toml::from_str(&std::fs::read_to_string(&f)?).with_context(|| format!("parse {}", f.display()))?;
                 statex_runtime::validate_app_name(&cfg.app.name).with_context(|| format!("app name in {}", f.display()))?;
+                cfg.limits.validate().with_context(|| format!("guest limits in {}", f.display()))?;
                 return Ok(Project { root: dir.to_path_buf(), cfg });
             }
         }
@@ -325,6 +326,22 @@ pub fn sample(t: &Ty) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_limits_parse_and_validate_before_building() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("statex.toml");
+        std::fs::write(&path, "[app]\nname = \"budgeted\"\n[limits]\ntimeout_ms = 20\nmemory_mb = 8\nfuel = 1000\nrps = 2\nburst = 3\nmax_concurrent = 1\n").unwrap();
+        let project = Project::find(dir.path()).unwrap();
+        assert_eq!(project.cfg.limits.fuel, Some(1000));
+        assert_eq!(project.cfg.limits.rps, Some(2));
+        assert_eq!(project.cfg.limits.burst, Some(3));
+        assert_eq!(project.cfg.limits.max_concurrent, Some(1));
+        for limits in ["rps = 0", "fuel = 0", "memory_mb = 0", "timeout_ms = 0", "max_concurrent = 0", "burst = 3", "cpu_ms = 10"] {
+            std::fs::write(&path, format!("[app]\nname = \"budgeted\"\n[limits]\n{limits}\n")).unwrap();
+            assert!(Project::find(dir.path()).is_err(), "{limits} must not be silently accepted");
+        }
+    }
 
     #[test]
     fn repository_manifests_use_canonical_app_and_callee_names() {

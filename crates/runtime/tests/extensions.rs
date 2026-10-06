@@ -197,6 +197,97 @@ struct Hook {
     mode: Arc<AtomicU8>,
 }
 
+#[test]
+fn native_callbacks_are_not_fuel_metered_but_late_return_and_panic_trap() {
+    use statex_runtime::Limits;
+    let mode = Arc::new(AtomicU8::new(0));
+    let control = mode.clone();
+    let rt = Runtime::builder().host_interface("example:extension/sequence@0.1.0", move |linker| {
+        linker.instance("example:extension/sequence@0.1.0")?.func_new("next", move |_, _, _, results| {
+            match control.load(Ordering::SeqCst) {
+                1 => std::thread::sleep(Duration::from_millis(20)),
+                2 => panic!("native callback panicked"),
+                _ => {
+                    // Trusted native work consumes no WASM fuel.
+                    let mut value = 0u64;
+                    for i in 0..100_000 { value = std::hint::black_box(value.wrapping_add(i)); }
+                    std::hint::black_box(value);
+                }
+            }
+            results[0] = Val::U32(7);
+            Ok(())
+        })?;
+        Ok(())
+    }).unwrap().build().unwrap();
+    let mut manifest = manifest();
+    manifest.limits = Limits { timeout_ms: 10, fuel: Some(1000), max_concurrent: Some(1), ..Default::default() };
+    let code = rt.load(COMPONENT.as_bytes(), manifest.clone()).unwrap();
+    let mut actor = code.instantiate(identity("native"), statex_runtime::database::sqlite_handle(
+        Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())))).unwrap();
+    assert_eq!(actor.call("counter", "next", &json!({})).unwrap().value, json!(7));
+    mode.store(1, Ordering::SeqCst);
+    assert!(matches!(actor.call("counter", "next", &json!({})), Err(CallError::Trap(message)) if message.contains("timed out")));
+    mode.store(2, Ordering::SeqCst);
+    let mut actor = code.instantiate(identity("panic"), statex_runtime::database::sqlite_handle(
+        Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())))).unwrap();
+    assert!(matches!(actor.call("counter", "next", &json!({})), Err(CallError::Trap(message)) if message.contains("panicked")));
+    mode.store(0, Ordering::SeqCst);
+    let mut actor = code.instantiate(identity("recovered"), statex_runtime::database::sqlite_handle(
+        Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())))).unwrap();
+    assert_eq!(actor.call("counter", "next", &json!({})).unwrap().value, json!(7));
+    let init_component = COMPONENT.replace("(func (export \"next\")", "(func $start call $next drop) (start $start) (func (export \"next\")");
+    let code = rt.load(init_component.as_bytes(), manifest).unwrap();
+    mode.store(1, Ordering::SeqCst);
+    let error = code.instantiate(identity("initialization"), statex_runtime::database::sqlite_handle(
+        Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())))).err().unwrap();
+    assert!(format!("{error:#}").contains("initialization timed out"), "{error:#}");
+}
+
+#[test]
+fn concurrent_guest_attempt_is_rejected_while_native_callback_is_running() {
+    use statex_runtime::Limits;
+    use std::sync::mpsc;
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release_rx = Arc::new(Mutex::new(release_rx));
+    let calls = Arc::new(AtomicU8::new(0));
+    let rt = Runtime::builder().host_interface("example:extension/sequence@0.1.0", move |linker| {
+        linker.instance("example:extension/sequence@0.1.0")?.func_new("next", move |_, _, _, results| {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                entered_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            results[0] = Val::U32(7);
+            Ok(())
+        })?;
+        Ok(())
+    }).unwrap().build().unwrap();
+    let mut manifest = manifest();
+    manifest.limits = Limits { max_concurrent: Some(1), ..Default::default() };
+    let code = rt.load(COMPONENT.as_bytes(), manifest).unwrap();
+    let instantiate = |key| code.instantiate(identity(key), statex_runtime::database::sqlite_handle(
+        Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap())))).unwrap();
+    let mut a = instantiate("running");
+    let mut b = instantiate("rejected");
+    let running = std::thread::spawn(move || a.call("counter", "next", &json!({})));
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(code.active_executions(), 1);
+    let (rejected_tx, rejected_rx) = mpsc::channel();
+    let rejected = std::thread::spawn(move || {
+        let result = b.call("counter", "next", &json!({}));
+        rejected_tx.send(result.clone()).unwrap();
+        (b, result)
+    });
+    let result = rejected_rx.recv_timeout(Duration::from_secs(1));
+    release_tx.send(()).unwrap();
+    running.join().unwrap().unwrap();
+    assert_eq!(code.active_executions(), 0);
+    assert!(matches!(result.unwrap(), Err(CallError::Rejected(HookError::Overloaded(_)))));
+    let (mut b, _) = rejected.join().unwrap();
+    assert_eq!(b.call("counter", "next", &json!({})).unwrap().value, json!(7));
+    assert_eq!(code.active_executions(), 0);
+}
+
 impl ExecutionExtension for Hook {
     fn before_guest(&self, context: &InvocationContext) -> Result<(), HookError> {
         self.events.lock().unwrap().push(self.id);

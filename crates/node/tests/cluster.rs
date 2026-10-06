@@ -1958,3 +1958,217 @@ async fn invocation_hooks_actor_call_rejection_is_not_an_unknown_outcome() {
     assert!(fleet.store.list(&id.ltx_prefix()).await.unwrap().is_empty());
     node.shutdown().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_budgets_apply_host_caps_and_charge_the_execution_owner() {
+    use statex_runtime::limits::HostLimits;
+    let fleet = Fleet::new().await;
+    let mut config = hook_config(&fleet, "budget-owner", vec![]);
+    config.guest_limits = HostLimits {
+        max_timeout_ms: Some(100),
+        max_memory_mb: Some(8),
+        max_fuel: Some(10_000_000),
+        max_rps: Some(1),
+        max_burst: Some(1),
+        max_concurrent: Some(4),
+    };
+    let owner_node = start(config.clone()).await.unwrap();
+    config.node_id = "budget-peer".into();
+    config.data_dir = fleet.root.join("budget-peer");
+    let peer = start(config).await.unwrap();
+    let code = owner_node.node.app("counter").unwrap();
+    assert_eq!(code.manifest.limits.memory_mb, 64);
+    assert_eq!(code.effective_limits().memory_mb, 8);
+    assert_eq!(code.effective_limits().timeout_ms, 100);
+    assert_eq!(code.effective_limits().fuel, Some(10_000_000));
+    assert_eq!(code.effective_limits().rps, Some(1));
+
+    assert_eq!(
+        post(
+            &owner_node,
+            "/v1/apps/counter/actors/counter/shared/increment",
+            json!({"by": "invalid"})
+        )
+        .await
+        .0,
+        400
+    );
+    assert_eq!(inc(&owner_node, "shared", 1).await.0, 200);
+    let (status, body) = inc(&peer, "shared", 100).await;
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(body["error"]["code"], "rate_limited");
+    assert!(matches!(
+        statex_node::node::reply_of(Outcome { status, body }),
+        statex_runtime::CallReply::Failed(statex_runtime::CallFailure::Rejected(_))
+    ));
+    // Sharing the default runtime engine does not share quota counters across nodes.
+    assert_eq!(inc(&peer, "peer-owned", 2).await.0, 200);
+    let (status, body) = post(
+        &owner_node,
+        "/v1/apps/counter/actors/account/other-type/deposit",
+        json!({"amount": 9, "memo": null}),
+    )
+    .await;
+    assert_eq!(status, 429, "{body}");
+    // Actor types share this app's budget; health/schema reads do not consume it.
+    let health: J = reqwest::get(format!("{}/healthz", owner_node.url()))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["apps"][0]["limits"]["memory_mb"], 8);
+    assert_eq!(health["apps"][0]["limits"]["rps"], 1);
+    owner_node.shutdown().await;
+    peer.shutdown().await;
+    let recovered = fleet.node("budget-recovery").await;
+    assert_eq!(get(&recovered, "shared").await, 1);
+    assert_eq!(get(&recovered, "peer-owned").await, 2);
+    let (status, body) = post(
+        &recovered,
+        "/v1/apps/counter/actors/account/other-type/balance",
+        J::Null,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"], 0);
+    recovered.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_budgets_fuel_and_timeout_fail_without_committing_migrations() {
+    use statex_runtime::limits::HostLimits;
+    let fleet = Fleet::new().await;
+    let (wasm, manifest) = caller();
+    deploy::deploy(
+        &fleet.store,
+        wasm,
+        manifest,
+        &deploy::DeployOptions::default(),
+    )
+    .await
+    .unwrap();
+    let mut config = hook_config(&fleet, "fuel-budget", vec![]);
+    config.guest_limits = HostLimits {
+        max_fuel: Some(1_000_000),
+        ..Default::default()
+    };
+    let fuel_node = start(config).await.unwrap();
+    let (status, body) = relay(&fuel_node, "burn", "spin", json!({"ms": 60_000})).await;
+    assert_eq!(status, 500, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("fuel"),
+        "{body}"
+    );
+    let id = ActorId {
+        app: "caller".into(),
+        ty: "relay".into(),
+        key: "burn".into(),
+    };
+    assert!(!fleet
+        .store
+        .list(&id.ltx_prefix())
+        .await
+        .unwrap()
+        .iter()
+        .any(|key| key.ends_with(".ltx")));
+    assert_eq!(
+        relay(&fuel_node, "burn", "calls", J::Null).await,
+        (200, json!({"result": 0}))
+    );
+    fuel_node.shutdown().await;
+
+    let mut config = hook_config(&fleet, "time-budget", vec![]);
+    config.guest_limits = HostLimits {
+        max_timeout_ms: Some(50),
+        ..Default::default()
+    };
+    let time_node = start(config).await.unwrap();
+    let began = std::time::Instant::now();
+    let (status, body) = relay(&time_node, "timeout", "spin", json!({"ms": 60_000})).await;
+    assert_eq!(status, 500, "{body}");
+    assert!(
+        body["error"]["message"].as_str().unwrap().contains("time"),
+        "{body}"
+    );
+    assert!(began.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        relay(&time_node, "timeout", "calls", J::Null).await,
+        (200, json!({"result": 0}))
+    );
+    time_node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn guest_budgets_concurrency_rejects_promptly_and_releases_reservations() {
+    use statex_runtime::limits::HostLimits;
+    let fleet = Fleet::new().await;
+    let (wasm, manifest) = caller();
+    deploy::deploy(
+        &fleet.store,
+        wasm,
+        manifest,
+        &deploy::DeployOptions::default(),
+    )
+    .await
+    .unwrap();
+    let mut config = hook_config(&fleet, "concurrent-budget", vec![]);
+    config.guest_limits = HostLimits {
+        max_concurrent: Some(1),
+        ..Default::default()
+    };
+    let node = start(config).await.unwrap();
+    let url = node.url();
+    let busy = tokio::spawn(async move {
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/apps/caller/actors/relay/busy/spin"))
+            .json(&json!({"ms": 400}))
+            .send()
+            .await
+            .unwrap();
+        response.status().as_u16()
+    });
+    assert!(
+        eventually(Duration::from_secs(2), || async {
+            node.node.app("caller").unwrap().active_executions() == 1
+        })
+        .await
+    );
+    let (status, body) = relay(&node, "another", "calls", J::Null).await;
+    assert_eq!(status, 429, "{body}");
+    assert_eq!(body["error"]["code"], "overloaded");
+    assert_eq!(busy.await.unwrap(), 200);
+    assert_eq!(node.node.app("caller").unwrap().active_executions(), 0);
+    assert_eq!(
+        relay(&node, "another", "calls", J::Null).await,
+        (200, json!({"result": 0}))
+    );
+
+    let began = std::time::Instant::now();
+    let (status, body) = relay(&node, "parent", "ping", json!({"path": ["child"]})).await;
+    assert_eq!(status, 422, "{body}");
+    assert!(
+        body["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("rejected:"),
+        "{body}"
+    );
+    assert!(
+        began.elapsed() < Duration::from_secs(1),
+        "nested admission must not wait behind its parent"
+    );
+    assert_eq!(node.node.app("caller").unwrap().active_executions(), 0);
+    // The counter app gets an independent slot even while caller is executing.
+    assert_eq!(
+        relay(
+            &node,
+            "parent",
+            "bump",
+            json!({"key": "separate-app", "by": 3})
+        )
+        .await,
+        (200, json!({"result": 3}))
+    );
+    node.shutdown().await;
+}

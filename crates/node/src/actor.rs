@@ -12,6 +12,7 @@ use statex_runtime::alarm::{self, Alarm};
 use statex_runtime::database::{BackendIdentity, DatabaseHandle, DynDatabaseFactory};
 use statex_runtime::{
     ActorCaller, ActorIdentity, ActorInstance, ActorRef, AppCode, CallError, CallOutput,
+    ExecutionAdmission,
 };
 use statex_store::{get_json, to_json_bytes, DynStore, ETag};
 
@@ -219,7 +220,7 @@ impl Actor {
             },
             operation,
             Caller::Embedded,
-            std::time::Duration::from_millis(code.manifest.limits.timeout_ms),
+            std::time::Duration::from_millis(code.effective_limits().timeout_ms),
         )?;
         self.execute_with_context(code, op, &context, &[])
     }
@@ -252,8 +253,15 @@ impl Actor {
                 chain,
             } => self.transaction(context, extensions, TransactionKind::Invocation, |a| {
                 let ty = a.id.ty.clone();
-                Ok(a.instance()?
-                    .call_with_context(&ty, &method, &args, &chain, context))
+                let admission = match a.code.admit_call(&ty, &method, &args, context) {
+                    Ok(admission) => admission,
+                    Err(error) => return Ok(Err(error)),
+                };
+                let instance = match a.instance(&admission, context) {
+                    Ok(instance) => instance,
+                    Err(error) => return Ok(Err(error)),
+                };
+                Ok(instance.call_admitted(&ty, &method, &args, &chain, context, admission))
             })?,
             Op::Alarm { now_ms } => self.fire_alarm(now_ms, context, extensions)?,
         };
@@ -374,7 +382,7 @@ impl Actor {
         Ok(())
     }
 
-    fn instance(&mut self) -> Result<&mut ActorInstance> {
+    fn instance(&mut self, admission: &ExecutionAdmission, context: &InvocationContext) -> Result<&mut ActorInstance, CallError> {
         if self.instance.is_none() {
             let identity = ActorIdentity {
                 app: self.id.app.clone(),
@@ -382,10 +390,12 @@ impl Actor {
                 key: self.id.key.clone(),
                 epoch: self.epoch,
             };
-            self.instance = Some(self.code.instantiate_with(
+            self.instance = Some(self.code.instantiate_admitted_with(
                 identity,
                 self.db.clone(),
                 self.caller.clone(),
+                admission,
+                context,
             )?);
         }
         Ok(self.instance.as_mut().unwrap())
@@ -431,13 +441,21 @@ impl Actor {
         }
         let (outcome, seg) =
             self.transaction(context, extensions, TransactionKind::Invocation, |a| {
+                let admission = match a.code.admit_alarm(&ty, context) {
+                    Ok(admission) => admission,
+                    Err(error) => return Ok(Err(error)),
+                };
                 a.db.lock().unwrap().clear_alarm()?;
-                Ok(a.instance()?
-                    .call_alarm_with_context(&ty, due.retry, context))
+                let instance = match a.instance(&admission, context) {
+                    Ok(instance) => instance,
+                    Err(error) => return Ok(Err(error)),
+                };
+                Ok(instance.call_alarm_admitted(&ty, due.retry, context, admission))
             })?;
         let error = match outcome {
             Ok(o) if !o.is_err => return Ok((ok(serde_json::json!({ "fired": true })), seg)),
             Ok(o) => format!("returned err: {}", o.value),
+            Err(e) if e.is_execution_limit() => return Ok((Err(e), None)),
             Err(e @ CallError::Rejected(_)) => return Ok((Err(e), None)),
             Err(e) => e.to_string(),
         };
@@ -640,7 +658,8 @@ mod tests {
                 )
                 .unwrap();
                 // Instantiate before the short deadline to isolate hook expiry.
-                actor.instance().unwrap();
+                let admission = code.admit_call("counter", "increment", &serde_json::json!({"by": 7}), &ctx).unwrap();
+                actor.instance(&admission, &ctx).unwrap();
             }
             let executed = actor
                 .execute_with_context(
@@ -1194,6 +1213,129 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn guest_limits_roll_back_initialization_migrations_and_alarm_without_txid_advance() {
+        use statex_runtime::Limits;
+        let dir = workdir();
+        let store = statex_store::open(dir.path().join("bucket").to_str().unwrap()).unwrap();
+        let (wasm, manifest) = component();
+        for (name, limits, message) in [
+            ("fuel", Limits { fuel: Some(1), ..Default::default() }, "fuel"),
+            ("memory", Limits { memory_mb: 1, ..Default::default() }, "memory"),
+        ] {
+            let runtime = Runtime::new().unwrap();
+            let healthy = runtime.load(wasm, manifest.clone()).unwrap();
+            let mut limited_manifest = manifest.clone();
+            limited_manifest.limits = limits;
+            let limited = runtime.load(wasm, limited_manifest).unwrap();
+            let id = ActorId { app: "counter".into(), ty: "counter".into(), key: name.into() };
+            let mut actor = activate(&store, dir.path(), &id, 1, "etag".into(), true,
+                limited.clone(), Arc::new(JsonFactory)).await.unwrap();
+            let result = actor.execute(&limited, Op::Call {
+                method: "increment".into(), args: serde_json::json!({"by": 7}), chain: vec![],
+            }).unwrap();
+            assert!(matches!(&result.outcome, Err(error @ CallError::Trap(text)) if error.is_execution_limit() && text.contains(message)),
+                "{name}: {:?}", result.outcome);
+            assert!(result.segment.is_none());
+            assert!(result.alarm.is_none());
+            assert_eq!(actor.txid, 0);
+            assert!(!actor.migrated);
+            assert!(actor.instance.is_none());
+            let ctx = context();
+            let (outcome, change) = actor.transaction(&ctx, &[], TransactionKind::Invocation, |a| {
+                {
+                    let mut db = a.db.lock().unwrap();
+                    db.execute("UPDATE counter SET value = value + ?1 WHERE id = 0", &[SqlValue::Integer(7)])?;
+                    db.set_alarm(100, 0, 1)?;
+                }
+                let admission = limited.admit_call("counter", "get", &J::Null, &ctx)?;
+                let instance = match a.instance(&admission, &ctx) {
+                    Ok(instance) => instance,
+                    Err(error) => return Ok(Err(error)),
+                };
+                Ok(instance.call_admitted("counter", "get", &J::Null, &[], &ctx, admission))
+            }).unwrap();
+            assert!(matches!(&outcome, Err(error) if error.is_execution_limit()));
+            assert!(change.is_none());
+            assert_eq!(actor.txid, 0);
+            assert!(!actor.migrated);
+            assert_eq!(actor.db.lock().unwrap().alarm().unwrap(), None);
+            assert_eq!(actor.db.lock().unwrap().query("SELECT value FROM counter WHERE id = 0", &[]).unwrap().rows,
+                vec![vec![SqlValue::Integer(0)]]);
+            actor.execute(&healthy, Op::Call {
+                method: "schedule".into(), args: serde_json::json!({"delay-ms": 0, "fail-times": 0}), chain: vec![],
+            }).unwrap().outcome.unwrap();
+            let alarm = actor.alarm;
+            let txid = actor.txid;
+            let result = actor.execute(&limited, Op::Alarm { now_ms: alarm.unwrap().at_ms }).unwrap();
+            assert!(matches!(&result.outcome, Err(error) if error.is_execution_limit()), "{:?}", result.outcome);
+            assert!(result.segment.is_none());
+            assert!(result.alarm.is_none());
+            assert_eq!(actor.txid, txid);
+            assert_eq!(actor.alarm, alarm);
+            assert_eq!(actor.db.lock().unwrap().alarm().unwrap(), alarm);
+            assert!(!actor.migrated);
+            assert!(actor.instance.is_none());
+            let result = actor.execute(&healthy, Op::Call { method: "get".into(), args: J::Null, chain: vec![] }).unwrap();
+            assert_eq!(result.outcome.unwrap().value, 0, "initialization trap must not leak an increment");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn quota_rejections_do_not_initialize_commit_migrations_or_consume_alarms() {
+        use statex_runtime::invocation::HookError;
+        use statex_runtime::Limits;
+        let dir = workdir();
+        let store = statex_store::open(dir.path().join("bucket").to_str().unwrap()).unwrap();
+        let (wasm, manifest) = component();
+        let initialized = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = initialized.clone();
+        let runtime = Runtime::builder().initialize_host(move |_| {
+            observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }).build().unwrap();
+        let mut limited_manifest = manifest.clone();
+        limited_manifest.limits = Limits { max_concurrent: Some(1), ..Default::default() };
+        let concurrent = runtime.load(wasm, limited_manifest.clone()).unwrap();
+        let admission = concurrent.admit_call("counter", "get", &J::Null, &context()).unwrap();
+        let id = ActorId { app: "counter".into(), ty: "counter".into(), key: "quota".into() };
+        let mut actor = activate(&store, dir.path(), &id, 1, "etag".into(), true,
+            concurrent.clone(), Arc::new(JsonFactory)).await.unwrap();
+        let result = actor.execute(&concurrent, Op::Call {
+            method: "increment".into(), args: serde_json::json!({"by": 7}), chain: vec![],
+        }).unwrap();
+        assert!(matches!(result.outcome, Err(CallError::Rejected(HookError::Overloaded(_)))));
+        assert!(result.segment.is_none());
+        assert_eq!(actor.txid, 0);
+        assert!(!actor.migrated);
+        assert!(actor.instance.is_none());
+        assert_eq!(initialized.load(std::sync::atomic::Ordering::SeqCst), 0,
+            "a denied fresh call must not initialize the component");
+        drop(admission);
+        let result = actor.execute(&concurrent, Op::Call {
+            method: "schedule".into(), args: serde_json::json!({"delay-ms": 0, "fail-times": 0}), chain: vec![],
+        }).unwrap();
+        result.outcome.unwrap();
+        let alarm = actor.alarm;
+        let txid = actor.txid;
+        // The new deployment's scope allows one attempt. An alarm shares that
+        // bucket and must leave already committed state unchanged on denial.
+        let rate_runtime = Runtime::new().unwrap();
+        limited_manifest.limits = Limits { rps: Some(1), burst: Some(1), ..Default::default() };
+        let rate = rate_runtime.load(wasm, limited_manifest.clone()).unwrap();
+        let redeployed = rate_runtime.load(wasm, limited_manifest).unwrap();
+        actor.execute(&rate, Op::Call { method: "get".into(), args: J::Null, chain: vec![] }).unwrap().outcome.unwrap();
+        let result = actor.execute(&redeployed, Op::Alarm { now_ms: alarm.unwrap().at_ms }).unwrap();
+        assert!(matches!(result.outcome, Err(CallError::Rejected(HookError::RateLimited(_)))));
+        assert!(result.segment.is_none());
+        assert!(result.alarm.is_none());
+        assert_eq!(actor.txid, txid);
+        assert_eq!(actor.alarm, alarm);
+        assert_eq!(actor.db.lock().unwrap().alarm().unwrap(), alarm);
+        assert!(actor.instance.is_none());
+        assert!(!actor.migrated);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn infallible_alarm_import_errors_trap_and_roll_back_transaction() {
         let dir = workdir();
         let store = statex_store::open(dir.path().join("bucket").to_str().unwrap()).unwrap();
@@ -1223,8 +1365,9 @@ mod tests {
             )
             .await
             .unwrap();
+            let ctx = context();
             let (outcome, change) = actor
-                .transaction(&context(), &[], TransactionKind::Invocation, |a| {
+                .transaction(&ctx, &[], TransactionKind::Invocation, |a| {
                     {
                         let mut db = a.db.lock().unwrap();
                         db.execute(
@@ -1233,7 +1376,8 @@ mod tests {
                         )?;
                         db.set_alarm(100, 0, 1)?;
                     }
-                    Ok(a.instance()?.call("counter", method, &J::Null))
+                    let admission = code.admit_call("counter", method, &J::Null, &ctx)?;
+                    Ok(a.instance(&admission, &ctx)?.call_admitted("counter", method, &J::Null, &[], &ctx, admission))
                 })
                 .unwrap();
             match outcome {

@@ -91,6 +91,7 @@ leases, epochs, and fencing; adapters supply the implementations.
 | Transactional actor state and recovery | SQLite with WAL/page-log replication | [State backends](docs/extensions/state-backends.md) |
 | Admission, ACLs, commit policies, and lifecycle | Ordered no-op extension chain | [Invocation hooks](docs/extensions/invocation-hooks.md) |
 | Runtime-only per-guest execution | Ordered no-op execution chain | [Runtime hooks](docs/extensions/runtime-hooks.md) |
+| Guest execution budgets | 64 MiB memory and 5 s timeout; optional fuel/rate/concurrency caps | [Execution limits](docs/extensions/execution-limits.md) |
 | Additional guest-to-host capabilities | Standard `statex:host` WIT imports | [Host capabilities](docs/extensions/host-capabilities.md) |
 | Calls between actors | Node ownership-aware routing | [Actor callers](docs/extensions/actor-callers.md) |
 | Outbound HTTP and host logs | ureq and tracing | [Host services](docs/extensions/host-services.md) |

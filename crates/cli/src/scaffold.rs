@@ -76,6 +76,11 @@ allow = []
 [limits]
 timeout_ms = 5000
 memory_mb = 64
+# Optional per-invocation fuel and per-app/node rate/concurrency budgets:
+# fuel = 10000000
+# rps = 100
+# burst = 100
+# max_concurrent = 16
 
 # Python actors are compiled to a WebAssembly component with componentize-py
 # (pip install {COMPONENTIZE_PY}, or let uvx fetch it).
@@ -276,6 +281,11 @@ allow = []
 [limits]
 timeout_ms = 5000
 memory_mb = 64
+# Optional per-invocation fuel and per-app/node rate/concurrency budgets:
+# fuel = 10000000
+# rps = 100
+# burst = 100
+# max_concurrent = 16
 "#
         ),
     )?;

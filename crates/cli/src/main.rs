@@ -157,6 +157,8 @@ enum Cmd {
         /// Seconds of inactivity after which an actor is released.
         #[arg(long, default_value_t = 300)]
         idle_timeout: u64,
+        #[command(flatten)]
+        guest_limits: GuestLimitArgs,
     },
     /// Call a method: statex call counter alice increment '{"by": 2}'
     Call {
@@ -294,6 +296,41 @@ struct Target {
     /// App name (defaults to the app of the current project).
     #[arg(long, env = "STATEX_APP")]
     app: Option<String>,
+}
+
+#[derive(clap::Args, Debug, Default)]
+struct GuestLimitArgs {
+    /// Platform ceiling on guest execution timeout per invocation.
+    #[arg(long, env = "STATEX_MAX_GUEST_TIMEOUT_MS")]
+    max_guest_timeout_ms: Option<u64>,
+    /// Platform ceiling on aggregate WASM linear memory per actor instance.
+    #[arg(long, env = "STATEX_MAX_GUEST_MEMORY_MB")]
+    max_guest_memory_mb: Option<u64>,
+    /// Platform ceiling on WASM instruction fuel per invocation.
+    #[arg(long, env = "STATEX_MAX_GUEST_FUEL")]
+    max_guest_fuel: Option<u64>,
+    /// Guest invocation rate ceiling, independently per app on this node.
+    #[arg(long, env = "STATEX_MAX_GUEST_RPS")]
+    max_guest_rps: Option<u32>,
+    /// Token-bucket burst ceiling.
+    #[arg(long, env = "STATEX_MAX_GUEST_BURST")]
+    max_guest_burst: Option<u32>,
+    /// Concurrent guest execution ceiling, independently per app on this node.
+    #[arg(long, env = "STATEX_MAX_GUEST_CONCURRENT")]
+    max_guest_concurrent: Option<u32>,
+}
+
+impl GuestLimitArgs {
+    fn into_limits(self) -> statex_runtime::limits::HostLimits {
+        statex_runtime::limits::HostLimits {
+            max_timeout_ms: self.max_guest_timeout_ms,
+            max_memory_mb: self.max_guest_memory_mb,
+            max_fuel: self.max_guest_fuel,
+            max_rps: self.max_guest_rps,
+            max_burst: self.max_guest_burst,
+            max_concurrent: self.max_guest_concurrent,
+        }
+    }
 }
 
 impl Target {
@@ -447,7 +484,7 @@ async fn run(cli: Cli) -> Result<()> {
                 println!("wrote {dir}/ ({n} app{})", if n == 1 { "" } else { "s" });
             }
         }
-        Cmd::Node { store, listen, internal_listen, advertise, node_id, data_dir, lease_ttl, idle_timeout } => {
+        Cmd::Node { store, listen, internal_listen, advertise, node_id, data_dir, lease_ttl, idle_timeout, guest_limits } => {
             let node_id = node_id.unwrap_or_else(|| {
                 let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "node".into());
                 format!("{host}-{}", listen.port())
@@ -459,6 +496,7 @@ async fn run(cli: Cli) -> Result<()> {
             cfg.lease_ttl = Duration::from_secs(lease_ttl);
             cfg.idle_timeout = Duration::from_secs(idle_timeout);
             cfg.exit_on_fence = true;
+            cfg.guest_limits = guest_limits.into_limits();
             let mut h = statex_node::start(cfg).await?;
             tracing::info!(url = %h.url(), internal = %h.internal_addr, "node ready");
             tokio::select! {
@@ -855,6 +893,25 @@ async fn dev(port: u16, clean: bool, workspace: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_accepts_platform_guest_ceilings() {
+        let cli = Cli::try_parse_from([
+            "statex", "node", "--store", "./data",
+            "--max-guest-timeout-ms", "40", "--max-guest-memory-mb", "8",
+            "--max-guest-fuel", "10000", "--max-guest-rps", "2",
+            "--max-guest-burst", "1", "--max-guest-concurrent", "3",
+        ]).unwrap();
+        let Cmd::Node { guest_limits, .. } = cli.cmd else { panic!("expected node command"); };
+        let limits = guest_limits.into_limits();
+        assert_eq!(limits.max_timeout_ms, Some(40));
+        assert_eq!(limits.max_memory_mb, Some(8));
+        assert_eq!(limits.max_fuel, Some(10000));
+        assert_eq!(limits.max_rps, Some(2));
+        assert_eq!(limits.max_burst, Some(1));
+        assert_eq!(limits.max_concurrent, Some(3));
+        limits.validate().unwrap();
+    }
 
     #[test]
     fn new_is_standalone_unless_workspace_is_explicit() {

@@ -123,15 +123,36 @@ pub struct HttpPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub timeout_ms: u64,
     pub memory_mb: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuel: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 }
 
 impl Default for Limits {
     fn default() -> Self {
-        Self { timeout_ms: 5_000, memory_mb: 64 }
+        Self { timeout_ms: 5_000, memory_mb: 64, fuel: None, rps: None, burst: None, max_concurrent: None }
+    }
+}
+
+impl Limits {
+    pub fn validate(&self) -> Result<()> {
+        crate::limits::validate_timeout(self.timeout_ms)?;
+        crate::limits::memory_bytes(self.memory_mb)?;
+        anyhow::ensure!(self.fuel != Some(0), "fuel must be positive");
+        anyhow::ensure!(self.rps != Some(0), "rps must be positive");
+        anyhow::ensure!(self.burst != Some(0), "burst must be positive");
+        anyhow::ensure!(self.max_concurrent != Some(0), "max_concurrent must be positive");
+        anyhow::ensure!(self.burst.is_none() || self.rps.is_some(), "burst requires rps");
+        Ok(())
     }
 }
 
@@ -182,6 +203,7 @@ impl Manifest {
         limits: Limits,
         additional_imports: &[String],
     ) -> Result<Manifest> {
+        limits.validate()?;
         validate_app_name(app)?;
         let ins = inspect_with_imports(wasm, additional_imports)?;
         let bad = unprovided_imports(&ins, additional_imports);
