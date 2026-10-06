@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::json;
 use statex_runtime::*;
+use statex_runtime::sqlite::{apply_migrations, open_db};
 
 fn counter_wasm() -> Vec<u8> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../examples/counter");
@@ -62,7 +63,7 @@ fn invoke_counter_and_account() {
         let applied = apply_migrations(&conn, &m.migrations[t]).unwrap();
         assert_eq!(applied.first().map(String::as_str), Some("0001_init.sql"));
         let id = ActorIdentity { app: "counter".into(), actor_type: t.into(), key: "alice".into(), epoch: 1 };
-        app.instantiate(id, Arc::new(Mutex::new(conn))).unwrap()
+        app.instantiate(id, database::sqlite_handle(Arc::new(Mutex::new(conn)))).unwrap()
     };
     let mut actor = open("counter");
 
@@ -97,7 +98,7 @@ fn alarm_handler_is_private_and_callable_by_the_host() {
     let db = Arc::new(Mutex::new(rusqlite::Connection::open_in_memory().unwrap()));
     apply_migrations(&db.lock().unwrap(), &m.migrations["counter"]).unwrap();
     let id = ActorIdentity { app: "counter".into(), actor_type: "counter".into(), key: "t".into(), epoch: 7 };
-    let mut inst = app.instantiate(id, db.clone()).unwrap();
+    let mut inst = app.instantiate(id, database::sqlite_handle(db.clone())).unwrap();
     assert!(inst.has_alarm_handler("counter"));
     assert!(matches!(inst.call("counter", "alarm", &json!({ "retry-count": 0 })), Err(CallError::NotFound(_))));
 

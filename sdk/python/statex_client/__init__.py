@@ -12,9 +12,12 @@ from ._runtime import (  # noqa: F401
     BadRequest,
     Actor,
     Conflict,
+    HttpBackend,
+    HttpResponse,
     MethodError,
     NotFound,
     StatexError,
     Transport,
+    UrllibBackend,
     Unavailable,
 )

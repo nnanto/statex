@@ -1,5 +1,11 @@
 # Guarantees and failure semantics
 
+These guarantees require a conforming object store and transactional state
+backend. The defaults use local files and SQLite; other implementations must
+uphold the same [object-store](extensions/object-stores.md) and
+[state-backend](extensions/state-backends.md) contracts. Interface
+implementation alone is not evidence of distributed-system correctness.
+
 ## Single writer per actor
 
 At most one node executes calls for an actor at a time, and once a newer owner
@@ -14,7 +20,8 @@ mechanisms:
 
 A successful response (2xx) is sent only after:
 
-1. the transaction's WAL segment has been written to the object store,
+1. the transaction's recoverable change has been written to the object store
+   (a WAL page segment for the SQLite backend),
 2. the node's lease is still valid (with margin), **and**
 3. `owner.json` still names this node, session and epoch.
 
@@ -57,17 +64,53 @@ Any write that was acknowledged therefore survives:
 | 200 | – | `{"result": ...}`. For `result<T, E>` methods this is the `ok` value |
 | 201 | – | Actor created (`_create`) |
 | 400 | `bad_request` | Invalid JSON or arguments that do not match the WIT signature |
+| 400 | `extension_invalid` | An invocation extension rejected input |
+| 401 / 403 | `unauthorized` / `forbidden` | Authentication or policy rejected the invocation |
 | 404 | `not_found` | Unknown app, actor type or method |
 | 409 | `conflict` | `_create` on an existing actor |
 | 422 | `method_error` | The method returned `err(E)`; `error.detail` holds E. The transaction is rolled back |
 | 500 | `trap` / `internal` | The guest trapped (panic, timeout, out of memory); the transaction is rolled back |
+| 500 | `extension_error` | A critical hook failed or panicked; no guest transaction is committed |
 | 503 | `unavailable` | Ownership could not be established or confirmed; retry. The outcome of a write is unknown |
+| 503 / 504 | `extension_unavailable` / `extension_timeout` | A critical hook failed or exceeded its budget; no guest transaction is committed |
 | 508 | `cycle` | An actor-to-actor call would re-enter an actor on its call chain, or the chain is too deep |
 
 ## Migrations
 
 - Each actor type has its own ordered `migrations/<type>/*.sql`.
-- Pending migrations are applied lazily inside the transaction of the first call after activation, or after a deploy that adds migrations.
-- They are therefore atomic with that call and durable through the same WAL segment.
-- Applied migrations are recorded in `_statex_migrations`.
+- Pending migrations are applied by the state backend lazily inside the transaction of the first call after activation, or after a deploy that adds migrations.
+- They are therefore atomic with that call and durable through the same change record.
+- The SQLite backend records applied migrations in `_statex_migrations`.
 - Migrations are append-only: never edit or reorder an applied file. Add a new one instead.
+
+## Extension responsibilities
+
+Custom state backends must atomically commit or roll back SQL, migrations and
+alarms together and restore exactly the committed state represented by a
+snapshot plus its ordered changes. A backend format mismatch is an activation
+failure, not permission to start a fresh actor. Changing engines requires an
+explicit data migration; using a different factory does not convert data.
+
+Custom host capabilities, HTTP transports, log sinks and client transports
+must report errors and respect caller budgets. Native adapters are trusted:
+WASM limits do not interrupt arbitrary blocking native I/O. Additional host
+effects and actor-local extension memory are not rolled back or checkpointed.
+Guest/client adapters must preserve method-error and unknown-outcome
+distinctions rather than treating a failed call as success.
+
+Invocation extensions cannot replace routing, transaction control, capture,
+or acknowledgement. Admission rejection precedes actor-state side effects;
+owner rejection precedes activation and migrations. A before-commit veto
+rolls back guest, migrations, alarms, and hook writes together and discards
+the component instance. Actor callers receive explicit `rejected` errors,
+not an unknown-outcome transport failure. Hooks and request IDs do not
+deduplicate repeated deliveries or provide distributed exactly-once semantics.
+
+Native hooks must bound their own blocking work. Async owner checks use
+timeouts and are followed by lease checks; read-only results also require a
+current lease and ownership record. Caller cancellation does not abandon an
+in-progress commit/capture/upload sequence. Completion and lifecycle
+observers are non-vetoing, best-effort notifications, not a durable event bus.
+External hook effects and typed local data are not rolled back. See
+[invocation hooks](extensions/invocation-hooks.md) and
+[runtime hooks](extensions/runtime-hooks.md) for phase and trust boundaries.

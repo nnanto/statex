@@ -9,13 +9,17 @@ use crate::workspace::{relative, slash, Workspace};
 
 use crate::project::Project;
 
-/// Location of the guest SDK crate, for path dependencies in new projects.
+/// Explicit SDK location; never embed the machine where the CLI was built.
 pub fn default_sdk_path() -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("STATEX_GUEST_PATH") {
-        return Some(PathBuf::from(p));
+    std::env::var_os("STATEX_GUEST_PATH").map(PathBuf::from)
+}
+
+fn actor_name(actor: &str) -> Result<()> {
+    validate_name("actor type", actor)?;
+    if !crate::calls::is_wit_id(actor) {
+        bail!("actor type {actor:?} cannot be named in WIT: use lowercase words separated by single dashes, each word starting with a letter");
     }
-    let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("../guest");
-    p.canonicalize().ok()
+    Ok(())
 }
 
 pub const HOST_WIT: &str = include_str!("../../../wit/statex-host.wit");
@@ -37,7 +41,7 @@ fn on_path(bin: &str) -> bool {
 /// WIT and `statex.py` are linked from the workspace instead of copied.
 pub fn new_python_project(name: &str, dir: &Path, actor: &str, ws: Option<&Workspace>) -> Result<()> {
     validate_app_name(name)?;
-    validate_name("actor type", actor)?;
+    actor_name(actor)?;
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         bail!("{} already exists and is not empty", dir.display());
     }
@@ -104,7 +108,9 @@ world app {{
 
   export {actor};
 }}
-"#
+"#,
+            slug = crate::calls::wid(&slug),
+            actor = crate::calls::wid(actor),
         ),
     )?;
     ensure_host_wit(dir, ws)?;
@@ -193,22 +199,42 @@ fn snake(s: &str) -> String {
     s.replace('-', "_")
 }
 
+fn export_package(slug: &str) -> String {
+    if crate::calls::rid(slug) != snake(slug) {
+        format!("app-{slug}")
+    } else {
+        slug.to_string()
+    }
+}
+
 /// A Rust project. Inside a workspace it joins the apps' Cargo workspace and
 /// depends on the workspace's statex-guest crate by relative path.
 pub fn new_project(name: &str, dir: &Path, actor: &str, sdk: Option<PathBuf>, ws: Option<&Workspace>) -> Result<()> {
     validate_app_name(name)?;
-    validate_name("actor type", actor)?;
+    actor_name(actor)?;
     if dir.exists() && std::fs::read_dir(dir)?.next().is_some() {
         bail!("{} already exists and is not empty", dir.display());
     }
-    std::fs::create_dir_all(dir)?;
     let slug = name.replace('/', "-");
+    let package = export_package(&slug);
     let sdk = match ws {
-        Some(ws) => ws.reach(dir, &ws.cfg.guest_sdk).context("locate the workspace's statex-guest crate (guest_sdk)")?,
-        None => sdk.or_else(default_sdk_path).context("cannot locate the statex-guest crate; pass --sdk <path>")?,
+        Some(ws) if sdk.is_none() => ws.path(&ws.cfg.guest_sdk),
+        _ => sdk.or_else(default_sdk_path).context("standalone Rust scaffolding needs --sdk <statex-guest path> or STATEX_GUEST_PATH; no published SDK version is assumed")?,
     };
+    let sdk = sdk.canonicalize().with_context(|| format!("locate statex-guest at {}", sdk.display()))?;
+    let sdk_manifest: toml::Value = toml::from_str(&std::fs::read_to_string(sdk.join("Cargo.toml")).context("read SDK Cargo.toml")?)?;
+    if sdk_manifest["package"]["name"].as_str() != Some("statex-guest") {
+        bail!("{} is not the statex-guest crate", sdk.display());
+    }
+    std::fs::create_dir_all(dir)?;
+    let sdk = relative(dir, &sdk)?;
+    let shared_cargo = ws.is_some_and(|ws| {
+        dir.canonicalize().is_ok_and(|dir| {
+            ws.apps_dir().canonicalize().is_ok_and(|apps| dir != apps && dir.starts_with(apps))
+        })
+    });
     // A standalone project is its own Cargo workspace; workspace apps share one.
-    let standalone = if ws.is_some() {
+    let standalone = if shared_cargo {
         ""
     } else {
         "\n[profile.release]\nopt-level = \"s\"\nlto = true\nstrip = true\n\n[workspace]\n"
@@ -230,10 +256,10 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-statex-guest = {{ path = "{sdk}" }}
+statex-guest = {{ path = {sdk} }}
 wit-bindgen = "0.62"
 {standalone}"#,
-            sdk = slash(&sdk)
+            sdk = format!("{:?}", slash(&sdk))
         ),
     )?;
     w(
@@ -270,9 +296,12 @@ interface {actor} {{
 world app {{
   export {actor};
 }}
-"#
+"#,
+            slug = crate::calls::wid(&package),
+            actor = crate::calls::wid(actor),
         ),
     )?;
+    ensure_host_wit(dir, ws)?;
     w(
         &format!("migrations/{actor}/0001_init.sql"),
         format!(
@@ -321,12 +350,12 @@ mod tests {{
     }}
 }}
 "#,
-            pkg = snake(&slug),
-            m = snake(actor),
+            pkg = crate::calls::rid(&package),
+            m = crate::calls::rid(actor),
             t = snake(actor),
         ),
     )?;
-    match ws {
+    match ws.filter(|_| shared_cargo) {
         Some(ws) => {
             w(".gitignore", "/.statex\n".into())?;
             add_cargo_member(ws, dir)?;
@@ -412,10 +441,11 @@ fn link_dir(target: &Path, rel: &Path, link: &Path) -> Result<()> {
 
 /// Adds a new actor type: WIT interface + world export, a migration and a Rust stub.
 pub fn add_actor(project: &Project, actor: &str) -> Result<()> {
-    validate_name("actor type", actor)?;
+    actor_name(actor)?;
     let wit_path = project.root.join("wit/app.wit");
     let wit = std::fs::read_to_string(&wit_path).context("read wit/app.wit")?;
-    if wit.contains(&format!("interface {actor} ")) || wit.contains(&format!("interface {actor}{{")) {
+    let actor_wit = crate::calls::wid(actor);
+    if wit.contains(&format!("interface {actor_wit} ")) || wit.contains(&format!("interface {actor_wit}{{")) {
         bail!("wit/app.wit already defines interface {actor}");
     }
     let (ns, pkg) = wit
@@ -425,7 +455,7 @@ pub fn add_actor(project: &Project, actor: &str) -> Result<()> {
             let p = p.trim_end_matches(';');
             let p = p.split('@').next()?;
             let (ns, pkg) = p.split_once(':')?;
-            Some((ns.to_string(), pkg.to_string()))
+            Some((ns.trim_start_matches('%').to_string(), pkg.trim_start_matches('%').to_string()))
         })
         .context("wit/app.wit has no `package ns:name;` line")?;
     let world_at = wit.find("\nworld ").context("wit/app.wit has no world")? + 1;
@@ -433,10 +463,11 @@ pub fn add_actor(project: &Project, actor: &str) -> Result<()> {
     let mut out = String::new();
     out.push_str(&wit[..world_at]);
     out.push_str(&format!(
-        "/// TODO: describe the `{actor}` actor type.\ninterface {actor} {{\n  /// Stores a value.\n  set: func(value: string);\n  /// Returns the stored value, if any.\n  get: func() -> option<string>;\n}}\n\n"
+        "/// TODO: describe the `{actor}` actor type.\ninterface {} {{\n  /// Stores a value.\n  set: func(value: string);\n  /// Returns the stored value, if any.\n  get: func() -> option<string>;\n}}\n\n",
+        crate::calls::wid(actor)
     ));
     out.push_str(&wit[world_at..close]);
-    out.push_str(&format!("  export {actor};\n"));
+    out.push_str(&format!("  export {};\n", crate::calls::wid(actor)));
     out.push_str(&wit[close..]);
     std::fs::write(&wit_path, out)?;
 
@@ -487,9 +518,9 @@ class {cls}(exports.{cls}):
 }}
 
 "#,
-        ns = snake(&ns),
-        pkg = snake(&pkg),
-        m = snake(actor)
+        ns = crate::calls::rid(&ns),
+        pkg = crate::calls::rid(&pkg),
+        m = crate::calls::rid(actor)
     );
     let new_src = match src.find("export!(") {
         Some(i) => format!("{}{stub}{}", &src[..i], &src[i..]),
@@ -497,4 +528,114 @@ class {cls}(exports.{cls}):
     };
     std::fs::write(&lib, new_src)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sdk() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../guest").canonicalize().unwrap()
+    }
+
+    #[test]
+    fn standalone_rust_uses_explicit_sdk_and_independent_directory() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let root = d.path().join("unrelated-directory");
+        new_project("shop", &root, "counter", Some(sdk()), None).unwrap();
+        let p = Project::find(&root).unwrap();
+        assert_eq!(p.app(), "shop");
+        assert_eq!(p.source_surface().unwrap().0[0].name, "counter");
+        let cargo: toml::Value = toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        assert!(cargo.get("workspace").is_some());
+        let dep = cargo["dependencies"]["statex-guest"]["path"].as_str().unwrap();
+        assert_eq!(root.join(dep).canonicalize().unwrap(), sdk());
+        assert!(!Path::new(dep).is_absolute());
+        assert!(check::check(&p, None, None, false).errors.is_empty());
+    }
+
+    #[test]
+    fn workspace_names_are_independent_of_depth_and_directory() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let ws = Workspace {
+            root: d.path().canonicalize().unwrap(),
+            cfg: crate::workspace::WorkspaceToml {
+                guest_sdk: sdk(),
+                host_wit: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit").canonicalize().unwrap(),
+                ..Default::default()
+            },
+        };
+        std::fs::create_dir_all(ws.apps_dir()).unwrap();
+        for (name, path) in [("shop", "deep/arbitrary/source"), ("payments/ledger", "one-folder")] {
+            let root = ws.apps_dir().join(path);
+            new_project(name, &root, "counter", None, Some(&ws)).unwrap();
+            let p = Project::find(&root).unwrap();
+            assert_eq!(p.app(), name);
+            assert!(check::check(&p, Some(&ws), None, false).errors.is_empty());
+            let cargo: toml::Value = toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+            assert!(cargo.get("workspace").is_none());
+            assert!(p.wasm_path().unwrap().starts_with(ws.apps_dir().join("target")));
+        }
+        assert_eq!(ws.projects().unwrap().len(), 2);
+        let caller = Project::find(&ws.apps_dir().join("one-folder")).unwrap();
+        assert_eq!(crate::calls::callee_root(&caller, Some(&ws), "shop").unwrap().unwrap(), ws.apps_dir().join("deep/arbitrary/source"));
+        assert!(crate::registry::generate(&ws).unwrap().contains_key(Path::new("shop.wit")));
+    }
+
+    #[test]
+    fn outside_discovery_root_can_use_workspace_dependencies() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let ws = Workspace {
+            root: d.path().canonicalize().unwrap(),
+            cfg: crate::workspace::WorkspaceToml {
+                guest_sdk: sdk(),
+                host_wit: Path::new(env!("CARGO_MANIFEST_DIR")).join("../../wit").canonicalize().unwrap(),
+                ..Default::default()
+            },
+        };
+        let root = ws.root.join("custom/source");
+        new_project("payments/shop", &root, "counter", None, Some(&ws)).unwrap();
+        let p = Project::find(&root).unwrap();
+        assert!(check::check(&p, Some(&ws), None, false).errors.is_empty());
+        let cargo: toml::Value = toml::from_str(&std::fs::read_to_string(root.join("Cargo.toml")).unwrap()).unwrap();
+        assert!(cargo.get("workspace").is_some());
+        assert!(ws.projects().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keyword_names_produce_valid_wit_and_rust_identifiers() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let root = d.path().join("keyword");
+        new_project("type", &root, "match", Some(sdk()), None).unwrap();
+        let p = Project::find(&root).unwrap();
+        assert_eq!(p.source_surface().unwrap().0[0].name, "match");
+        assert!(std::fs::read_to_string(root.join("src/lib.rs")).unwrap().contains("exports::local::app_type::match_"));
+        add_actor(&p, "interface").unwrap();
+        assert_eq!(p.source_surface().unwrap().0.len(), 2);
+    }
+
+    #[test]
+    fn standalone_python_copies_helpers_and_keeps_name() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let root = d.path().join("python-code");
+        new_python_project("shop", &root, "counter", None).unwrap();
+        let p = Project::find(&root).unwrap();
+        assert_eq!(p.app(), "shop");
+        assert!(root.join("statex.py").is_file());
+        assert!(root.join("statex_testing.py").is_file());
+        assert!(!std::fs::symlink_metadata(root.join("wit/deps/statex-host")).unwrap().file_type().is_symlink());
+        assert!(check::check(&p, None, None, false).errors.is_empty());
+    }
+
+    #[test]
+    fn bad_sdk_and_wit_names_do_not_create_partial_projects() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let root = d.path().join("app");
+        assert!(new_project("shop", &root, "counter", Some(d.path().join("missing-sdk")), None).is_err());
+        assert!(!root.exists());
+        assert!(new_project("a--b", &root, "counter", Some(sdk()), None).is_err());
+        assert!(!root.exists());
+    }
+
+    use crate::check;
 }

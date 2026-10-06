@@ -1,13 +1,17 @@
 # statex
 
-statex is a stateful execution engine for WebAssembly.
+statex is an extensible stateful actor framework for WebAssembly. Start with
+SQLite, a local filesystem object store, and the standard WASI host; inject
+your own implementations as your application grows.
 
 You write a **actor type** as a WIT interface and implement it in a WASM
 component. Each actor type can have any number of **actors**, one per key, for
-example `counter("alice")`. Every actor has its own private SQLite database.
+example `counter("alice")`. Every actor has its own private transactional
+state (SQLite by default).
 
 - Any node can serve any call, because a node that does not own the actor forwards the call to the node that does.
-- Ownership is coordinated with leases and epochs stored in an object store (Azure Blob/ADLS, or a local directory), using compare-and-swap writes.
+- Ownership is coordinated with leases and epochs through the `ObjectStore`
+  interface, using compare-and-swap writes. No cloud provider is required.
 - A write is made durable in the object store before it is acknowledged.
 
 ```python
@@ -33,39 +37,77 @@ the given time, waking the actor on some node if it is not loaded (see the
 ```sh
 rustup target add wasm32-wasip2
 cargo install --path crates/cli          # installs `statex`
+export STATEX_GUEST_PATH="$PWD/crates/guest"  # SDK checkout for standalone Rust apps
 
-# apps live in this repo under apps/<team>/<app>
-statex new demo/hello                    # -> apps/demo/hello, with a `counter` actor type (--lang python for Python)
-cd apps/demo/hello
+mkdir my-projects && cd my-projects
+statex new hello                         # standalone app; --lang python for Python
+cd hello
 cargo test                               # unit tests against an in-process mock host
 statex dev                               # local node on :9876, rebuilds on change
 statex call counter alice increment -a by=2
-curl -X POST localhost:9876/v1/apps/demo/hello/actors/counter/alice/get
-statex codegen python                    # -> demo_hello_client.py (typed, stdlib only)
-statex check --all && statex registry build   # before committing
+curl -X POST localhost:9876/v1/apps/hello/actors/counter/alice/get
+statex codegen python                    # -> hello_client.py (typed, stdlib only)
+statex check
 ```
 
 When you are ready for a cluster:
 
 ```sh
-export STATEX_STORE=az://statex            # or a local path shared by the nodes
+export STATEX_STORE=/path/to/shared/store  # local development; inject a production store when embedding
 statex diagnose                            # checks the store's conditional-write semantics
 statex node --advertise http://10.0.0.5:9876 &   # on every node
 statex deploy                              # from the project directory
 ```
 
-Teams add their apps to this repo. `statex new team/app` creates
-`apps/team/app`, linked to the host WIT and SDKs in this repo.
-`statex check --all --against origin/main` and `statex registry build --check`
-gate PRs (name/path consistency and breaking changes). Incompatible
-deploys are refused.
+Applications do not have to live in this repository or carry a team prefix.
+Workspaces and registries are optional conveniences for multi-app projects;
+namespaced apps remain supported. Incompatible deployments are refused.
 See [Monorepo workspaces](docs/developer-guide.md#monorepo-workspaces).
+
+## Embed and extend
+
+Use the `statex` crate as a small entry point, or depend directly on the
+individual crates. Until packages are published, use path dependencies to
+this checkout.
+
+```rust,no_run
+# async fn example() -> anyhow::Result<()> {
+let config = statex::local_config("./statex-data", "local")?;
+let node = statex::start(config).await?;
+// Publish a component with statex::deploy::deploy, or use the CLI.
+println!("Actor endpoint: {}", node.url());
+node.shutdown().await;
+# Ok(())
+# }
+```
+
+Extension contracts are small, explicit interfaces rather than a plugin
+loader. The node retains serialization, durability-before-acknowledgement,
+leases, epochs, and fencing; adapters supply the implementations.
+
+| Boundary | Default | Guide |
+|---|---|---|
+| Shared coordination and durable objects | `LocalFsStore` (Azure adapter also included) | [Object stores](docs/extensions/object-stores.md) |
+| Transactional actor state and recovery | SQLite with WAL/page-log replication | [State backends](docs/extensions/state-backends.md) |
+| Admission, ACLs, commit policies, and lifecycle | Ordered no-op extension chain | [Invocation hooks](docs/extensions/invocation-hooks.md) |
+| Runtime-only per-guest execution | Ordered no-op execution chain | [Runtime hooks](docs/extensions/runtime-hooks.md) |
+| Additional guest-to-host capabilities | Standard `statex:host` WIT imports | [Host capabilities](docs/extensions/host-capabilities.md) |
+| Calls between actors | Node ownership-aware routing | [Actor callers](docs/extensions/actor-callers.md) |
+| Outbound HTTP and host logs | ureq and tracing | [Host services](docs/extensions/host-services.md) |
+| Guest-side capability adapters | WASM imports; native mock host for tests | [Guest adapters](docs/extensions/guest-adapters.md) |
+| Python client HTTP transport | Standard-library transport | [Client transports](docs/extensions/client-transports.md) |
+| Application names and project layout | Standalone project with an explicit name | [Application names](docs/extensions/application-names.md) |
+
+Third-party implementations must uphold their contract; replacing a backend
+does not make a weakly consistent store safe or turn external side effects
+into transactions. See [guarantees](docs/guarantees.md).
 
 ## Layout
 
 | Path | What |
 |---|---|
 | `wit/statex-host.wit` | The host contract (`context`, `sql`, `http-client`, `log`, `actors`) |
+| `crates/statex` | Library entry point, local defaults, and reexports |
 | `crates/store` | `ObjectStore` trait with conditional writes; local-fs and Azure Blob backends |
 | `crates/ltx` | WAL-frame capture, segment codec, restore planning |
 | `crates/runtime` | wasmtime host: WIT/JSON mapping, limits, host imports, compatibility rules |
@@ -78,7 +120,7 @@ See [Monorepo workspaces](docs/developer-guide.md#monorepo-workspaces).
 | `examples/python-caller` | Python: typed calls to a Rust app and between its own actors, tested with `statex test` stubs |
 | `examples/python-counter` | Python (componentize-py): `counter` and `profile` actor types |
 | `sdk/python-guest/` | Python guest helper (`statex.py`) and mock host for tests (`statex_testing.py`); `statex new --lang python` vendors them into standalone projects and links them in workspaces |
-| `apps/<team>/<app>` | Teams' apps; layout configured in `statex-workspace.toml` |
+| `apps/` | Sample multi-app workspace; optional for consumers |
 | `registry/` | Generated index and WIT of every app (`statex registry build`) |
 | `scripts/e2e.sh` | End-to-end run: forwarding, actor-to-actor calls, crash takeover, generated client, monorepo checks |
 

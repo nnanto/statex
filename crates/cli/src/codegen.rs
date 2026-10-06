@@ -254,7 +254,7 @@ pub fn python(manifest: &Manifest, default_url: &str) -> Result<String> {
     let app_cls = format!("{}App", pascal(&manifest.app));
     let _ = writeln!(
         o,
-        "class {app_cls}(App):\n    \"\"\"Typed client for app {app:?}. Any node URL works; calls are routed to the actor's owner.\n\n    Example: {app_cls}().{first}(\"alice\")\n    \"\"\"\n\n    _name = {app:?}\n\n    def __init__(self, base_url: str = {url:?}, timeout: float = 30.0, retries: int = 3,\n                 transport: Optional[Transport] = None):\n        super().__init__(None, base_url, timeout, retries, transport)\n",
+        "class {app_cls}(App):\n    \"\"\"Typed client for app {app:?}. Any node URL works; calls are routed to the actor's owner.\n\n    Example: {app_cls}().{first}(\"alice\")\n    \"\"\"\n\n    _name = {app:?}\n\n    def __init__(self, base_url: str = {url:?}, timeout: float = 30.0, retries: int = 3,\n                 transport: Optional[Transport] = None):\n        super().__init__(None, base_url, timeout, retries, transport=transport)\n",
         app = manifest.app,
         url = default_url,
         first = manifest.types.first().map(|t| ident(&t.name)).unwrap_or_default()
@@ -265,4 +265,28 @@ pub fn python(manifest: &Manifest, default_url: &str) -> Result<String> {
     }
     let _ = writeln!(o, "\nClient = {app_cls}");
     Ok(o)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn typed_python_clients_forward_optional_transport_and_embed_runtime_once() {
+        let manifest = Manifest {
+            format: 1,
+            app: "shop".into(),
+            sha256: "0".repeat(64),
+            types: vec![],
+            migrations: BTreeMap::new(),
+            http: Default::default(),
+            limits: Default::default(),
+            calls: vec![],
+        };
+        let code = python(&manifest, "http://example.test:9876").unwrap();
+        assert!(code.contains("def __init__(self, base_url: str = \"http://example.test:9876\", timeout: float = 30.0, retries: int = 3,"));
+        assert!(code.contains("transport: Optional[Transport] = None):\n        super().__init__(None, base_url, timeout, retries, transport=transport)"));
+        assert_eq!(code.matches("class HttpBackend").count(), 1);
+        assert_eq!(code.matches("class Transport:").count(), 1);
+    }
 }

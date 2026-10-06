@@ -324,17 +324,20 @@ impl ObjectStore for AzureBlobStore {
 
     async fn get_range(&self, key: &str, start: u64, len: u64) -> Result<Option<Bytes>> {
         if len == 0 {
-            return Ok(Some(Bytes::new()));
+            let resp = self.request(Method::HEAD, self.url(Some(key)), &[], None).await?;
+            return match resp.status() {
+                StatusCode::NOT_FOUND => Ok(None),
+                s if s.is_success() => Ok(Some(Bytes::new())),
+                s => Err(StoreError::Other(anyhow!("HEAD {key}: {s}"))),
+            };
         }
-        let range = format!("bytes={}-{}", start, start + len - 1);
+        let range = format!("bytes={}-{}", start, start.saturating_add(len - 1));
         let resp =
             self.request(Method::GET, self.url(Some(key)), &[("x-ms-range", range)], None).await?;
         match resp.status() {
             StatusCode::NOT_FOUND => Ok(None),
             StatusCode::RANGE_NOT_SATISFIABLE => Ok(Some(Bytes::new())),
-            s if s.is_success() => {
-                Ok(Some(resp.bytes().await.map_err(anyhow::Error::from)?))
-            }
+            s if s.is_success() => Ok(Some(resp.bytes().await.map_err(anyhow::Error::from)?)),
             s => Err(StoreError::Other(anyhow!("GET range {key}: {s}"))),
         }
     }
@@ -524,6 +527,60 @@ mod tests {
         assert_eq!(parse_content_range_total("garbage"), None);
     }
 
+    #[tokio::test]
+    async fn range_requests_preserve_missing_semantics_and_do_not_overflow() {
+        for (start, len, status, body, expected) in [
+            (0, 0, "404 Not Found", "", None),
+            (0, 0, "200 OK", "", Some("")),
+            (8, u64::MAX, "206 Partial Content", "89", Some("89")),
+            (10, 1, "416 Range Not Satisfiable", "", Some("")),
+            (0, 1, "404 Not Found", "", None),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                    assert!(request.len() < 16_384);
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let store = AzureBlobStore {
+                account: "testaccount".into(),
+                container: "testcontainer".into(),
+                base: format!("http://{address}"),
+                cred: Credential::SharedKey(vec![0; 32]),
+                http: reqwest::Client::builder()
+                    .no_proxy()
+                    .timeout(Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+                token: Mutex::new(None),
+            };
+            let result = store.get_range("object", start, len).await.unwrap();
+            assert_eq!(result.as_deref(), expected.map(str::as_bytes));
+            let request = server.await.unwrap().to_ascii_lowercase();
+            if len == 0 {
+                assert!(request.starts_with("head "));
+                assert!(!request.contains("x-ms-range:"));
+            } else {
+                assert!(request.starts_with("get "));
+                let range = format!("x-ms-range: bytes={start}-{}", start.saturating_add(len - 1));
+                assert!(request.contains(&range), "{request}");
+            }
+        }
+    }
+
     /// Runs against Azurite when `STATEX_AZURITE_TEST=1` and the usual
     /// `AZURE_STORAGE_*` variables point at it.
     #[tokio::test]
@@ -538,7 +595,8 @@ mod tests {
             .await
             .unwrap();
         assert!(r.status().is_success(), "create container: {}", r.status());
-        let dir = tempfile::tempdir().unwrap();
+        crate::conformance_test(&s).await.unwrap();
+        let dir = tempfile::tempdir_in(".").unwrap();
         // Larger than two chunks and not a multiple of the chunk size.
         let n = (2 * CHUNK + 12_345) as usize;
         let data: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();

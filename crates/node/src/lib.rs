@@ -1,9 +1,10 @@
 //! statex node: leases, actor ownership, replication, routing and the HTTP API.
 
-pub mod api;
 pub mod actor;
 mod alarms;
+pub mod api;
 pub mod deploy;
+pub mod extensions;
 pub mod layout;
 pub mod lease;
 pub mod node;
@@ -18,6 +19,7 @@ use tokio::task::JoinHandle;
 
 pub use layout::ActorId;
 pub use node::{InvOp, Invocation, Node, NodeConfig, Outcome};
+pub use statex_runtime::database;
 
 /// A running node.
 pub struct NodeHandle {
@@ -66,7 +68,9 @@ impl NodeHandle {
 
 fn advertise_for(addr: SocketAddr) -> String {
     if addr.ip().is_unspecified() {
-        tracing::warn!("listening on {addr}; advertising 127.0.0.1 — set --advertise for multi-host fleets");
+        tracing::warn!(
+            "listening on {addr}; advertising 127.0.0.1 — set --advertise for multi-host fleets"
+        );
         format!("http://127.0.0.1:{}", addr.port())
     } else {
         format!("http://{addr}")
@@ -83,8 +87,15 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         Some(a) => Some(tokio::net::TcpListener::bind(a).await?),
         None => None,
     };
-    let internal_addr = internal.as_ref().map(|l| l.local_addr()).transpose()?.unwrap_or(addr);
-    let advertise = cfg.advertise.clone().unwrap_or_else(|| advertise_for(internal_addr));
+    let internal_addr = internal
+        .as_ref()
+        .map(|l| l.local_addr())
+        .transpose()?
+        .unwrap_or(addr);
+    let advertise = cfg
+        .advertise
+        .clone()
+        .unwrap_or_else(|| advertise_for(internal_addr));
     let (node, renew) = Node::new(cfg.clone(), advertise).await?;
     let (stop, _) = watch::channel(false);
     let mut tasks = vec![renew];
@@ -117,7 +128,10 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
         let node = node.clone();
         let idle = cfg.idle_timeout;
         tasks.push(tokio::spawn(async move {
-            let every = (idle / 4).clamp(std::time::Duration::from_millis(100), std::time::Duration::from_secs(30));
+            let every = (idle / 4).clamp(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(30),
+            );
             loop {
                 tokio::time::sleep(every).await;
                 node.evict_idle(idle).await;
@@ -141,8 +155,17 @@ pub async fn start(cfg: NodeConfig) -> Result<NodeHandle> {
             tasks.push(serve(public, api::public_router(node.clone())));
             tasks.push(serve(l, api::internal_router(node.clone())));
         }
-        None => tasks.push(serve(public, api::public_router(node.clone()).merge(api::internal_router(node.clone())))),
+        None => tasks.push(serve(
+            public,
+            api::public_router(node.clone()).merge(api::internal_router(node.clone())),
+        )),
     }
     tracing::info!(node = cfg.node_id, %addr, store = node.store.describe(), "statex node listening");
-    Ok(NodeHandle { node, addr, internal_addr, stop, tasks })
+    Ok(NodeHandle {
+        node,
+        addr,
+        internal_addr,
+        stop,
+        tasks,
+    })
 }

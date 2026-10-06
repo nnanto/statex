@@ -10,7 +10,7 @@
         assert call("counter", "bob", Counter().get) == 0
 
 Each (actor type, key) gets its own in-memory SQLite database with the
-migrations from `migrations/<actor-type>/*.sql` applied, like the real host.
+migrations from `migrations/<actor-type>/*.sql` applied, like the default SQLite host.
 Each `call` is one transaction: returning commits, raising (including
 `statex.Err`) rolls back and re-raises.
 
@@ -38,10 +38,12 @@ import inspect
 import os
 import sqlite3
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-__all__ = ["call", "stub", "clear_stubs", "mock_http", "logs", "alarm", "reactivate", "reset", "set_app", "project_root"]
+__all__ = ["call", "stub", "clear_stubs", "mock_http", "capabilities", "logs", "alarm", "reactivate", "reset", "set_app", "project_root"]
 
 
 def project_root() -> Path:
@@ -101,6 +103,29 @@ class _State:
 
 
 _state = _State()
+_capabilities: ContextVar = ContextVar("statex_native_capabilities", default={})
+
+
+@contextmanager
+def capabilities(http: Optional[Callable[[Any], Any]] = None,
+                 log: Optional[Callable[[Any, str], None]] = None) -> Any:
+    """Temporarily adapts native HTTP/logging without replacing SQL or alarms.
+
+    HTTP uses the same request/response contract as mock_http. Exceptions
+    propagate unchanged. Omitted handlers inherit the enclosing scope/default.
+    Nested scopes restore on exit, including exceptions; overrides are local
+    to this execution context. The underlying test host remains single-threaded.
+    """
+    handlers = dict(_capabilities.get())
+    if http is not None:
+        handlers["http"] = http
+    if log is not None:
+        handlers["log"] = log
+    token = _capabilities.set(handlers)
+    try:
+        yield
+    finally:
+        _capabilities.reset(token)
 
 
 def _current() -> Tuple[str, str]:
@@ -312,9 +337,10 @@ def _install() -> None:
     http = _module("http_client")
     if http is not None:
         def send(req: Any) -> Any:
-            if _state.http is None:
+            handler = _capabilities.get().get("http", _state.http)
+            if handler is None:
                 raise Err("no HTTP mock: use statex_testing.mock_http(handler)")
-            resp = _state.http(req)
+            resp = handler(req)
             if isinstance(resp, tuple):
                 status, headers, body = resp
                 resp = http.Response(status=status, headers=list(dict(headers).items()), body=bytes(body))
@@ -346,6 +372,10 @@ def _install() -> None:
     log = _module("log")
     if log is not None:
         def record(level: Any, msg: str) -> None:
+            handler = _capabilities.get().get("log")
+            if handler is not None:
+                handler(level, msg)
+                return
             _state.logs.append((level, msg))
             print("[%s] %s" % (getattr(level, "name", level), msg))
 

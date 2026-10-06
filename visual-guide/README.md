@@ -16,7 +16,13 @@ Open **[`dist/index.html`](dist/index.html)** in a browser. Each of the 11 chapt
 10. **Agents, queues & cron** — agent, queue, cron, and workflow state-machine designs with explicit external-driver requirements.
 11. **Field notes & sources** — exact defaults, API routes, searchable glossary, source references, assumptions, and non-guarantees.
 
-The guide follows the working tree inspected on October 3, 2026, including its pre-existing local changes. Source references appear alongside explanations. The interactive labs are illustrative models, not live cluster simulators or formal proofs. Agent/queue/cron/workflow designs are **not built-in StateX features**.
+The labs illustrate the **default SQLite/WAL backend**, not requirements for
+all extensions. The framework also accepts custom state backends, object
+stores, host capabilities and transports; see `docs/extensions/`. Workspaces
+and namespaced application names are optional. Source references appear
+alongside explanations. The interactive labs are illustrative models, not
+live cluster simulators or formal proofs. Agent/queue/cron/workflow designs
+are **not built-in StateX features**.
 
 ## Rebuild and maintain
 

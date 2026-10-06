@@ -44,20 +44,31 @@ pub async fn read(store: &DynStore, id: &ActorId) -> Result<Option<(OwnerRecord,
 }
 
 /// Takes ownership of an actor if it is unowned or its owner is dead.
-pub async fn acquire(store: &DynStore, id: &ActorId, me: &NodeRecord, create_only: bool) -> Result<Acquire> {
+pub async fn acquire(
+    store: &DynStore,
+    id: &ActorId,
+    me: &NodeRecord,
+    create_only: bool,
+) -> Result<Acquire> {
     let key = id.owner_key();
     loop {
         let current = read(store, id).await?;
         let (epoch, fresh, res) = match &current {
             None => {
                 let rec = record(id, me, 1, OwnerState::Owned);
-                (1, true, store.put_if_absent(&key, to_json_bytes(&rec)).await)
+                (
+                    1,
+                    true,
+                    store.put_if_absent(&key, to_json_bytes(&rec)).await,
+                )
             }
             Some((old, etag)) => {
                 if create_only && old.state != OwnerState::Deleted {
                     return Ok(Acquire::Exists);
                 }
-                if old.state == OwnerState::Owned && !(old.node == me.node_id && old.session == me.session) {
+                if old.state == OwnerState::Owned
+                    && !(old.node == me.node_id && old.session == me.session)
+                {
                     if let Some(n) = read_node(store, &old.node).await? {
                         if n.session == old.session && n.alive() {
                             return Ok(Acquire::Remote(n));
@@ -67,7 +78,11 @@ pub async fn acquire(store: &DynStore, id: &ActorId, me: &NodeRecord, create_onl
                 }
                 let rec = record(id, me, old.epoch + 1, OwnerState::Owned);
                 let fresh = old.state == OwnerState::Deleted;
-                (rec.epoch, fresh, store.put_if_match(&key, to_json_bytes(&rec), etag).await)
+                (
+                    rec.epoch,
+                    fresh,
+                    store.put_if_match(&key, to_json_bytes(&rec), etag).await,
+                )
             }
         };
         match res {
@@ -81,9 +96,19 @@ pub async fn acquire(store: &DynStore, id: &ActorId, me: &NodeRecord, create_onl
 /// Gives up ownership (idle eviction / shutdown) or marks the actor deleted.
 /// Returns false if the record was no longer ours. The epoch is kept so it
 /// stays monotonic across releases and deletes.
-pub async fn release(store: &DynStore, id: &ActorId, me: &NodeRecord, epoch: u64, etag: &str, state: OwnerState) -> Result<bool> {
+pub async fn release(
+    store: &DynStore,
+    id: &ActorId,
+    me: &NodeRecord,
+    epoch: u64,
+    etag: &str,
+    state: OwnerState,
+) -> Result<bool> {
     let rec = record(id, me, epoch, state);
-    match store.put_if_match(&id.owner_key(), to_json_bytes(&rec), etag).await {
+    match store
+        .put_if_match(&id.owner_key(), to_json_bytes(&rec), etag)
+        .await
+    {
         Ok(_) => Ok(true),
         Err(StoreError::Precondition) => Ok(false),
         Err(e) => Err(e.into()),
@@ -91,9 +116,19 @@ pub async fn release(store: &DynStore, id: &ActorId, me: &NodeRecord, epoch: u64
 }
 
 /// The ack rule: the record must still name us at this epoch.
-pub async fn still_owner(store: &DynStore, id: &ActorId, me: &NodeRecord, epoch: u64) -> Result<bool> {
+pub async fn still_owner(
+    store: &DynStore,
+    id: &ActorId,
+    me: &NodeRecord,
+    epoch: u64,
+) -> Result<bool> {
     Ok(match read(store, id).await? {
-        Some((r, _)) => r.state == OwnerState::Owned && r.node == me.node_id && r.session == me.session && r.epoch == epoch,
+        Some((r, _)) => {
+            r.state == OwnerState::Owned
+                && r.node == me.node_id
+                && r.session == me.session
+                && r.epoch == epoch
+        }
         None => false,
     })
 }

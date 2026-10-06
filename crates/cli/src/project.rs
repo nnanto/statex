@@ -7,7 +7,8 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use statex_runtime::{apply_migrations, open_db, ActorIdentity, HttpPolicy, Limits, Manifest, Migration, Runtime, Ty};
+use statex_runtime::sqlite::{apply_migrations, open_db};
+use statex_runtime::{ActorIdentity, HttpPolicy, Limits, Manifest, Migration, Runtime, Ty};
 
 #[derive(Debug, Deserialize)]
 pub struct StatexToml {
@@ -66,6 +67,7 @@ impl Project {
             if f.exists() {
                 let cfg: StatexToml =
                     toml::from_str(&std::fs::read_to_string(&f)?).with_context(|| format!("parse {}", f.display()))?;
+                statex_runtime::validate_app_name(&cfg.app.name).with_context(|| format!("app name in {}", f.display()))?;
                 return Ok(Project { root: dir.to_path_buf(), cfg });
             }
         }
@@ -276,7 +278,8 @@ pub fn verify(wasm: &[u8], manifest: &Manifest) -> Result<()> {
         let migrations = manifest.migrations.get(&t.name).cloned().unwrap_or_default();
         apply_migrations(&conn, &migrations).with_context(|| format!("migrations of actor type {}", t.name))?;
         let id = ActorIdentity { app: manifest.app.clone(), actor_type: t.name.clone(), key: "verify".into(), epoch: 0 };
-        code.instantiate(id, Arc::new(Mutex::new(conn))).with_context(|| format!("instantiate for {}", t.name))?;
+        code.instantiate(id, statex_runtime::database::sqlite_handle(Arc::new(Mutex::new(conn))))
+            .with_context(|| format!("instantiate for {}", t.name))?;
     }
     Ok(())
 }
@@ -316,5 +319,44 @@ pub fn sample(t: &Ty) -> serde_json::Value {
         Ty::Variant { cases, .. } => json!({ "tag": cases.first().map(|c| c.name.clone()) }),
         Ty::Result { ok, .. } => json!({ "ok": ok.as_deref().map(sample) }),
         _ => json!(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_manifests_use_canonical_app_and_callee_names() {
+        fn walk(dir: &Path, count: &mut usize) {
+            if !dir.exists() {
+                return;
+            }
+            let manifest = dir.join("statex.toml");
+            if manifest.is_file() {
+                let cfg: StatexToml = toml::from_str(&std::fs::read_to_string(&manifest).unwrap()).unwrap();
+                for app in std::iter::once(&cfg.app.name).chain(&cfg.calls.apps).chain(cfg.calls.paths.keys()) {
+                    statex_runtime::validate_app_name(app)
+                        .unwrap_or_else(|e| panic!("{}: {e}", manifest.display()));
+                    *count += 1;
+                }
+                return;
+            }
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name();
+                if entry.file_type().unwrap().is_dir()
+                    && !["target", "node_modules", "__pycache__"].contains(&name.to_str().unwrap_or(""))
+                    && !name.to_string_lossy().starts_with('.')
+                {
+                    walk(&entry.path(), count);
+                }
+            }
+        }
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut count = 0;
+        walk(&root.join("apps"), &mut count);
+        walk(&root.join("examples"), &mut count);
+        assert!(count > 0, "repository app-name audit found no manifests");
     }
 }

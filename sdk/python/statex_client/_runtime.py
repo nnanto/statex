@@ -8,7 +8,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Protocol
 
 
 class StatexError(Exception):
@@ -58,44 +59,91 @@ def _py(f: Dict[str, Any]) -> str:
     return f.get("py") or _snake(f["name"])
 
 
-class Transport:
-    """HTTP transport. Any statex node accepts any call; it routes to the owner."""
+@dataclass
+class HttpResponse:
+    """Raw HTTP response, including non-2xx statuses."""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:9876", timeout: float = 30.0, retries: int = 3):
+    status: int
+    body: bytes = b""
+
+
+class HttpBackend(Protocol):
+    """HTTP I/O only. Return all statuses; raise OSError for network failures.
+
+    Do not retry requests here: Transport owns retries and statex error mapping.
+    Implementations must honor timeout and must not mutate headers.
+    """
+
+    def request(self, method: str, url: str, headers: Dict[str, str],
+                body: Optional[bytes], timeout: float) -> HttpResponse:
+        ...
+
+
+class UrllibBackend:
+    """The default, standard-library HTTP backend."""
+
+    def request(self, method: str, url: str, headers: Dict[str, str],
+                body: Optional[bytes], timeout: float) -> HttpResponse:
+        req = urllib.request.Request(url, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                return HttpResponse(response.status, response.read())
+        except urllib.error.HTTPError as error:
+            with error:
+                return HttpResponse(error.code, error.read())
+        except urllib.error.URLError as error:
+            raise OSError(str(error.reason)) from error
+
+
+class Transport:
+    """Statex HTTP transport with injectable I/O and shared error/retry policy.
+
+    Any statex node accepts any call; it routes to the owner.
+    """
+
+    def __init__(self, base_url: str = "http://127.0.0.1:9876", timeout: float = 30.0,
+                 retries: int = 3, backend: Optional[HttpBackend] = None):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.retries = retries
+        self.backend = backend if backend is not None else UrllibBackend()
 
     def request(self, method: str, path: str, body: Any = None) -> Any:
         data = None if body is None else json.dumps(body).encode()
         attempt = 0
         while True:
-            req = urllib.request.Request(self.base_url + path, data=data, method=method)
-            req.add_header("content-type", "application/json")
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as r:
-                    return json.loads(r.read() or b"null")
-            except urllib.error.HTTPError as e:
-                try:
-                    payload = json.loads(e.read() or b"null") or {}
-                except ValueError:
-                    payload = {}
-                err = payload.get("error") or {}
-                code = err.get("code", "http_%d" % e.code)
-                if code == "unavailable" and attempt < self.retries:
-                    attempt += 1
-                    time.sleep(0.2 * 2 ** attempt)
-                    continue
-                if code == "method_error":
-                    raise _RawMethodError(err.get("detail"), e.code)
-                cls = _ERRORS.get(code, StatexError)
-                raise cls(code, err.get("message", str(e)), e.code, err.get("detail"))
-            except urllib.error.URLError as e:
+                response = self.backend.request(
+                    method, self.base_url + path, {"content-type": "application/json"},
+                    data, self.timeout,
+                )
+            except OSError as error:
                 if attempt < self.retries:
                     attempt += 1
                     time.sleep(0.2 * 2 ** attempt)
                     continue
-                raise StatexError("transport", str(e.reason))
+                raise StatexError("transport", str(error)) from error
+            try:
+                payload = json.loads(response.body or b"null")
+            except (ValueError, UnicodeError) as error:
+                if 200 <= response.status < 300:
+                    raise StatexError("transport", "invalid JSON response", response.status) from error
+                payload = None
+            if 200 <= response.status < 300:
+                return payload
+            err = payload.get("error") if isinstance(payload, dict) else None
+            err = err if isinstance(err, dict) else {}
+            code = err.get("code")
+            code = code if isinstance(code, str) else "http_%d" % response.status
+            if code == "unavailable" and attempt < self.retries:
+                attempt += 1
+                time.sleep(0.2 * 2 ** attempt)
+                continue
+            if code == "method_error":
+                raise _RawMethodError(err.get("detail"), response.status)
+            cls = _ERRORS.get(code, StatexError)
+            raise cls(code, err.get("message", "HTTP %d" % response.status),
+                      response.status, err.get("detail"))
 
     def actor_path(self, app: str, ty: str, key: str) -> str:
         q = urllib.parse.quote
@@ -207,7 +255,10 @@ class Actor:
         t = self._app._transport
         path = t.actor_path(self._app._name, self._type, self.key) + "/" + method
         if sig is None:
-            return t.request("POST", path, args)["result"]
+            try:
+                return t.request("POST", path, args)["result"]
+            except _RawMethodError as e:
+                raise MethodError(e.detail, e.status)
         body = {}
         for p in sig["params"]:
             v = args.get(_py(p))
@@ -253,7 +304,7 @@ class App:
                  timeout: float = 30.0, retries: int = 3, transport: Optional[Transport] = None):
         if name:
             self._name = name
-        self._transport = transport or Transport(base_url, timeout, retries)
+        self._transport = transport if transport is not None else Transport(base_url, timeout, retries)
 
     def actor(self, ty: str, key: str) -> Actor:
         c = Actor(self, key)

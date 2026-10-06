@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use statex_store::{get_json, to_json_bytes};
 use tokio::task::JoinSet;
 
-use crate::layout::{now_ms, parse_wake, wake_minute_prefix, ActorId, WakeEntry, WAKER, WAKE_PREFIX};
+use crate::layout::{
+    now_ms, parse_wake, wake_minute_prefix, ActorId, WakeEntry, WAKER, WAKE_PREFIX,
+};
 use crate::node::{InvOp, Invocation, Node};
 
 /// Waker invocations in flight at once.
@@ -67,7 +69,11 @@ impl Node {
             let now = now_ms();
             let due: Vec<ActorId> = {
                 let mut t = self.timers.lock().unwrap();
-                let due: Vec<ActorId> = t.iter().filter(|(_, at)| **at <= now).map(|(id, _)| id.clone()).collect();
+                let due: Vec<ActorId> = t
+                    .iter()
+                    .filter(|(_, at)| **at <= now)
+                    .map(|(id, _)| id.clone())
+                    .collect();
                 for id in &due {
                     t.remove(id);
                 }
@@ -157,7 +163,10 @@ impl Node {
     /// it no longer names the actor's scheduled alarm.
     async fn wake(&self, key: String, e: WakeEntry) {
         // Keep hints of apps this node has not loaded (yet).
-        if self.app(&e.id.app).is_none_or(|c| c.manifest.actor_type(&e.id.ty).is_none()) {
+        if self
+            .app(&e.id.app)
+            .is_none_or(|c| c.manifest.actor_type(&e.id.ty).is_none())
+        {
             return;
         }
         let o = self.invoke(alarm_invocation(&e.id), 0).await;
@@ -181,9 +190,17 @@ impl Node {
         let me = self.me();
         let now = now_ms();
         let ttl = self.cfg.lease_ttl.as_millis() as u64;
-        let mine = WakerLease { node: me.node_id.clone(), session: me.session.clone(), expires_at_ms: now + ttl };
+        let mine = WakerLease {
+            node: me.node_id.clone(),
+            session: me.session.clone(),
+            expires_at_ms: now + ttl,
+        };
         match get_json::<WakerLease>(&*self.store, WAKER).await? {
-            None => Ok(self.store.put_if_absent(WAKER, to_json_bytes(&mine)).await.is_ok()),
+            None => Ok(self
+                .store
+                .put_if_absent(WAKER, to_json_bytes(&mine))
+                .await
+                .is_ok()),
             Some((cur, etag)) => {
                 let ours = cur.node == me.node_id && cur.session == me.session;
                 if ours && cur.expires_at_ms > now + ttl / 2 {
@@ -193,14 +210,28 @@ impl Node {
                     return Ok(false);
                 }
                 if !ours {
-                    tracing::info!(node = me.node_id, "taking over the waker role from {}", cur.node);
+                    tracing::info!(
+                        node = me.node_id,
+                        "taking over the waker role from {}",
+                        cur.node
+                    );
                 }
-                Ok(self.store.put_if_match(WAKER, to_json_bytes(&mine), &etag).await.is_ok())
+                Ok(self
+                    .store
+                    .put_if_match(WAKER, to_json_bytes(&mine), &etag)
+                    .await
+                    .is_ok())
             }
         }
     }
 }
 
 fn alarm_invocation(id: &ActorId) -> Invocation {
-    Invocation { app: id.app.clone(), ty: id.ty.clone(), key: id.key.clone(), op: InvOp::Alarm, chain: vec![] }
+    Invocation {
+        app: id.app.clone(),
+        ty: id.ty.clone(),
+        key: id.key.clone(),
+        op: InvOp::Alarm,
+        chain: vec![],
+    }
 }

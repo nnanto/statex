@@ -33,43 +33,58 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Create a new app project. Inside a workspace (statex-workspace.toml),
-    /// `statex new team/app` creates <apps>/team/app linked to the shared SDKs.
+    /// Create a standalone app project; opt into shared tooling with --workspace.
     New {
-        /// App name: `app`, or `team/app` (required inside a workspace).
+        /// App name: `app`, or `namespace/app`, independent of its source path.
         name: String,
-        /// Directory (defaults to ./<name>, or <apps>/<name> inside a workspace).
+        /// Directory (defaults to ./<name>, or <apps>/<name> with --workspace).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Use statex-workspace.toml for shared SDKs, WIT and default app directory.
+        #[arg(long)]
+        workspace: bool,
         /// Name of the first actor type.
         #[arg(long, default_value = "counter")]
         actor: String,
         /// Guest language: rust or python (componentize-py).
         #[arg(long, default_value = "rust", value_parser = ["rust", "python"])]
         lang: String,
-        /// Path to the statex-guest crate (defaults to the one this CLI was built from).
+        /// Path to statex-guest (or STATEX_GUEST_PATH); required for standalone Rust.
         #[arg(long, env = "STATEX_GUEST_PATH")]
         sdk: Option<PathBuf>,
     },
     /// Add an actor type (WIT interface, migration and Rust stub) to the current project.
     AddActor { name: String },
-    /// Build the component (cargo build --release --target wasm32-wasip2).
-    Build,
+    /// Build using [build] command, or cargo build --release --target wasm32-wasip2.
+    Build {
+        /// Discover callee source using statex-workspace.toml.
+        #[arg(long)]
+        workspace: bool,
+    },
     /// Run the unit tests against the mock host: pytest for Python projects
     /// (after refreshing the typed bindings in .statex/bindings), cargo test for Rust.
     Test {
+        /// Discover callee source using statex-workspace.toml.
+        #[arg(long)]
+        workspace: bool,
         /// Extra arguments for pytest / cargo test.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     /// Build and verify: WIT exports, allowed imports, migrations and instantiation.
     Verify {
+        /// Discover callee source using statex-workspace.toml.
+        #[arg(long)]
+        workspace: bool,
         /// Verify an existing component instead of building the project.
         #[arg(long)]
         wasm: Option<PathBuf>,
     },
     /// Run a local single-node dev server that rebuilds and redeploys on change.
     Dev {
+        /// Discover and deploy local workspace callees.
+        #[arg(long)]
+        workspace: bool,
         #[arg(long, default_value_t = 9876)]
         port: u16,
         /// Wipe local dev state (all actors) before starting.
@@ -78,6 +93,9 @@ enum Cmd {
     },
     /// Build, verify and deploy the project to a store (all nodes pick it up).
     Deploy {
+        /// Discover callee source using statex-workspace.toml.
+        #[arg(long)]
+        workspace: bool,
         #[arg(long, env = "STATEX_STORE")]
         store: String,
         /// Deploy an existing component instead of building. Uses the project's
@@ -94,7 +112,7 @@ enum Cmd {
         #[arg(long)]
         allow_unresolved_calls: bool,
     },
-    /// Pre-merge checks: app name matches its path, WIT and migrations are
+    /// Pre-merge checks: valid app name, consistent WIT and migrations,
     /// consistent, and (with --against) nothing breaks.
     Check {
         /// Git revision to compare against, e.g. `origin/main`.
@@ -107,7 +125,7 @@ enum Cmd {
         #[arg(long)]
         allow_breaking: bool,
     },
-    /// Monorepo workspace setup.
+    /// Optional workspace setup for shared SDKs and app discovery.
     Workspace {
         #[command(subcommand)]
         cmd: WorkspaceCmd,
@@ -204,11 +222,11 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum WorkspaceCmd {
-    /// Make the current directory (a repo root) a statex workspace.
+    /// Configure optional app discovery and shared SDKs in the current directory.
     Init {
         /// statex checkout or vendored copy providing wit/, crates/guest and
-        /// sdk/python-guest (defaults to the one this CLI was built from).
-        #[arg(long)]
+        /// sdk/python-guest (required; no build-machine path assumptions).
+        #[arg(long, required = true)]
         statex: Option<PathBuf>,
     },
 }
@@ -217,16 +235,22 @@ enum WorkspaceCmd {
 enum CallsCmd {
     /// Add apps to `[calls] apps` and generate their client interfaces.
     Add {
-        /// Callee apps, e.g. `payments/ledger` (the project's own app works too).
+        /// Discover callee source using statex-workspace.toml.
+        #[arg(long)]
+        workspace: bool,
+        /// Callee apps, e.g. `ledger` or `payments/ledger` (self-calls work too).
         #[arg(required = true)]
         apps: Vec<String>,
         /// Read callee schemas not found in the workspace from a running node.
         #[arg(long)]
         from_url: Option<String>,
     },
-    /// (Re)generate wit/deps/<ns>-<app>/client.wit for every `[calls]` app,
+    /// (Re)generate wit/deps/<ns>--<app>/client.wit for every `[calls]` app,
     /// plus src/statex_calls.rs in Rust projects.
     Sync {
+        /// Discover callee source using statex-workspace.toml.
+        #[arg(long)]
+        workspace: bool,
         /// Read callee schemas not found in the workspace from a running node.
         #[arg(long)]
         from_url: Option<String>,
@@ -296,19 +320,10 @@ async fn main() {
 
 async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
-        Cmd::New { name, dir, actor, lang, sdk } => {
-            let ws = if dir.is_none() { Workspace::find(Path::new("."))? } else { None };
-            let dir = match (&ws, dir) {
-                (_, Some(d)) => d,
-                (Some(ws), None) => {
-                    statex_runtime::validate_app_name(&name)?;
-                    if !name.contains('/') {
-                        bail!("inside a workspace, name apps `team/app` (e.g. `payments/{name}`); they are created at <apps>/team/app");
-                    }
-                    ws.app_dir(&name)
-                }
-                (None, None) => PathBuf::from(&name),
-            };
+        Cmd::New { name, dir, workspace, actor, lang, sdk } => {
+            statex_runtime::validate_app_name(&name)?;
+            let ws = workspace.then(|| Workspace::require(Path::new("."))).transpose()?;
+            let dir = new_directory(&name, dir, ws.as_ref());
             if let Some(ws) = &ws {
                 println!("workspace {}: linking shared host WIT and SDKs", ws.root.display());
             }
@@ -330,23 +345,23 @@ async fn run(cli: Cli) -> Result<()> {
             let code = if p.root.join("app.py").exists() { "app.py" } else { "src/lib.rs" };
             println!("added actor type {name}: edit wit/app.wit, migrations/{name}/ and {code}");
         }
-        Cmd::Test { args } => {
+        Cmd::Test { args, workspace } => {
             let p = Project::find(Path::new("."))?;
-            sync_local(&p)?;
+            sync_local(&p, workspace)?;
             python::test(&p, &args)?;
         }
-        Cmd::Build => {
+        Cmd::Build { workspace } => {
             let p = Project::find(Path::new("."))?;
-            sync_local(&p)?;
+            sync_local(&p, workspace)?;
             let wasm = p.build(false)?;
             println!("built {}", wasm.display());
         }
-        Cmd::Verify { wasm } => {
+        Cmd::Verify { wasm, workspace } => {
             let p = Project::find(Path::new("."))?;
             let path = match wasm {
                 Some(w) => w,
                 None => {
-                    sync_local(&p)?;
+                    sync_local(&p, workspace)?;
                     p.build(true)?
                 }
             };
@@ -356,8 +371,8 @@ async fn run(cli: Cli) -> Result<()> {
             project::print_summary(&manifest, bytes.len());
             println!("ok: component verified");
         }
-        Cmd::Dev { port, clean } => dev(port, clean).await?,
-        Cmd::Deploy { store, wasm, manifest, allow_breaking, allow_unresolved_calls } => {
+        Cmd::Dev { port, clean, workspace } => dev(port, clean, workspace).await?,
+        Cmd::Deploy { store, wasm, manifest, allow_breaking, allow_unresolved_calls, workspace } => {
             let (bytes, manifest) = match (wasm, manifest) {
                 (Some(w), Some(m)) => {
                     let bytes = std::fs::read(&w)?;
@@ -368,7 +383,7 @@ async fn run(cli: Cli) -> Result<()> {
                 (w, _) => {
                     let p = Project::find(Path::new("."))?;
                     if w.is_none() {
-                        sync_local(&p)?;
+                        sync_local(&p, workspace)?;
                     }
                     let path = match w {
                         Some(w) => w,
@@ -389,7 +404,7 @@ async fn run(cli: Cli) -> Result<()> {
             );
         }
         Cmd::Check { against, all, allow_breaking } => {
-            let ws = Workspace::find(Path::new("."))?;
+            let ws = workspace_if_requested(Path::new("."), all)?;
             let projects = if all {
                 ws.as_ref().context("--all needs a workspace (statex-workspace.toml)")?.projects()?
             } else {
@@ -412,16 +427,11 @@ async fn run(cli: Cli) -> Result<()> {
             }
         }
         Cmd::Workspace { cmd: WorkspaceCmd::Init { statex } } => {
-            let statex = match statex {
-                Some(p) => p,
-                None => scaffold::default_sdk_path()
-                    .and_then(|g| g.parent()?.parent().map(Path::to_path_buf))
-                    .context("cannot locate a statex checkout; pass --statex <path>")?,
-            };
+            let statex = statex.context("workspace init needs --statex <checkout> providing WIT and guest SDKs")?;
             for f in workspace::init(Path::new("."), &statex)? {
                 println!("created {f}");
             }
-            println!("\nnext:\n  statex new <team>/<app> [--lang python]\n  statex check --all --against origin/main\n  statex registry build");
+            println!("\nnext:\n  statex new <app> --workspace [--lang python]\n  statex check --all --against origin/main\n  statex registry build");
         }
         Cmd::Registry { cmd: RegistryCmd::Build { check } } => {
             let ws = Workspace::require(Path::new("."))?;
@@ -514,19 +524,19 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Calls { cmd } => {
             let p = Project::find(Path::new("."))?;
-            let ws = Workspace::find(&p.root)?;
-            let from_url = match cmd {
-                CallsCmd::Add { apps, from_url } => {
+            let (from_url, workspace) = match cmd {
+                CallsCmd::Add { apps, from_url, workspace } => {
                     for a in &apps {
                         statex_runtime::validate_app_name(a)?;
                     }
                     if project::add_calls(&p.root, &apps)? {
                         println!("updated statex.toml [calls] apps");
                     }
-                    from_url
+                    (from_url, workspace)
                 }
-                CallsCmd::Sync { from_url } => from_url,
+                CallsCmd::Sync { from_url, workspace } => (from_url, workspace),
             };
+            let ws = workspace_if_requested(&p.root, workspace)?;
             let p = Project::find(&p.root)?;
             calls_sync(&p, ws.as_ref(), from_url.as_deref()).await?;
         }
@@ -554,9 +564,17 @@ async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+fn new_directory(name: &str, dir: Option<PathBuf>, ws: Option<&Workspace>) -> PathBuf {
+    dir.unwrap_or_else(|| ws.map_or_else(|| PathBuf::from(name), |ws| ws.app_dir(name)))
+}
+
 /// Regenerates client interfaces whose callee source is local; prints changes.
-fn sync_local(p: &Project) -> Result<()> {
-    let ws = Workspace::find(&p.root)?;
+fn workspace_if_requested(start: &Path, requested: bool) -> Result<Option<Workspace>> {
+    requested.then(|| Workspace::require(start)).transpose()
+}
+
+fn sync_local(p: &Project, workspace: bool) -> Result<()> {
+    let ws = workspace_if_requested(&p.root, workspace)?;
     for f in calls::sync_local(p, ws.as_ref())? {
         println!("updated {f}");
     }
@@ -575,7 +593,7 @@ async fn calls_sync(p: &Project, ws: Option<&Workspace>, from_url: Option<&str>)
             None => match from_url {
                 Some(u) => schema(u, &app).await.with_context(|| format!("read schema of app {app}"))?.types,
                 None => bail!(
-                    "app {app} is not in this workspace; pass --from-url <node url> to read its schema from a running cluster"
+                    "app {app} has no locally available source; configure [calls] paths or pass --from-url <node url> to read its schema from a running cluster"
                 ),
             },
         };
@@ -587,7 +605,7 @@ async fn calls_sync(p: &Project, ws: Option<&Workspace>, from_url: Option<&str>)
         println!("wrote {f}");
     }
     if callees.is_empty() {
-        println!("no apps under [calls] in statex.toml (add some with `statex calls add <team/app>`)");
+        println!("no apps under [calls] in statex.toml (add some with `statex calls add <app>`)");
         return Ok(());
     }
     if changed.is_empty() {
@@ -668,7 +686,7 @@ fn enc(s: &str) -> String {
     o
 }
 
-/// URL path of an app: `team/app` keeps its slash.
+/// URL path of an app: `namespace/app` keeps its slash.
 fn app_path(app: &str) -> String {
     app.split('/').map(enc).collect::<Vec<_>>().join("/")
 }
@@ -723,11 +741,11 @@ fn newest_mtime(paths: &[PathBuf]) -> SystemTime {
 }
 
 /// Builds, verifies and deploys the project to the dev store.
-async fn dev_deploy(p: &Project, store: &statex_store::DynStore) -> Result<Manifest> {
+async fn dev_deploy(p: &Project, store: &statex_store::DynStore, workspace: bool) -> Result<Manifest> {
     let root = p.root.clone();
     let (bytes, manifest) = tokio::task::spawn_blocking(move || -> Result<_> {
         let p = Project::find(&root)?;
-        sync_local(&p)?;
+        sync_local(&p, workspace)?;
         let bytes = std::fs::read(p.build(true)?)?;
         let manifest = p.manifest(&bytes)?;
         project::verify(&bytes, &manifest)?;
@@ -765,23 +783,24 @@ async fn stale_migrations(store: &statex_store::DynStore, manifest: &Manifest) -
     Ok(out)
 }
 
-async fn dev(port: u16, clean: bool) -> Result<()> {
+async fn dev(port: u16, clean: bool, workspace: bool) -> Result<()> {
     let p = Project::find(Path::new("."))?;
     let dev_dir = p.root.join(".statex/dev");
     if clean && dev_dir.exists() {
         std::fs::remove_dir_all(&dev_dir)?;
     }
+
     let store = statex_store::open(dev_dir.join("bucket").to_str().unwrap())?;
     // Callees with local source run in the dev node too (deployed once, at startup).
-    let ws = Workspace::find(&p.root)?;
+    let ws = workspace_if_requested(&p.root, workspace)?;
     for app in calls::listed(&p)? {
-        if let Some(dir) = calls::callee_root(&p, ws.as_ref(), &app).filter(|_| app != p.app()) {
+        if let Some(dir) = calls::callee_root(&p, ws.as_ref(), &app)?.filter(|_| app != p.app()) {
             println!("building callee {app} ...");
-            dev_deploy(&Project::find(&dir)?, &store).await.with_context(|| format!("deploy callee {app}"))?;
+            dev_deploy(&Project::find(&dir)?, &store, workspace).await.with_context(|| format!("deploy callee {app}"))?;
         }
     }
     println!("building {} ...", p.app());
-    let manifest = dev_deploy(&p, &store).await?;
+    let manifest = dev_deploy(&p, &store, workspace).await?;
 
     let mut cfg = NodeConfig::new("dev", store.clone(), dev_dir.join("node"));
     cfg.listen = SocketAddr::from(([127, 0, 0, 1], port));
@@ -820,7 +839,7 @@ async fn dev(port: u16, clean: bool) -> Result<()> {
                 }
                 last = now;
                 println!("change detected, rebuilding ...");
-                match dev_deploy(&p, &store).await {
+                match dev_deploy(&p, &store, workspace).await {
                     Ok(m) => {
                         h.node.refresh_apps().await?;
                         println!("reloaded {} ({})", m.app, &m.sha256[..12]);
@@ -830,5 +849,45 @@ async fn dev(port: u16, clean: bool) -> Result<()> {
                 last = last.max(newest_mtime(&watched));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_is_standalone_unless_workspace_is_explicit() {
+        let cli = Cli::try_parse_from(["statex", "new", "shop", "--sdk", "guest"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::New { workspace: false, .. }));
+        let cli = Cli::try_parse_from(["statex", "new", "shop", "--workspace", "--dir", "custom"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::New { workspace: true, .. }));
+        let ws = Workspace { root: PathBuf::from("repo"), cfg: workspace::WorkspaceToml::default() };
+        assert_eq!(new_directory("shop", None, None), PathBuf::from("shop"));
+        assert_eq!(new_directory("shop", None, Some(&ws)), PathBuf::from("repo/apps/shop"));
+        assert_eq!(new_directory("payments/shop", Some("custom".into()), Some(&ws)), PathBuf::from("custom"));
+    }
+
+    #[test]
+    fn app_urls_keep_optional_namespace() {
+        assert_eq!(app_path("shop"), "shop");
+        assert_eq!(app_path("payments/shop"), "payments/shop");
+    }
+
+    #[test]
+    fn project_commands_do_not_implicitly_read_workspace_configuration() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        std::fs::write(d.path().join(workspace::FILE), "invalid [toml").unwrap();
+        assert!(workspace_if_requested(d.path(), false).unwrap().is_none());
+        assert!(workspace_if_requested(d.path(), true).is_err());
+        assert!(matches!(Cli::try_parse_from(["statex", "build"]).unwrap().cmd, Cmd::Build { workspace: false }));
+        assert!(matches!(
+            Cli::try_parse_from(["statex", "calls", "sync"]).unwrap().cmd,
+            Cmd::Calls { cmd: CallsCmd::Sync { workspace: false, .. } }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["statex", "dev", "--workspace"]).unwrap().cmd,
+            Cmd::Dev { workspace: true, .. }
+        ));
     }
 }

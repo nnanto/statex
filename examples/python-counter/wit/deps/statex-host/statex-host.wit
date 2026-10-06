@@ -13,8 +13,10 @@ interface context {
   epoch: func() -> u64;
 }
 
-/// The actor's private SQLite database. Every method invocation runs inside one
-/// transaction managed by the host: a trap rolls back, a normal return commits.
+/// The actor's private SQL database (SQLite by default). Every method invocation
+/// runs inside one transaction managed by the host: a trap or method-level
+/// result::err rolls back, a successful return commits. SQL dialect and
+/// migration support belong to the configured state backend.
 interface sql {
   variant value {
     null,
@@ -57,7 +59,7 @@ interface http-client {
 /// Calls to other actors (in this app or any other deployed app).
 ///
 /// A caller imports a generated *client interface* per callee actor type
-/// (`statex calls sync`): for app `team/app` the package is `team:app`, for a
+/// (`statex calls sync`): for app `namespace/app` the package is `namespace:app`, for a
 /// single-segment app `shop` it is `statex:shop`. Each callee method
 /// `m(p...) -> t` is imported as `m(actor: string, p...) -> result<t, call-error>`.
 /// The callee runs in its own transaction, which commits independently of the
@@ -72,6 +74,8 @@ interface actors {
     incompatible(string),
     /// The callee trapped (panic, timeout, out of memory); its transaction was rolled back.
     trap(string),
+    /// A host extension vetoed execution or commit; no callee transaction committed.
+    rejected(string),
     /// Ownership could not be established or confirmed. The outcome of a write is unknown.
     unavailable(string),
     /// The callee is already executing further up this call chain (A -> B -> A).

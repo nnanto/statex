@@ -14,14 +14,20 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as J};
 use sha2::Sha256;
 use statex_ltx::segment_name;
+use statex_runtime::database::{DynDatabaseFactory, SqliteFactory};
 use statex_runtime::{
-    resolve_method, ActorCaller, ActorRef, AppCode, CallError, CallFailure, CallReply, CallRequest, Runtime,
+    resolve_method, ActorCaller, ActorRef, AppCode, CallError, CallFailure, CallReply, CallRequest,
+    Runtime,
 };
 use statex_store::{get_json, to_json_bytes, DynStore, StoreError};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::actor::{self, Actor, Op};
 use crate::deploy;
+use crate::extensions::{
+    observe_lifecycle, run_hook, Caller, HookError, InvocationContext, InvocationExtension,
+    InvocationMetadata, InvocationOperation, LifecycleEvent, LifecycleKind,
+};
 use crate::layout::{app_dir, now_ms, wake_key, ActorId, MAX_KEY_LEN, PEER_AUTH};
 use crate::lease::{Lease, NodeRecord};
 use crate::owner::{self, Acquire, OwnerRecord, OwnerState};
@@ -53,6 +59,20 @@ pub struct NodeConfig {
     /// How often the waker rescans all wake hints, picking up ones whose
     /// earlier attempts failed.
     pub wake_full_scan: Duration,
+    /// Actor database and durable state format. All nodes serving an actor
+    /// must use a factory with the same identity. SQLite/WAL is the default.
+    pub database_factory: DynDatabaseFactory,
+    /// Optional configured runtime (additional host capabilities and adapters).
+    /// None uses the process-wide default runtime.
+    pub runtime: Option<Runtime>,
+    /// Ordered invocation and lifecycle extensions. Empty means no hooks.
+    pub extensions: Vec<Arc<dyn InvocationExtension>>,
+    /// Maximum wait for each async hook. Critical hooks also share the
+    /// invocation deadline; observers use an independent bounded budget.
+    pub extension_timeout: Duration,
+    /// Optional public HTTP router customization, e.g. trusted authentication
+    /// middleware. The peer router is never passed through this callback.
+    pub public_router: Option<Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>>,
 }
 
 impl NodeConfig {
@@ -71,6 +91,11 @@ impl NodeConfig {
             exit_on_fence: false,
             wake_tick: Duration::from_secs(1),
             wake_full_scan: Duration::from_secs(30),
+            database_factory: Arc::new(SqliteFactory),
+            runtime: None,
+            extensions: Vec::new(),
+            extension_timeout: Duration::from_secs(5),
+            public_router: None,
         }
     }
 }
@@ -93,7 +118,11 @@ pub struct Invocation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "lowercase")]
 pub enum InvOp {
-    Call { method: String, #[serde(default)] args: J },
+    Call {
+        method: String,
+        #[serde(default)]
+        args: J,
+    },
     Create,
     Delete,
     /// Fire the actor's alarm if it is due (internal: issued by alarm timers
@@ -110,19 +139,30 @@ pub struct Outcome {
 
 impl Outcome {
     pub fn ok(v: J) -> Self {
-        Self { status: 200, body: json!({ "result": v }) }
+        Self {
+            status: 200,
+            body: json!({ "result": v }),
+        }
     }
     pub fn err(status: u16, code: &str, message: impl Into<String>) -> Self {
-        Self { status, body: json!({ "error": { "code": code, "message": message.into() } }) }
+        Self {
+            status,
+            body: json!({ "error": { "code": code, "message": message.into() } }),
+        }
     }
     fn unavailable(m: impl Into<String>) -> Self {
         Self::err(503, "unavailable", m)
+    }
+
+    pub fn rejected(error: HookError) -> Self {
+        Self::err(error.status(), error.code(), error.to_string())
     }
 }
 
 type Slot = Arc<AsyncMutex<Option<Actor>>>;
 
 pub struct Node {
+    self_ref: Weak<Node>,
     pub cfg: NodeConfig,
     pub store: DynStore,
     pub runtime: Runtime,
@@ -154,11 +194,17 @@ impl ActorCaller for NodeCaller {
             app: req.target.app,
             ty: req.target.actor_type,
             key: req.target.key,
-            op: InvOp::Call { method: req.method, args: req.args },
+            op: InvOp::Call {
+                method: req.method,
+                args: req.args,
+            },
             chain: req.chain,
         };
         // Runs on the blocking thread executing the caller.
-        match self.rt.block_on(tokio::time::timeout(req.timeout, node.invoke(inv, 0))) {
+        match self.rt.block_on(tokio::time::timeout(
+            req.timeout,
+            node.invoke_with_metadata(inv, req.context),
+        )) {
             Err(_) => CallReply::Failed(CallFailure::Timeout),
             Ok(o) => reply_of(o),
         }
@@ -177,6 +223,14 @@ pub fn reply_of(o: Outcome) -> CallReply {
         Some("not_found") => CallFailure::NotFound(msg),
         Some("bad_request") => CallFailure::Incompatible(msg),
         Some("trap") => CallFailure::Trap(msg),
+        Some(
+            "unauthorized"
+            | "forbidden"
+            | "extension_invalid"
+            | "extension_unavailable"
+            | "extension_error"
+            | "extension_timeout",
+        ) => CallFailure::Rejected(msg),
         // The variant already says "cycle"; keep only the path.
         Some("cycle") => CallFailure::Cycle(msg.trim_start_matches("call cycle: ").to_string()),
         _ => CallFailure::Unavailable(format!("{} {msg}", o.status)),
@@ -191,6 +245,7 @@ struct PeerAuth {
 #[derive(Serialize, Deserialize)]
 pub struct Forwarded {
     pub invocation: Invocation,
+    pub context: InvocationMetadata,
     pub hops: u32,
     pub ts_ms: u64,
 }
@@ -200,7 +255,9 @@ async fn peer_secret(store: &DynStore) -> Result<Vec<u8>> {
         if let Some((a, _)) = get_json::<PeerAuth>(&**store, PEER_AUTH).await? {
             return Ok(hex::decode(a.secret)?);
         }
-        let a = PeerAuth { secret: hex::encode(rand::random::<[u8; 32]>()) };
+        let a = PeerAuth {
+            secret: hex::encode(rand::random::<[u8; 32]>()),
+        };
         match store.put_if_absent(PEER_AUTH, to_json_bytes(&a)).await {
             Ok(_) | Err(StoreError::Precondition) => continue,
             Err(e) => return Err(e.into()),
@@ -216,14 +273,24 @@ pub fn sign(secret: &[u8], body: &[u8]) -> String {
 
 /// Accepts WIT names (`get-balance`) and snake_case (`get_balance`).
 pub fn norm(s: &str) -> String {
-    if s.starts_with('_') { s.to_string() } else { s.replace('_', "-") }
+    if s.starts_with('_') {
+        s.to_string()
+    } else {
+        s.replace('_', "-")
+    }
 }
 
 impl Node {
     /// Acquires the lease, starts renewing it, then loads deployments.
-    pub(crate) async fn new(cfg: NodeConfig, advertise: String) -> Result<(Arc<Node>, tokio::task::JoinHandle<()>)> {
+    pub(crate) async fn new(
+        cfg: NodeConfig,
+        advertise: String,
+    ) -> Result<(Arc<Node>, tokio::task::JoinHandle<()>)> {
         let store = cfg.store.clone();
-        let runtime = Runtime::shared()?;
+        let runtime = match &cfg.runtime {
+            Some(runtime) => runtime.clone(),
+            None => Runtime::shared()?,
+        };
         let lease = Lease::acquire(store.clone(), &cfg.node_id, &advertise, cfg.lease_ttl).await?;
         let renew = tokio::spawn(lease.clone().run());
         let secret = match peer_secret(&store).await {
@@ -233,9 +300,12 @@ impl Node {
                 return Err(e);
             }
         };
-        let client = reqwest::Client::builder().timeout(Duration::from_secs(60)).build()?;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(60))
+            .build()?;
         let rt = tokio::runtime::Handle::current();
         let node = Arc::new_cyclic(|me| Node {
+            self_ref: me.clone(),
             cfg,
             store,
             runtime,
@@ -245,7 +315,10 @@ impl Node {
             actors: Default::default(),
             secret,
             client,
-            caller: Arc::new(NodeCaller { node: me.clone(), rt }),
+            caller: Arc::new(NodeCaller {
+                node: me.clone(),
+                rt,
+            }),
             timers: Default::default(),
             timers_changed: Default::default(),
         });
@@ -288,7 +361,13 @@ impl Node {
     /// Loads new deployments. Resident actors switch on their next call.
     pub async fn refresh_apps(&self) -> Result<()> {
         for cur in deploy::list(&self.store).await? {
-            if self.deployed.lock().unwrap().get(&cur.app).is_some_and(|d| d.id == cur.id) {
+            if self
+                .deployed
+                .lock()
+                .unwrap()
+                .get(&cur.app)
+                .is_some_and(|d| d.id == cur.id)
+            {
                 continue;
             }
             let (wasm, manifest) = deploy::fetch(&self.store, &cur).await?;
@@ -296,7 +375,12 @@ impl Node {
             let code = tokio::task::spawn_blocking(move || rt.load(&wasm, manifest))
                 .await?
                 .with_context(|| format!("load {}@{}", cur.app, cur.sha256))?;
-            tracing::info!(app = cur.app, version = cur.version, sha = &cur.sha256[..12], "loaded deployment");
+            tracing::info!(
+                app = cur.app,
+                version = cur.version,
+                sha = &cur.sha256[..12],
+                "loaded deployment"
+            );
             self.apps.write().unwrap().insert(cur.app.clone(), code);
             self.deployed.lock().unwrap().insert(cur.app.clone(), cur);
         }
@@ -304,7 +388,12 @@ impl Node {
     }
 
     fn slot(&self, id: &ActorId) -> Slot {
-        self.actors.lock().unwrap().entry(id.clone()).or_default().clone()
+        self.actors
+            .lock()
+            .unwrap()
+            .entry(id.clone())
+            .or_default()
+            .clone()
     }
 
     fn drop_slot_if_empty(&self, id: &ActorId) {
@@ -317,54 +406,294 @@ impl Node {
     }
 
     /// Routes and runs an invocation. Any node accepts any call.
-    pub async fn invoke(&self, mut inv: Invocation, hops: u32) -> Outcome {
+    pub async fn invoke(&self, inv: Invocation, hops: u32) -> Outcome {
+        let caller = if matches!(inv.op, InvOp::Alarm) {
+            Caller::System {
+                name: "alarm".into(),
+            }
+        } else {
+            Caller::Embedded
+        };
+        let context = match self.invocation_context(&inv, caller) {
+            Ok(context) => context,
+            Err(error) => return Outcome::rejected(error),
+        };
+        self.invoke_with_context(inv, context, hops).await
+    }
+
+    pub fn invocation_context(
+        &self,
+        inv: &Invocation,
+        caller: Caller,
+    ) -> std::result::Result<InvocationContext, HookError> {
+        let (target, operation) = invocation_parts(inv);
+        InvocationContext::new(target, operation, caller, self.cfg.lease_ttl * 2)
+    }
+
+    /// Trusted embedding API. Metadata is never taken from public request
+    /// bodies or identity headers by the framework.
+    pub async fn invoke_with_metadata(
+        &self,
+        inv: Invocation,
+        metadata: InvocationMetadata,
+    ) -> Outcome {
+        let (target, operation) = invocation_parts(&inv);
+        let context = match InvocationContext::from_metadata(target, operation, metadata) {
+            Ok(context) => context,
+            Err(error) => return Outcome::rejected(error),
+        };
+        self.invoke_with_context(inv, context, 0).await
+    }
+
+    pub async fn invoke_with_context(
+        &self,
+        mut inv: Invocation,
+        mut context: InvocationContext,
+        hops: u32,
+    ) -> Outcome {
         inv.ty = norm(&inv.ty);
         if let InvOp::Call { method, .. } = &mut inv.op {
             *method = norm(method);
         }
-        let deadline = Instant::now() + self.cfg.lease_ttl * 2;
+        (context.target, context.operation) = invocation_parts(&inv);
+        match self.admit(&mut context).await {
+            Ok(()) => self.invoke_routed(&inv, &context, hops, true).await,
+            Err(error) => {
+                let outcome = Outcome::rejected(error);
+                self.completed(context, outcome.clone());
+                outcome
+            }
+        }
+    }
+
+    async fn admit(&self, context: &mut InvocationContext) -> std::result::Result<(), HookError> {
+        let target = context.target.clone();
+        let operation = context.operation.clone();
+        let metadata = context.request.clone();
+        for extension in &self.cfg.extensions {
+            context.check_deadline()?;
+            let budget = self.cfg.extension_timeout.min(context.remaining());
+            run_hook(
+                extension.admit(context),
+                extension.name(),
+                "admission",
+                budget,
+            )
+            .await?;
+            if context.target != target
+                || context.operation != operation
+                || context.request.caller != metadata.caller
+                || context.request.request_id != metadata.request_id
+                || context.request.parent_request_id != metadata.parent_request_id
+                || context.request.deadline_unix_ms != metadata.deadline_unix_ms
+            {
+                context.target = target.clone();
+                context.operation = operation.clone();
+                context.request.caller = metadata.caller.clone();
+                context.request.request_id = metadata.request_id.clone();
+                context.request.parent_request_id = metadata.parent_request_id.clone();
+                context.request.deadline_unix_ms = metadata.deadline_unix_ms;
+                return Err(HookError::Internal(format!(
+                    "extension {} changed immutable invocation context",
+                    extension.name(),
+                )));
+            }
+        }
+        context.check_deadline()
+    }
+
+    async fn authorize_execution(
+        &self,
+        context: &InvocationContext,
+    ) -> std::result::Result<(), HookError> {
+        for extension in &self.cfg.extensions {
+            context.check_deadline()?;
+            run_hook(
+                extension.before_execute(context),
+                extension.name(),
+                "before-execute",
+                self.cfg.extension_timeout.min(context.remaining()),
+            )
+            .await?;
+            if !self.lease.valid() {
+                return Err(HookError::Unavailable(
+                    "node lease expired during extension".into(),
+                ));
+            }
+        }
+        context.check_deadline()
+    }
+
+    fn completed(&self, context: InvocationContext, outcome: Outcome) {
+        if self.cfg.extensions.is_empty() {
+            return;
+        }
+        let extensions = self.cfg.extensions.clone();
+        let budget = self.cfg.extension_timeout;
+        tokio::spawn(async move {
+            for extension in extensions {
+                let _ = run_hook(
+                    extension.completed(&context, &outcome),
+                    extension.name(),
+                    "completed",
+                    budget,
+                )
+                .await;
+            }
+        });
+    }
+
+    async fn lifecycle(&self, id: &ActorId, epoch: u64, kind: LifecycleKind) {
+        observe_lifecycle(
+            &self.cfg.extensions,
+            self.cfg.extension_timeout,
+            &LifecycleEvent {
+                actor: actor_ref(id),
+                epoch,
+                node_id: self.cfg.node_id.clone(),
+                kind,
+            },
+        )
+        .await;
+    }
+
+    async fn discard(&self, guard: &mut Option<Actor>, id: &ActorId) {
+        let epoch = guard.take().map(|actor| actor.epoch);
+        self.set_timer(id, None);
+        if let Some(epoch) = epoch {
+            let kind = if self.lease.valid() {
+                LifecycleKind::Discarded
+            } else {
+                LifecycleKind::Fenced
+            };
+            self.lifecycle(id, epoch, kind).await;
+        }
+    }
+
+    async fn invoke_routed(
+        &self,
+        inv: &Invocation,
+        context: &InvocationContext,
+        hops: u32,
+        complete: bool,
+    ) -> Outcome {
+        let Some(node) = self.self_ref.upgrade() else {
+            return Outcome::unavailable("node is shutting down");
+        };
+        let inv = inv.clone();
+        let context = context.clone();
+        // Once routing starts, caller cancellation must not abandon a local
+        // transaction between commit, capture, and durable upload.
+        match tokio::spawn(async move {
+            let outcome = node.route_loop(&inv, &context, hops).await;
+            if complete {
+                node.completed(context, outcome.clone());
+            }
+            outcome
+        })
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => Outcome::err(500, "internal", format!("invocation task failed: {error}")),
+        }
+    }
+
+    async fn route_loop(
+        &self,
+        inv: &Invocation,
+        context: &InvocationContext,
+        hops: u32,
+    ) -> Outcome {
+        let deadline = Instant::now() + (self.cfg.lease_ttl * 2).min(context.remaining());
+        let mut execution_checked = false;
         loop {
-            match self.try_invoke(&inv, hops).await {
+            if context.remaining().is_zero() {
+                return Outcome::unavailable("routing deadline expired; outcome may be unknown");
+            }
+            match self
+                .try_invoke(inv, context, &mut execution_checked, hops)
+                .await
+            {
                 Retry::Done(o) => return o,
                 Retry::Again(why) if Instant::now() < deadline => {
                     tracing::debug!("retrying {}: {why}", inv.key);
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    tokio::time::sleep(Duration::from_millis(250).min(context.remaining())).await;
                 }
                 Retry::Again(why) => return Outcome::unavailable(why),
             }
         }
     }
 
-    async fn try_invoke(&self, inv: &Invocation, hops: u32) -> Retry {
+    async fn try_invoke(
+        &self,
+        inv: &Invocation,
+        context: &InvocationContext,
+        execution_checked: &mut bool,
+        hops: u32,
+    ) -> Retry {
         use Retry::*;
         if !self.lease.valid() {
-            return Done(Outcome::unavailable("node is fenced or its lease is not current"));
+            return Done(Outcome::unavailable(
+                "node is fenced or its lease is not current",
+            ));
         }
         let Some(code) = self.app(&inv.app) else {
-            return Done(Outcome::err(404, "not_found", format!("app {:?} is not deployed", inv.app)));
+            return Done(Outcome::err(
+                404,
+                "not_found",
+                format!("app {:?} is not deployed", inv.app),
+            ));
         };
         if let InvOp::Call { method, .. } = &inv.op {
             if let Err(e) = resolve_method(&code.manifest, &inv.ty, method) {
                 return Done(Outcome::err(404, "not_found", e.to_string()));
             }
         } else if code.manifest.actor_type(&inv.ty).is_none() {
-            return Done(Outcome::err(404, "not_found", format!("app {} has no actor type {:?}", inv.app, inv.ty)));
+            return Done(Outcome::err(
+                404,
+                "not_found",
+                format!("app {} has no actor type {:?}", inv.app, inv.ty),
+            ));
         }
         if inv.key.is_empty() || inv.key.len() > MAX_KEY_LEN {
-            return Done(Outcome::err(400, "bad_request", format!("actor key must be 1..={MAX_KEY_LEN} bytes")));
+            return Done(Outcome::err(
+                400,
+                "bad_request",
+                format!("actor key must be 1..={MAX_KEY_LEN} bytes"),
+            ));
         }
-        let id = ActorId { app: inv.app.clone(), ty: inv.ty.clone(), key: inv.key.clone() };
+        let id = ActorId {
+            app: inv.app.clone(),
+            ty: inv.ty.clone(),
+            key: inv.key.clone(),
+        };
         // The actors on the chain hold their slot locks while waiting for this
         // call, so calling back into one of them would deadlock.
-        if inv.chain.iter().any(|a| a.app == id.app && a.actor_type == id.ty && a.key == id.key) {
+        if inv
+            .chain
+            .iter()
+            .any(|a| a.app == id.app && a.actor_type == id.ty && a.key == id.key)
+        {
             let path: Vec<String> = inv.chain.iter().map(|a| a.to_string()).collect();
-            return Done(Outcome::err(508, "cycle", format!("call cycle: {} -> {id}", path.join(" -> "))));
+            return Done(Outcome::err(
+                508,
+                "cycle",
+                format!("call cycle: {} -> {id}", path.join(" -> ")),
+            ));
         }
         if inv.chain.len() >= MAX_CALL_DEPTH {
-            return Done(Outcome::err(508, "cycle", format!("call chain deeper than {MAX_CALL_DEPTH}")));
+            return Done(Outcome::err(
+                508,
+                "cycle",
+                format!("call chain deeper than {MAX_CALL_DEPTH}"),
+            ));
         }
         let slot = self.slot(&id);
-        let mut guard = slot.clone().lock_owned().await;
+        let mut guard =
+            match tokio::time::timeout(context.remaining(), slot.clone().lock_owned()).await {
+                Ok(guard) => guard,
+                Err(_) => return Done(Outcome::rejected(HookError::Timeout)),
+            };
         let mut created = false;
         if guard.is_none() {
             if matches!(inv.op, InvOp::Delete | InvOp::Alarm) {
@@ -374,8 +703,16 @@ impl Node {
                         drop(guard);
                         self.drop_slot_if_empty(&id);
                         // `gone` tells the waker the actor no longer exists.
-                        let code = if matches!(inv.op, InvOp::Alarm) { "gone" } else { "not_found" };
-                        return Done(Outcome::err(404, code, format!("actor {id} does not exist")));
+                        let code = if matches!(inv.op, InvOp::Alarm) {
+                            "gone"
+                        } else {
+                            "not_found"
+                        };
+                        return Done(Outcome::err(
+                            404,
+                            code,
+                            format!("actor {id} does not exist"),
+                        ));
                     }
                     Err(e) => return Again(format!("read owner: {e}")),
                 }
@@ -386,7 +723,11 @@ impl Node {
                 Ok(Acquire::Exists) => {
                     drop(guard);
                     self.drop_slot_if_empty(&id);
-                    return Done(Outcome::err(409, "conflict", format!("actor {id} already exists")));
+                    return Done(Outcome::err(
+                        409,
+                        "conflict",
+                        format!("actor {id} already exists"),
+                    ));
                 }
                 Ok(Acquire::Remote(peer)) => {
                     drop(guard);
@@ -394,40 +735,111 @@ impl Node {
                     if hops >= MAX_HOPS {
                         return Done(Outcome::unavailable("too many forwarding hops"));
                     }
-                    return match self.forward(&peer.advertise, inv, hops + 1).await {
+                    return match self.forward(&peer.advertise, inv, context, hops + 1).await {
                         Ok(o) => Done(o),
                         Err(e) => Again(format!("owner {} unreachable: {e}", peer.node_id)),
                     };
                 }
                 Ok(Acquire::Acquired { epoch, etag, fresh }) => {
-                    match actor::activate(&self.store, &self.cfg.data_dir, &id, epoch, etag, fresh, code.clone()).await {
+                    if !*execution_checked {
+                        if let Err(error) = self.authorize_execution(context).await {
+                            if let Err(release_error) = owner::release(
+                                &self.store,
+                                &id,
+                                &self.me(),
+                                epoch,
+                                &etag,
+                                if fresh {
+                                    OwnerState::Deleted
+                                } else {
+                                    OwnerState::Unowned
+                                },
+                            )
+                            .await
+                            {
+                                tracing::warn!(actor = %id, %release_error, "release rejected activation failed");
+                            }
+                            drop(guard);
+                            self.drop_slot_if_empty(&id);
+                            return Done(Outcome::rejected(error));
+                        }
+                        *execution_checked = true;
+                    }
+                    if !self.lease.valid() {
+                        return Done(Outcome::unavailable("lease expired before activation"));
+                    }
+                    match actor::activate(
+                        &self.store,
+                        &self.cfg.data_dir,
+                        &id,
+                        epoch,
+                        etag,
+                        fresh,
+                        code.clone(),
+                        self.cfg.database_factory.clone(),
+                    )
+                    .await
+                    {
                         Ok(mut c) => {
                             c.caller = Some(self.caller.clone());
                             tracing::info!(actor = %id, epoch, "activated");
                             self.set_timer(&id, c.alarm.map(|a| a.at_ms));
                             *guard = Some(c);
                             created = true;
+                            self.lifecycle(&id, epoch, LifecycleKind::Activated).await;
                         }
                         Err(e) => return Again(format!("activate {id}: {e:#}")),
                     }
                 }
             }
         } else if matches!(inv.op, InvOp::Create) {
-            return Done(Outcome::err(409, "conflict", format!("actor {id} already exists")));
+            return Done(Outcome::err(
+                409,
+                "conflict",
+                format!("actor {id} already exists"),
+            ));
         }
 
+        if !*execution_checked {
+            if let Err(error) = self.authorize_execution(context).await {
+                if !self.lease.valid() {
+                    self.discard(&mut guard, &id).await;
+                }
+                return Done(Outcome::rejected(error));
+            }
+            *execution_checked = true;
+        }
+        if !self.lease.valid() {
+            self.discard(&mut guard, &id).await;
+            return Done(Outcome::unavailable("lease expired before execution"));
+        }
+        if let Err(error) = context.check_deadline() {
+            return Done(Outcome::rejected(error));
+        }
         let op = match &inv.op {
             InvOp::Delete => return Done(self.delete(guard, &id).await),
             InvOp::Create => {
                 debug_assert!(created);
                 Op::Touch
             }
-            InvOp::Call { method, args } => {
-                Op::Call { method: method.clone(), args: args.clone(), chain: inv.chain.clone() }
-            }
+            InvOp::Call { method, args } => Op::Call {
+                method: method.clone(),
+                args: args.clone(),
+                chain: inv.chain.clone(),
+            },
             InvOp::Alarm => Op::Alarm { now_ms: now_ms() },
         };
-        Done(self.run(guard, &id, code, op, matches!(inv.op, InvOp::Create)).await)
+        Done(
+            self.run(
+                guard,
+                &id,
+                code,
+                op,
+                matches!(inv.op, InvOp::Create),
+                context,
+            )
+            .await,
+        )
     }
 
     async fn run(
@@ -437,29 +849,69 @@ impl Node {
         code: Arc<AppCode>,
         op: Op,
         is_create: bool,
+        context: &InvocationContext,
     ) -> Outcome {
-        let (mut guard, res) = tokio::task::spawn_blocking(move || {
+        let slot = tokio::sync::OwnedMutexGuard::mutex(&guard).clone();
+        let extensions = self.cfg.extensions.clone();
+        let context = context.clone();
+        let lease = self.lease.clone();
+        let execution = tokio::task::spawn_blocking(move || {
             let mut guard = guard;
-            let res = guard.as_mut().expect("resident").execute(&code, op);
+            let res = if lease.valid() {
+                Some(guard.as_mut().expect("resident").execute_with_context(
+                    &code,
+                    op,
+                    &context,
+                    &extensions,
+                ))
+            } else {
+                None
+            };
             (guard, res)
         })
-        .await
-        .expect("execute task panicked");
+        .await;
+        let (mut guard, res) = match execution {
+            Ok((guard, Some(res))) => (guard, res),
+            Ok((mut guard, None)) => {
+                self.discard(&mut guard, id).await;
+                return Outcome::unavailable("lease expired before transaction");
+            }
+            Err(error) => {
+                let mut guard = slot.lock_owned().await;
+                self.discard(&mut guard, id).await;
+                return Outcome::err(
+                    500,
+                    "internal",
+                    format!("actor execution task failed: {error}"),
+                );
+            }
+        };
         let executed = match res {
             Ok(x) => x,
             Err(e) => {
-                *guard = None;
-                self.set_timer(id, None);
+                self.discard(&mut guard, id).await;
                 return Outcome::err(500, "internal", format!("{e:#}"));
             }
         };
+        if executed.code_changed {
+            let epoch = guard.as_ref().expect("resident").epoch;
+            self.lifecycle(id, epoch, LifecycleKind::CodeReplaced).await;
+        }
         // A new alarm's wake hint is written before the transaction becomes
         // durable, so a durable alarm always has one.
         if let Some(a) = executed.alarm.and_then(|c| c.after) {
-            if let Err(e) = self.store.put(&wake_key(id, &a), to_json_bytes(&json!({ "at_ms": a.at_ms }))).await {
-                *guard = None;
-                self.set_timer(id, None);
-                return Outcome::unavailable(format!("write was not made durable ({e}); it did not apply"));
+            if let Err(e) = self
+                .store
+                .put(
+                    &wake_key(id, &a),
+                    to_json_bytes(&json!({ "at_ms": a.at_ms })),
+                )
+                .await
+            {
+                self.discard(&mut guard, id).await;
+                return Outcome::unavailable(format!(
+                    "write was not made durable ({e}); it did not apply"
+                ));
             }
         }
         if let Some(seg) = executed.segment {
@@ -469,18 +921,14 @@ impl Node {
                 (c.epoch, c.txid, c.snapshot_txid)
             };
             let key = format!("{}{}", id.epoch_prefix(epoch), segment_name(seg.txid));
-            if let Err(e) = self.store.put(&key, Bytes::from(seg.encode())).await {
-                *guard = None;
-                self.set_timer(id, None);
-                return Outcome::unavailable(format!("write was not made durable ({e}); it may or may not have applied"));
+            if let Err(e) = self.store.put(&key, Bytes::from(seg.data)).await {
+                self.discard(&mut guard, id).await;
+                return Outcome::unavailable(format!(
+                    "write was not made durable ({e}); it may or may not have applied"
+                ));
             }
-            let owned = self.lease.valid()
-                && matches!(owner::still_owner(&self.store, id, &self.me(), epoch).await, Ok(true));
-            if !owned {
-                tracing::warn!(actor = %id, epoch, "lost ownership; not acknowledging");
-                *guard = None;
-                self.set_timer(id, None);
-                return Outcome::unavailable("actor ownership moved; write not acknowledged");
+            if let Some(outcome) = self.check_owner(&mut guard, id).await {
+                return outcome;
             }
             if let Some(change) = executed.alarm {
                 self.set_timer(id, change.after.map(|a| a.at_ms));
@@ -496,9 +944,12 @@ impl Node {
             if txid - snapshot_txid >= self.cfg.snapshot_every {
                 let store = self.store.clone();
                 let id = id.clone();
+                let node = self.self_ref.clone();
                 tokio::spawn(async move {
                     let (mut guard, res) = tokio::task::spawn_blocking(move || {
-                        let r = guard.as_mut().map(|c| c.snapshot().map(|b| (c.epoch, c.txid, b)));
+                        let r = guard
+                            .as_mut()
+                            .map(|c| c.snapshot().map(|b| (c.epoch, c.txid, b)));
                         (guard, r)
                     })
                     .await
@@ -506,26 +957,44 @@ impl Node {
                     match res {
                         // `guard` stays held until the upload is done, which
                         // keeps the snapshot file unchanged.
-                        Some(Ok((epoch, txid, image))) => match actor::compact(&store, &id, epoch, txid, &image).await {
-                            Ok(()) => {
-                                if let Some(c) = guard.as_mut() {
-                                    c.snapshot_txid = txid;
+                        Some(Ok((epoch, txid, image))) => {
+                            match actor::compact(&store, &id, epoch, txid, &image).await {
+                                Ok(()) => {
+                                    if let Some(c) = guard.as_mut() {
+                                        c.snapshot_txid = txid;
+                                    }
+                                    tracing::debug!(actor = %id, txid, "compacted");
                                 }
-                                tracing::debug!(actor = %id, txid, "compacted");
+                                Err(e) => tracing::warn!(actor = %id, "compaction failed: {e:#}"),
                             }
-                            Err(e) => tracing::warn!(actor = %id, "compaction failed: {e:#}"),
-                        },
+                        }
                         Some(Err(e)) => {
                             tracing::warn!(actor = %id, "snapshot failed: {e:#}");
-                            *guard = None;
+                            let epoch = guard.take().map(|actor| actor.epoch);
+                            if let Some(node) = node.upgrade() {
+                                node.set_timer(&id, None);
+                                if let Some(epoch) = epoch {
+                                    let kind = if node.lease.valid() {
+                                        LifecycleKind::Discarded
+                                    } else {
+                                        LifecycleKind::Fenced
+                                    };
+                                    node.lifecycle(&id, epoch, kind).await;
+                                }
+                            }
                         }
                         None => {}
                     }
                 });
             }
+        } else if let Some(outcome) = self.check_owner(&mut guard, id).await {
+            return outcome;
         }
-        if is_create {
-            return Outcome { status: 201, body: json!({ "result": { "created": true } }) };
+        if is_create && matches!(&executed.outcome, Ok(output) if !output.is_err) {
+            return Outcome {
+                status: 201,
+                body: json!({ "result": { "created": true } }),
+            };
         }
         match executed.outcome {
             Ok(out) if out.is_err => Outcome {
@@ -536,24 +1005,69 @@ impl Node {
             Err(CallError::NotFound(m)) => Outcome::err(404, "not_found", m),
             Err(CallError::BadArgs(m)) => Outcome::err(400, "bad_request", m),
             Err(CallError::Trap(m)) => Outcome::err(500, "trap", m),
+            Err(CallError::Rejected(error)) => Outcome::rejected(error),
         }
     }
 
-    async fn delete(&self, mut guard: tokio::sync::OwnedMutexGuard<Option<Actor>>, id: &ActorId) -> Outcome {
+    async fn check_owner(&self, guard: &mut Option<Actor>, id: &ActorId) -> Option<Outcome> {
+        let epoch = guard.as_ref().expect("resident").epoch;
+        let owned = self.lease.valid()
+            && matches!(
+                owner::still_owner(&self.store, id, &self.me(), epoch).await,
+                Ok(true)
+            )
+            && self.lease.valid();
+        if !owned {
+            tracing::warn!(actor = %id, epoch, "lost ownership; not acknowledging");
+            self.discard(guard, id).await;
+            Some(Outcome::unavailable(
+                "actor ownership moved; outcome not acknowledged",
+            ))
+        } else {
+            None
+        }
+    }
+
+    async fn delete(
+        &self,
+        mut guard: tokio::sync::OwnedMutexGuard<Option<Actor>>,
+        id: &ActorId,
+    ) -> Outcome {
         let actor = guard.take().expect("resident");
+        let epoch = actor.epoch;
+        self.set_timer(id, None);
         if !self.lease.valid() {
+            drop(actor);
+            self.lifecycle(id, epoch, LifecycleKind::Fenced).await;
             return Outcome::unavailable("lease not current");
         }
-        match owner::release(&self.store, id, &self.me(), actor.epoch, &actor.owner_etag, OwnerState::Deleted).await {
+        match owner::release(
+            &self.store,
+            id,
+            &self.me(),
+            actor.epoch,
+            &actor.owner_etag,
+            OwnerState::Deleted,
+        )
+        .await
+        {
             Ok(true) => {}
-            Ok(false) => return Outcome::unavailable("actor ownership moved; retry"),
-            Err(e) => return Outcome::unavailable(format!("delete failed: {e}")),
+            Ok(false) => {
+                drop(actor);
+                self.lifecycle(id, epoch, LifecycleKind::Discarded).await;
+                return Outcome::unavailable("actor ownership moved; retry");
+            }
+            Err(e) => {
+                drop(actor);
+                self.lifecycle(id, epoch, LifecycleKind::Discarded).await;
+                return Outcome::unavailable(format!("delete failed: {e}"));
+            }
         }
-        self.set_timer(id, None);
         if let Some(a) = actor.alarm {
             let _ = self.store.delete(&wake_key(id, &a)).await;
         }
         drop(actor);
+        self.lifecycle(id, epoch, LifecycleKind::Deleted).await;
         let prefix = id.ltx_prefix();
         if let Ok(keys) = self.store.list(&prefix).await {
             for k in keys {
@@ -563,11 +1077,26 @@ impl Node {
         drop(guard);
         self.drop_slot_if_empty(id);
         tracing::info!(actor = %id, "deleted");
-        Outcome::ok(json!({ "deleted": true }))
+        if self.lease.valid() {
+            Outcome::ok(json!({ "deleted": true }))
+        } else {
+            Outcome::unavailable("lease expired after deletion; outcome not acknowledged")
+        }
     }
 
-    async fn forward(&self, base: &str, inv: &Invocation, hops: u32) -> Result<Outcome> {
-        let body = serde_json::to_vec(&Forwarded { invocation: inv.clone(), hops, ts_ms: now_ms() })?;
+    async fn forward(
+        &self,
+        base: &str,
+        inv: &Invocation,
+        context: &InvocationContext,
+        hops: u32,
+    ) -> Result<Outcome> {
+        let body = serde_json::to_vec(&Forwarded {
+            invocation: inv.clone(),
+            context: context.request.clone(),
+            hops,
+            ts_ms: now_ms(),
+        })?;
         let sig = sign(&self.secret, &body);
         let resp = self
             .client
@@ -575,6 +1104,7 @@ impl Node {
             .header(SIGNATURE_HEADER, sig)
             .header("content-type", "application/json")
             .body(body)
+            .timeout(context.remaining())
             .send()
             .await?;
         let status = resp.status().as_u16();
@@ -599,23 +1129,58 @@ impl Node {
         if now_ms().abs_diff(f.ts_ms) > 60_000 {
             return Outcome::err(401, "unauthorized", "stale peer request");
         }
-        self.invoke(f.invocation, f.hops).await
+        let mut inv = f.invocation;
+        inv.ty = norm(&inv.ty);
+        if let InvOp::Call { method, .. } = &mut inv.op {
+            *method = norm(method);
+        }
+        let (target, operation) = invocation_parts(&inv);
+        let context = match InvocationContext::from_metadata(target, operation, f.context) {
+            Ok(context) => context,
+            Err(error) => return Outcome::rejected(error),
+        };
+        // Admission already ran at the trusted entry node. The actual owner
+        // still runs its own execution and transaction checks.
+        self.invoke_routed(&inv, &context, f.hops, false).await
     }
 
     /// Releases actors idle for longer than the idle timeout.
     pub async fn evict_idle(&self, idle: Duration) {
-        let slots: Vec<(ActorId, Slot)> =
-            self.actors.lock().unwrap().iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        self.release_idle(idle, LifecycleKind::Evicted).await;
+    }
+
+    async fn release_idle(&self, idle: Duration, kind: LifecycleKind) {
+        let slots: Vec<(ActorId, Slot)> = self
+            .actors
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         for (id, slot) in slots {
-            let Ok(mut g) = slot.clone().try_lock_owned() else { continue };
+            let Ok(mut g) = slot.clone().try_lock_owned() else {
+                continue;
+            };
             if g.as_ref().is_some_and(|c| c.last_used.elapsed() >= idle) {
                 let c = g.take().unwrap();
                 // The waker fires its alarm from now on.
                 self.set_timer(&id, None);
-                match owner::release(&self.store, &id, &self.me(), c.epoch, &c.owner_etag, OwnerState::Unowned).await {
+                match owner::release(
+                    &self.store,
+                    &id,
+                    &self.me(),
+                    c.epoch,
+                    &c.owner_etag,
+                    OwnerState::Unowned,
+                )
+                .await
+                {
                     Ok(_) => tracing::info!(actor = %id, "released"),
                     Err(e) => tracing::warn!(actor = %id, "release failed: {e}"),
                 }
+                let epoch = c.epoch;
+                drop(c);
+                self.lifecycle(&id, epoch, kind).await;
             }
             drop(g);
             drop(slot);
@@ -625,22 +1190,52 @@ impl Node {
 
     /// Releases every actor (graceful shutdown).
     pub async fn release_all(&self) {
-        self.evict_idle(Duration::ZERO).await;
+        self.release_idle(Duration::ZERO, LifecycleKind::Shutdown)
+            .await;
     }
 
     /// Drops all resident actors without touching the store (after fencing).
     pub fn drop_all(&self) {
         self.timers.lock().unwrap().clear();
-        let slots: Vec<Slot> = self.actors.lock().unwrap().drain().map(|(_, v)| v).collect();
-        for s in slots {
+        let slots: Vec<(ActorId, Slot)> = self.actors.lock().unwrap().drain().collect();
+        let mut events = Vec::new();
+        for (id, s) in slots {
             if let Ok(mut g) = s.try_lock() {
-                *g = None;
+                if let Some(actor) = g.take() {
+                    events.push(LifecycleEvent {
+                        actor: actor_ref(&id),
+                        epoch: actor.epoch,
+                        node_id: self.cfg.node_id.clone(),
+                        kind: LifecycleKind::Fenced,
+                    });
+                }
+            }
+        }
+        if !events.is_empty() && !self.cfg.extensions.is_empty() {
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let extensions = self.cfg.extensions.clone();
+                    let budget = self.cfg.extension_timeout;
+                    handle.spawn(async move {
+                        for event in events {
+                            observe_lifecycle(&extensions, budget, &event).await;
+                        }
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cannot deliver fencing lifecycle events without a runtime")
+                }
             }
         }
     }
 
     /// Lists actors of an app from ownership records.
-    pub async fn list_actors(&self, app: &str, ty: Option<&str>, limit: usize) -> Result<Vec<OwnerRecord>> {
+    pub async fn list_actors(
+        &self,
+        app: &str,
+        ty: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<OwnerRecord>> {
         let prefix = match ty {
             Some(t) => format!("actors/{}/{}/", app_dir(app), norm(t)),
             None => format!("actors/{}/", app_dir(app)),
@@ -666,4 +1261,32 @@ impl Node {
 enum Retry {
     Done(Outcome),
     Again(String),
+}
+
+fn actor_ref(id: &ActorId) -> ActorRef {
+    ActorRef {
+        app: id.app.clone(),
+        actor_type: id.ty.clone(),
+        key: id.key.clone(),
+    }
+}
+
+fn invocation_parts(inv: &Invocation) -> (ActorRef, InvocationOperation) {
+    let operation = match &inv.op {
+        InvOp::Call { method, args } => InvocationOperation::Call {
+            method: norm(method),
+            args: args.clone(),
+        },
+        InvOp::Create => InvocationOperation::Create,
+        InvOp::Delete => InvocationOperation::Delete,
+        InvOp::Alarm => InvocationOperation::Alarm,
+    };
+    (
+        ActorRef {
+            app: inv.app.clone(),
+            actor_type: norm(&inv.ty),
+            key: inv.key.clone(),
+        },
+        operation,
+    )
 }

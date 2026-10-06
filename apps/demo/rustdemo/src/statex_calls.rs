@@ -6,7 +6,8 @@
 //! (per test thread); a call without a stub panics.
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 
-mod bindings_demo_db {
+#[allow(non_snake_case)]
+mod bindings_demo__db {
     wit_bindgen::generate!({
         path: "wit",
         world: "demo:db/statex-calls",
@@ -21,7 +22,7 @@ pub mod demo {
         /// Each exported interface is an actor type; each function is a method.
         /// Every key (e.g. "alice") is an independent actor with its own SQLite database.
         pub mod kv {
-            use super::super::super::bindings_demo_db::demo::db::kv as raw;
+            use super::super::super::bindings_demo__db::demo::db::kv as raw;
             pub use raw::{Entry};
             pub use statex_guest::actors::CallError;
 

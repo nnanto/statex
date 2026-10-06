@@ -6,7 +6,8 @@
 //! (per test thread); a call without a stub panics.
 #![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 
-mod bindings_statex_counter {
+#[allow(non_snake_case)]
+mod bindings_statex__counter {
     wit_bindgen::generate!({
         path: "wit",
         world: "statex:counter/statex-calls",
@@ -15,7 +16,8 @@ mod bindings_statex_counter {
     });
 }
 
-mod bindings_statex_caller {
+#[allow(non_snake_case)]
+mod bindings_statex__caller {
     wit_bindgen::generate!({
         path: "wit",
         world: "statex:caller/statex-calls",
@@ -29,7 +31,7 @@ pub mod statex {
     pub mod counter {
         /// A simple counter. Each key (e.g. "alice") is an independent actor.
         pub mod counter {
-            use super::super::super::bindings_statex_counter::statex::counter::counter as raw;
+            use super::super::super::bindings_statex__counter::statex::counter::counter as raw;
             pub use statex_guest::actors::CallError;
 
             #[cfg(target_arch = "wasm32")]
@@ -131,7 +133,7 @@ pub mod statex {
         }
         /// A tiny ledger showing records, enums, variants, options and results.
         pub mod account {
-            use super::super::super::bindings_statex_counter::statex::counter::account as raw;
+            use super::super::super::bindings_statex__counter::statex::counter::account as raw;
             pub use raw::{TxError, Kind, Entry};
             pub use statex_guest::actors::CallError;
 
@@ -213,7 +215,7 @@ pub mod statex {
     pub mod caller {
         /// Calls actors of the `counter` example app, and other relays.
         pub mod relay {
-            use super::super::super::bindings_statex_caller::statex::caller::relay as raw;
+            use super::super::super::bindings_statex__caller::statex::caller::relay as raw;
             pub use statex_guest::actors::CallError;
 
             #[cfg(target_arch = "wasm32")]

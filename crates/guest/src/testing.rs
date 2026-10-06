@@ -13,7 +13,7 @@
 //!
 //! Each `(actor type, key)` gets its own in-memory SQLite database with the
 //! migrations from `migrations/<actor-type>/*.sql` (relative to
-//! `CARGO_MANIFEST_DIR`) applied, exactly like the real host does. Each
+//! `CARGO_MANIFEST_DIR`) applied, like the default SQLite host does. Each
 //! `call` runs in a transaction: a panic rolls it back (and, with
 //! [`try_call`], so does returning `Err`).
 

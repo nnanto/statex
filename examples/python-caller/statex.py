@@ -4,7 +4,9 @@
     statex.execute("UPDATE t SET v = v + ?1", by)
     n = statex.query_scalar("SELECT v FROM t")
 
-Every method call runs inside one host-managed transaction: returning commits,
+The actor's private SQL database uses SQLite by default; SQL dialect and
+migration support belong to the configured state backend.
+Every method call runs inside one host-managed transaction: a successful return commits,
 raising rolls back. For a method returning `result<T, E>`, `raise statex.Err(e)`
 returns the `err` case (HTTP 422 with `e` as detail); any other exception traps.
 
@@ -99,6 +101,7 @@ _CALL_ERRORS = {
     "Incompatible": "incompatible",
     "Trap": "callee trapped",
     "Unavailable": "unavailable",
+    "Rejected": "rejected",
     "Cycle": "call cycle",
     "Timeout": "timed out",
 }

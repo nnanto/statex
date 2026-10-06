@@ -1,15 +1,14 @@
 //! Host implementations of the `statex:host` interfaces.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rusqlite::types::Value as RV;
-use rusqlite::Connection;
 use wasmtime::component::ResourceTable;
 use wasmtime::StoreLimits;
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 
 use crate::calls::{ActorCaller, ActorRef};
+use crate::database::{DatabaseHandle, SqlValue};
 use crate::manifest::HttpPolicy;
 
 wasmtime::component::bindgen!({
@@ -34,7 +33,7 @@ pub struct HostState {
     pub(crate) table: ResourceTable,
     pub(crate) limits: StoreLimits,
     pub identity: ActorIdentity,
-    pub db: Arc<Mutex<Connection>>,
+    pub db: DatabaseHandle,
     pub(crate) http: HttpPolicy,
     pub(crate) http_timeout: Duration,
     /// Routes actor-to-actor calls; `None` where calls are unavailable.
@@ -45,13 +44,33 @@ pub struct HostState {
     pub(crate) deadline: Option<Instant>,
     /// Whether the actor type exports an alarm handler.
     pub(crate) has_alarm: bool,
+    pub extensions: crate::Extensions,
+    pub(crate) http_transport: Arc<dyn crate::HttpTransport>,
+    pub(crate) log_sink: Arc<dyn crate::LogSink>,
+    /// Failures of capabilities whose WIT signatures cannot return errors.
+    pub(crate) capability_error: Option<String>,
+    pub(crate) invocation_context: Option<crate::invocation::InvocationContext>,
+}
+
+impl HostState {
+    /// Present only while guest code executes, including additional imports.
+    pub fn invocation_context(&self) -> Option<&crate::invocation::InvocationContext> {
+        self.invocation_context.as_ref()
+    }
+    /// The actor's resource table, shared by WASI and additional host interfaces.
+    pub fn resource_table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
 }
 
 impl actors::Host for HostState {}
 
 impl WasiView for HostState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView { ctx: &mut self.wasi, table: &mut self.table }
+        WasiCtxView {
+            ctx: &mut self.wasi,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -78,86 +97,148 @@ impl alarms::Host for HostState {
                 self.identity.actor_type
             ));
         }
-        let db = self.db.lock().unwrap();
-        crate::alarm::set(&db, at_ms, self.identity.epoch).map_err(|e| e.to_string())
+        self.db
+            .lock()
+            .unwrap()
+            .set_alarm(at_ms, 0, self.identity.epoch)
+            .map_err(|e| e.to_string())
     }
 
     fn get(&mut self) -> Option<u64> {
-        let db = self.db.lock().unwrap();
-        crate::alarm::read(&db).ok().flatten().map(|a| a.at_ms)
+        let result = self.db.lock().unwrap().alarm();
+        match result {
+            Ok(alarm) => alarm.map(|a| a.at_ms),
+            Err(error) => {
+                let error = format!("read alarm: {error:#}");
+                tracing::error!("{error}");
+                self.capability_error.get_or_insert(error);
+                None
+            }
+        }
     }
 
     fn clear(&mut self) {
-        let db = self.db.lock().unwrap();
-        if let Err(e) = crate::alarm::clear(&db) {
-            tracing::warn!("clear alarm: {e}");
+        let result = self.db.lock().unwrap().clear_alarm();
+        if let Err(error) = result {
+            let error = format!("clear alarm: {error:#}");
+            tracing::error!("{error}");
+            self.capability_error.get_or_insert(error);
         }
     }
 }
 
 /// Statements a guest may not run: the host owns transactions and the file.
 pub fn forbidden(stmt: &str) -> Option<&'static str> {
-    let s = stmt.trim_start().to_ascii_uppercase();
-    for kw in [
-        "BEGIN", "COMMIT", "END", "ROLLBACK", "SAVEPOINT", "RELEASE", "ATTACH", "DETACH", "VACUUM", "PRAGMA",
-    ] {
-        if s.starts_with(kw)
-            && s[kw.len()..].chars().next().is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_')
-        {
-            return Some(kw);
+    const KEYWORDS: &[&str] = &[
+        "BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "SAVEPOINT",
+        "RELEASE",
+        "ATTACH",
+        "DETACH",
+        "VACUUM",
+        "PRAGMA",
+    ];
+    let bytes = stmt.as_bytes();
+    let mut i = 0;
+    let mut statement_start = true;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+        } else if bytes[i..].starts_with(b"\xef\xbb\xbf") {
+            i += 3;
+        } else if bytes[i..].starts_with(b"--") {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' { i += 1; }
+        } else if bytes[i..].starts_with(b"/*") {
+            i += 2;
+            while i < bytes.len() && !bytes[i..].starts_with(b"*/") { i += 1; }
+            i = (i + 2).min(bytes.len());
+        } else if bytes[i] == b';' {
+            statement_start = true;
+            i += 1;
+        } else if matches!(bytes[i], b'\'' | b'"' | b'`' | b'[') {
+            statement_start = false;
+            let quote = if bytes[i] == b'[' { b']' } else { bytes[i] };
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == quote {
+                    i += 1;
+                    if i < bytes.len() && bytes[i] == quote { i += 1; } else { break; }
+                } else { i += 1; }
+            }
+        } else {
+            let start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') { i += 1; }
+            if statement_start && i > start {
+                for &keyword in KEYWORDS {
+                    if bytes[start..i].eq_ignore_ascii_case(keyword.as_bytes()) { return Some(keyword); }
+                }
+            }
+            statement_start = false;
+            if i == start { i += 1; }
         }
     }
     None
 }
 
-fn to_rv(v: &sql::Value) -> RV {
+fn to_value(v: &sql::Value) -> SqlValue {
     match v {
-        sql::Value::Null => RV::Null,
-        sql::Value::Integer(i) => RV::Integer(*i),
-        sql::Value::Real(f) => RV::Real(*f),
-        sql::Value::Text(t) => RV::Text(t.clone()),
-        sql::Value::Blob(b) => RV::Blob(b.clone()),
+        sql::Value::Null => SqlValue::Null,
+        sql::Value::Integer(i) => SqlValue::Integer(*i),
+        sql::Value::Real(f) => SqlValue::Real(*f),
+        sql::Value::Text(t) => SqlValue::Text(t.clone()),
+        sql::Value::Blob(b) => SqlValue::Blob(b.clone()),
     }
 }
 
-fn from_rv(v: RV) -> sql::Value {
+fn from_value(v: SqlValue) -> sql::Value {
     match v {
-        RV::Null => sql::Value::Null,
-        RV::Integer(i) => sql::Value::Integer(i),
-        RV::Real(f) => sql::Value::Real(f),
-        RV::Text(t) => sql::Value::Text(t),
-        RV::Blob(b) => sql::Value::Blob(b),
+        SqlValue::Null => sql::Value::Null,
+        SqlValue::Integer(i) => sql::Value::Integer(i),
+        SqlValue::Real(f) => sql::Value::Real(f),
+        SqlValue::Text(t) => sql::Value::Text(t),
+        SqlValue::Blob(b) => sql::Value::Blob(b),
     }
 }
 
 impl sql::Host for HostState {
     fn execute(&mut self, stmt: String, params: Vec<sql::Value>) -> Result<u64, String> {
         if let Some(kw) = forbidden(&stmt) {
-            return Err(format!("{kw} is not allowed: the host manages transactions"));
+            return Err(format!(
+                "{kw} is not allowed: the host manages transactions"
+            ));
         }
-        let p: Vec<RV> = params.iter().map(to_rv).collect();
-        let db = self.db.lock().unwrap();
-        db.execute(&stmt, rusqlite::params_from_iter(p.iter())).map(|n| n as u64).map_err(|e| e.to_string())
+        let p: Vec<_> = params.iter().map(to_value).collect();
+        self.db
+            .lock()
+            .unwrap()
+            .execute(&stmt, &p)
+            .map_err(|e| e.to_string())
     }
 
     fn query(&mut self, stmt: String, params: Vec<sql::Value>) -> Result<sql::Rows, String> {
         if let Some(kw) = forbidden(&stmt) {
-            return Err(format!("{kw} is not allowed: the host manages transactions"));
+            return Err(format!(
+                "{kw} is not allowed: the host manages transactions"
+            ));
         }
-        let p: Vec<RV> = params.iter().map(to_rv).collect();
-        let db = self.db.lock().unwrap();
-        let run = || -> rusqlite::Result<sql::Rows> {
-            let mut st = db.prepare(&stmt)?;
-            let columns: Vec<String> = st.column_names().iter().map(|s| s.to_string()).collect();
-            let n = columns.len();
-            let rows = st
-                .query_map(rusqlite::params_from_iter(p.iter()), |r| {
-                    (0..n).map(|i| r.get::<_, RV>(i).map(from_rv)).collect::<rusqlite::Result<Vec<_>>>()
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok(sql::Rows { columns, rows })
-        };
-        run().map_err(|e| e.to_string())
+        let p: Vec<_> = params.iter().map(to_value).collect();
+        self.db
+            .lock()
+            .unwrap()
+            .query(&stmt, &p)
+            .map(|r| sql::Rows {
+                columns: r.columns,
+                rows: r
+                    .rows
+                    .into_iter()
+                    .map(|row| row.into_iter().map(from_value).collect())
+                    .collect(),
+            })
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -166,11 +247,12 @@ pub fn host_allowed(policy: &HttpPolicy, host: &str) -> bool {
     let host = host.to_ascii_lowercase();
     policy.allow.iter().any(|a| {
         let a = a.to_ascii_lowercase();
-        a == "*" || a == host || a.strip_prefix("*.").is_some_and(|d| host.ends_with(&format!(".{d}")))
+        a == "*"
+            || a == host
+            || a.strip_prefix("*.")
+                .is_some_and(|d| host.ends_with(&format!(".{d}")))
     })
 }
-
-const MAX_BODY: u64 = 10 * 1024 * 1024;
 
 impl http_client::Host for HostState {
     fn send(&mut self, req: http_client::Request) -> Result<http_client::Response, String> {
@@ -180,35 +262,22 @@ impl http_client::Host for HostState {
                 "host {url:?} is not allowed; add it to [http] allow in statex.toml"
             ));
         }
-        let agent = ureq::AgentBuilder::new().timeout(self.http_timeout).build();
-        let mut r = agent.request(&req.method, &req.url);
-        for (k, v) in &req.headers {
-            r = r.set(k, v);
+        let timeout = self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(self.http_timeout)
+            .min(self.http_timeout);
+        if timeout.is_zero() {
+            return Err("HTTP request deadline expired".into());
         }
-        let resp = match req.body {
-            Some(b) => r.send_bytes(&b),
-            None => r.call(),
-        };
-        let resp = match resp {
-            Ok(r) => r,
-            Err(ureq::Error::Status(_, r)) => r,
-            Err(e) => return Err(e.to_string()),
-        };
-        let status = resp.status();
-        let headers = resp
-            .headers_names()
-            .into_iter()
-            .filter_map(|n| resp.header(&n).map(|v| (n.clone(), v.to_string())))
-            .collect();
-        let mut body = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::Read::take(resp.into_reader(), MAX_BODY), &mut body)
-            .map_err(|e| e.to_string())?;
-        Ok(http_client::Response { status, headers, body })
+        self.http_transport.send(req, timeout)
     }
 }
 
 fn url_host(url: &str) -> Option<String> {
-    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
     let authority = rest.split(['/', '?', '#']).next()?;
     let authority = authority.rsplit('@').next()?;
     let host = if authority.starts_with('[') {
@@ -221,47 +290,72 @@ fn url_host(url: &str) -> Option<String> {
 
 impl log::Host for HostState {
     fn log(&mut self, level: log::Level, msg: String) {
-        let id = &self.identity;
-        let actor = format!("{}/{}/{}", id.app, id.actor_type, id.key);
-        match level {
-            log::Level::Trace => tracing::trace!(target: "actor", %actor, "{msg}"),
-            log::Level::Debug => tracing::debug!(target: "actor", %actor, "{msg}"),
-            log::Level::Info => tracing::info!(target: "actor", %actor, "{msg}"),
-            log::Level::Warn => tracing::warn!(target: "actor", %actor, "{msg}"),
-            log::Level::Error => tracing::error!(target: "actor", %actor, "{msg}"),
-        }
+        self.log_sink.log(&self.identity, level, &msg);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    #[test]
+    fn transaction_controls_cannot_hide_behind_comments_or_statements() {
+        for statement in ["-- comment\n COMMIT", "/* comment */ ROLLBACK", "; BEGIN", "SELECT 1; /* c */ PRAGMA journal_mode = off"] {
+            assert!(forbidden(statement).is_some(), "{statement}");
+        }
+        for statement in ["SELECT 'COMMIT; ROLLBACK'", "SELECT \"COMMIT\"", "SELECT 1 -- COMMIT", "SELECT 1 /* COMMIT */"] {
+            assert!(forbidden(statement).is_none(), "{statement}");
+        }
+    }
 
     #[test]
     fn allowlist() {
-        let p = HttpPolicy { allow: vec!["api.example.com".into(), "*.corp.test".into()] };
+        let p = HttpPolicy {
+            allow: vec!["api.example.com".into(), "*.corp.test".into()],
+        };
         assert!(host_allowed(&p, "api.example.com"));
         assert!(host_allowed(&p, "a.corp.test"));
         assert!(!host_allowed(&p, "corp.test.evil.com"));
         assert!(!host_allowed(&p, "example.com"));
-        assert_eq!(url_host("https://u:p@a.corp.test:8443/x?y").as_deref(), Some("a.corp.test"));
+        assert_eq!(
+            url_host("https://u:p@a.corp.test:8443/x?y").as_deref(),
+            Some("a.corp.test")
+        );
+    }
+
+    fn host_state() -> HostState {
+        HostState {
+            wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
+            table: Default::default(),
+            limits: Default::default(),
+            identity: ActorIdentity {
+                app: "a".into(),
+                actor_type: "t".into(),
+                key: "k".into(),
+                epoch: 2,
+            },
+            db: crate::database::sqlite_handle(Arc::new(Mutex::new(
+                Connection::open_in_memory().unwrap(),
+            ))),
+            http: HttpPolicy { allow: vec![] },
+            http_timeout: Duration::from_secs(1),
+            caller: None,
+            invocation_context: None,
+            chain: vec![],
+            deadline: None,
+            has_alarm: false,
+            extensions: Default::default(),
+            http_transport: Arc::new(crate::DefaultHttpTransport),
+            log_sink: Arc::new(crate::TracingLogSink),
+            capability_error: None,
+        }
     }
 
     #[test]
     fn alarm_set_requires_a_handler() {
-        let mut s = HostState {
-            wasi: wasmtime_wasi::WasiCtxBuilder::new().build(),
-            table: Default::default(),
-            limits: Default::default(),
-            identity: ActorIdentity { app: "a".into(), actor_type: "t".into(), key: "k".into(), epoch: 2 },
-            db: Arc::new(Mutex::new(Connection::open_in_memory().unwrap())),
-            http: HttpPolicy { allow: vec![] },
-            http_timeout: Duration::from_secs(1),
-            caller: None,
-            chain: vec![],
-            deadline: None,
-            has_alarm: false,
-        };
+        let mut s = host_state();
         let e = alarms::Host::set(&mut s, 10).unwrap_err();
         assert!(e.contains("no alarm handler"), "{e}");
         assert_eq!(alarms::Host::get(&mut s), None);
@@ -270,6 +364,161 @@ mod tests {
         assert_eq!(alarms::Host::get(&mut s), Some(10));
         alarms::Host::clear(&mut s);
         assert_eq!(alarms::Host::get(&mut s), None);
+    }
+
+    #[test]
+    fn additional_host_resources_share_the_wasi_table() {
+        let mut state = host_state();
+        let resource = state.resource_table().push(42u32).unwrap();
+        assert_eq!(*WasiView::ctx(&mut state).table.get(&resource).unwrap(), 42);
+        assert_eq!(state.resource_table().delete(resource).unwrap(), 42);
+    }
+
+    #[test]
+    fn infallible_alarm_imports_record_backend_errors() {
+        let mut state = host_state();
+        state
+            .db
+            .lock()
+            .unwrap()
+            .execute("CREATE TABLE _statex_alarm(id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        assert_eq!(alarms::Host::get(&mut state), None);
+        let read_error = state.capability_error.clone().unwrap();
+        assert!(read_error.contains("read alarm"), "{read_error}");
+        alarms::Host::clear(&mut state);
+        assert_eq!(
+            state.capability_error,
+            Some(read_error),
+            "the first failure must remain sticky"
+        );
+        state.capability_error = None;
+        alarms::Host::clear(&mut state);
+        assert!(state
+            .capability_error
+            .take()
+            .unwrap()
+            .contains("clear alarm"));
+    }
+
+    #[derive(Default)]
+    struct RecordingTransport {
+        requests: Mutex<Vec<(http_client::Request, Duration)>>,
+    }
+
+    impl crate::HttpTransport for RecordingTransport {
+        fn send(
+            &self,
+            request: http_client::Request,
+            timeout: Duration,
+        ) -> Result<http_client::Response, String> {
+            self.requests.lock().unwrap().push((request, timeout));
+            Ok(http_client::Response {
+                status: 201,
+                headers: vec![("x-adapter".into(), "custom".into())],
+                body: b"ok".to_vec(),
+            })
+        }
+    }
+
+    #[test]
+    fn custom_http_transport_cannot_bypass_admission_or_deadlines() {
+        let transport = Arc::new(RecordingTransport::default());
+        let mut state = host_state();
+        state.http_transport = transport.clone();
+        state.http.allow = vec!["api.example.com".into()];
+        let request = |url: &str| http_client::Request {
+            method: "POST".into(),
+            url: url.into(),
+            headers: vec![("x-request".into(), "test".into())],
+            body: Some(vec![1, 2]),
+        };
+        let error = http_client::Host::send(&mut state, request("https://blocked.example.com/"))
+            .unwrap_err();
+        assert!(error.contains("not allowed"), "{error}");
+        let error =
+            http_client::Host::send(&mut state, request("ftp://api.example.com/")).unwrap_err();
+        assert!(error.contains("invalid url"), "{error}");
+        assert!(transport.requests.lock().unwrap().is_empty());
+
+        let response =
+            http_client::Host::send(&mut state, request("https://api.example.com/path")).unwrap();
+        assert_eq!(response.status, 201);
+        assert_eq!(response.headers, [("x-adapter".into(), "custom".into())]);
+        assert_eq!(response.body, b"ok");
+        {
+            let requests = transport.requests.lock().unwrap();
+            assert_eq!(requests[0].0.method, "POST");
+            assert_eq!(requests[0].0.url, "https://api.example.com/path");
+            assert_eq!(requests[0].0.body, Some(vec![1, 2]));
+            assert_eq!(requests[0].1, Duration::from_secs(1));
+        }
+        state.http_timeout = Duration::from_secs(60);
+        state.deadline = Some(Instant::now() + Duration::from_secs(10));
+        http_client::Host::send(&mut state, request("https://api.example.com/")).unwrap();
+        let budget = transport.requests.lock().unwrap()[1].1;
+        assert!(!budget.is_zero() && budget <= Duration::from_secs(10));
+        state.http_timeout = Duration::from_secs(1);
+        http_client::Host::send(&mut state, request("https://api.example.com/")).unwrap();
+        assert_eq!(
+            transport.requests.lock().unwrap()[2].1,
+            Duration::from_secs(1)
+        );
+
+        state.deadline = Some(Instant::now() - Duration::from_secs(1));
+        let error =
+            http_client::Host::send(&mut state, request("https://api.example.com/")).unwrap_err();
+        assert!(error.contains("deadline expired"), "{error}");
+        state.deadline = None;
+        state.http_timeout = Duration::ZERO;
+        assert!(http_client::Host::send(&mut state, request("https://api.example.com/")).is_err());
+        assert_eq!(
+            transport.requests.lock().unwrap().len(),
+            3,
+            "expired calls must not reach the adapter"
+        );
+    }
+
+    #[derive(Default)]
+    struct RecordingLog {
+        messages: Mutex<Vec<(ActorIdentity, log::Level, String)>>,
+    }
+
+    impl crate::LogSink for RecordingLog {
+        fn log(&self, identity: &ActorIdentity, level: log::Level, message: &str) {
+            self.messages
+                .lock()
+                .unwrap()
+                .push((identity.clone(), level, message.into()));
+        }
+    }
+
+    #[test]
+    fn custom_log_sink_receives_actor_identity_level_and_message() {
+        let sink = Arc::new(RecordingLog::default());
+        let mut state = host_state();
+        state.log_sink = sink.clone();
+        log::Host::log(&mut state, log::Level::Warn, "custom message".into());
+        let messages = sink.messages.lock().unwrap();
+        let [(identity, level, message)] = messages.as_slice() else {
+            panic!("one log message expected")
+        };
+        assert_eq!(
+            (
+                &identity.app,
+                &identity.actor_type,
+                &identity.key,
+                identity.epoch
+            ),
+            (
+                &state.identity.app,
+                &state.identity.actor_type,
+                &state.identity.key,
+                state.identity.epoch
+            )
+        );
+        assert!(matches!(level, log::Level::Warn));
+        assert_eq!(message, "custom message");
     }
 
     #[test]

@@ -83,7 +83,12 @@ pub fn app_dir(app: &str) -> String {
 
 impl ActorId {
     pub fn prefix(&self) -> String {
-        format!("actors/{}/{}/{}/", app_dir(&self.app), self.ty, enc(&self.key))
+        format!(
+            "actors/{}/{}/{}/",
+            app_dir(&self.app),
+            self.ty,
+            enc(&self.key)
+        )
     }
     pub fn owner_key(&self) -> String {
         format!("{}owner.json", self.prefix())
@@ -96,7 +101,9 @@ impl ActorId {
     }
     /// Local directory, relative to the node data dir.
     pub fn local_dir(&self) -> std::path::PathBuf {
-        ["actors", &app_dir(&self.app), &self.ty, &enc(&self.key)].iter().collect()
+        ["actors", &app_dir(&self.app), &self.ty, &enc(&self.key)]
+            .iter()
+            .collect()
     }
 }
 
@@ -154,7 +161,13 @@ pub struct WakeEntry {
 pub fn parse_wake(key: &str) -> Option<WakeEntry> {
     let rest = key.strip_prefix(WAKE_PREFIX)?;
     let mut parts = rest.split('/');
-    let (_minute, app, ty, k, name) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?, parts.next()?);
+    let (_minute, app, ty, k, name) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
     if parts.next().is_some() {
         return None;
     }
@@ -163,7 +176,11 @@ pub fn parse_wake(key: &str) -> Option<WakeEntry> {
     let epoch = u64::from_str_radix(f.next()?, 16).ok()?;
     u64::from_str_radix(f.next()?, 16).ok()?;
     Some(WakeEntry {
-        id: ActorId { app: app.replace('.', "/"), ty: ty.to_string(), key: dec(k)? },
+        id: ActorId {
+            app: app.replace('.', "/"),
+            ty: ty.to_string(),
+            key: dec(k)?,
+        },
         at_ms,
         epoch,
         name: name.to_string(),
@@ -171,7 +188,10 @@ pub fn parse_wake(key: &str) -> Option<WakeEntry> {
 }
 
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -184,20 +204,42 @@ mod tests {
             assert_eq!(dec(&enc(k)).as_deref(), Some(k));
             assert!(!enc(k).contains('/') && !enc(k).contains('.'));
         }
-        let id = ActorId { app: "payments/shop".into(), ty: "cart".into(), key: "a/b".into() };
+        let id = ActorId {
+            app: "payments/shop".into(),
+            ty: "cart".into(),
+            key: "a/b".into(),
+        };
         assert_eq!(id.owner_key(), "actors/payments.shop/cart/a%2Fb/owner.json");
-        assert_eq!(deploy_current("payments/shop"), "deploy/payments.shop/current.json");
-        assert_eq!(parse_ltx("e0000000003/snapshot-0000000000000007.db"), Some((3, statex_ltx::LogEntry::Snapshot(7))));
+        assert_eq!(
+            deploy_current("payments/shop"),
+            "deploy/payments.shop/current.json"
+        );
+        assert_eq!(
+            parse_ltx("e0000000003/snapshot-0000000000000007.db"),
+            Some((3, statex_ltx::LogEntry::Snapshot(7)))
+        );
     }
 
     #[test]
     fn wake_keys() {
-        let id = ActorId { app: "payments/shop".into(), ty: "cart".into(), key: "a/b".into() };
-        let a = statex_runtime::alarm::Alarm { at_ms: 120_500, retry: 0, epoch: 3, seq: 10 };
+        let id = ActorId {
+            app: "payments/shop".into(),
+            ty: "cart".into(),
+            key: "a/b".into(),
+        };
+        let a = statex_runtime::alarm::Alarm {
+            at_ms: 120_500,
+            retry: 0,
+            epoch: 3,
+            seq: 10,
+        };
         let k = wake_key(&id, &a);
         assert_eq!(k, "wake/0000000002/payments.shop/cart/a%2Fb/000000000120500-0000000000000003-000000000000000a");
         let e = parse_wake(&k).unwrap();
-        assert_eq!((e.id, e.at_ms, e.epoch, e.name), (id, 120_500, 3, wake_name(&a)));
+        assert_eq!(
+            (e.id, e.at_ms, e.epoch, e.name),
+            (id, 120_500, 3, wake_name(&a))
+        );
         assert_eq!(parse_wake("wake/0000000002/x"), None);
     }
 }

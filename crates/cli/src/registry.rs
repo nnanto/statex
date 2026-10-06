@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! <registry>/index.json          every app: name, path, actor types, method signatures, calls
-//! <registry>/<team>/<app>.wit    copy of the app's wit/app.wit
+//! <registry>/<app>.wit           copy of the app's wit/app.wit (may be namespaced)
 //! ```
 
 use std::collections::BTreeMap;

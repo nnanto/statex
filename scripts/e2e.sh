@@ -65,8 +65,9 @@ check "generated python client" "$OUT" python-ok
 M="$W/mono"; mkdir -p "$M"; cd "$M"
 git init -q && git config user.email e2e@statex && git config user.name e2e
 "$S" workspace init --statex "$ROOT" >/dev/null
-"$S" new payments/shop --actor cart >/dev/null
-check "app linked to workspace sdk" "$(grep -c "statex-guest = { path = \"$ROOT/crates/guest\"" apps/payments/shop/Cargo.toml)" 1
+"$S" new payments/shop --workspace --actor cart >/dev/null
+SDK="$(sed -n 's/^statex-guest = { path = "\(.*\)" }$/\1/p' apps/payments/shop/Cargo.toml)"
+check "app linked to workspace sdk" "$(cd apps/payments/shop && cd "$SDK" && pwd -P)" "$(cd "$ROOT/crates/guest" && pwd -P)"
 check "check --all" "$("$S" check --all | head -1)" "ok   payments/shop"
 "$S" registry build >/dev/null && "$S" registry build --check >/dev/null
 git add -A && git commit -qm init
@@ -76,6 +77,11 @@ check "breaking change detected" "$(grep -c 'parameters changed from (by: s64) t
 if "$S" registry build --check >/dev/null 2>&1; then echo "FAIL stale registry not detected"; exit 1; fi
 echo "ok   stale registry detected"
 mkdir -p apps/growth/x && cp -R apps/payments/shop apps/growth/x/notes
-if "$S" check --all >/dev/null 2>&1; then echo "FAIL app not under <team>/<app> passed"; exit 1; fi
-echo "ok   app at the wrong path rejected"
+if "$S" check --all >"$W/duplicate.log" 2>&1; then echo "FAIL duplicate app name passed"; exit 1; fi
+check "duplicate identity diagnosed" "$(grep -c 'app name "payments/shop" is used by both' "$W/duplicate.log")" 1
+echo "ok   duplicate app name rejected"
+sed -i.bak 's/name = "payments\/shop"/name = "notes"/' apps/growth/x/notes/statex.toml
+"$S" check --all >"$W/unique.log"
+check "nested app uses its manifest name" "$(grep -c '^ok   notes$' "$W/unique.log")" 1
+echo "ok   unique app name at an independent nested path accepted"
 echo "e2e passed"

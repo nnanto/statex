@@ -1,6 +1,6 @@
 //! `statex check`: pre-merge checks for one app or every app of a workspace.
 //!
-//! - the app name is valid and, in a workspace, equals the app's path;
+//! - the app name is valid, independently of its source path;
 //! - WIT and migrations are consistent (read from source, no build needed);
 //! - with `--against <git ref>`, nothing breaks compared to that version
 //!   (same rules as `statex deploy`, see `statex_runtime::compat`).
@@ -24,26 +24,6 @@ pub fn check(p: &Project, ws: Option<&Workspace>, against: Option<&str>, allow_b
     let mut r = Report { app: p.app().to_string(), errors: vec![], warnings: vec![] };
     if let Err(e) = validate_app_name(p.app()) {
         r.errors.push(format!("{e:#}"));
-    }
-    if let Some(ws) = ws {
-        match ws.expected_name(&p.root) {
-            None => r.errors.push(format!(
-                "app is outside the workspace apps directory {}; apps live at {}/<team>/<app>",
-                ws.rel(&ws.apps_dir()),
-                ws.rel(&ws.apps_dir())
-            )),
-            Some(exp) if exp.matches('/').count() != 1 => r.errors.push(format!(
-                "app at {} must live at {}/<team>/<app>",
-                ws.rel(&p.root),
-                ws.rel(&ws.apps_dir())
-            )),
-            Some(exp) if exp != p.app() => r.errors.push(format!(
-                "app name {:?} does not match its path {}; set `name = {exp:?}` in statex.toml",
-                p.app(),
-                ws.rel(&p.root)
-            )),
-            Some(_) => {}
-        }
     }
     let new = match source_surface(&p.root) {
         Ok(s) => s,
@@ -172,7 +152,7 @@ fn check_calls(p: &Project, ws: Option<&Workspace>, r: &mut Report) {
                 r.errors.push(format!("client interfaces: {d} (run `statex calls sync`)"));
             }
             for a in remote {
-                r.warnings.push(format!("app {a} is not in this workspace; its client interface was not checked against its source"));
+                r.warnings.push(format!("app {a} has no locally available source; its client interface was not checked against its source"));
             }
         }
         Err(e) => r.errors.push(format!("{e:#}")),

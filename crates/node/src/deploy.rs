@@ -39,7 +39,11 @@ pub struct DeployOptions {
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
     #[error("deploy of {app:?} has breaking changes against the deployed version {version}:\n  - {}\nKeep the old surface (add new methods or types instead), or pass --allow-breaking", changes.join("\n  - "))]
-    Breaking { app: String, version: u64, changes: Vec<String> },
+    Breaking {
+        app: String,
+        version: u64,
+        changes: Vec<String>,
+    },
     #[error("deploy of {app:?} calls actor types that are not deployed or do not match its client interfaces:\n  - {}\nDeploy the callees first, or regenerate the client interfaces (`statex calls sync`); pass --allow-unresolved-calls to deploy anyway", problems.join("\n  - "))]
     UnresolvedCalls { app: String, problems: Vec<String> },
 }
@@ -51,7 +55,11 @@ pub async fn unresolved_calls(store: &DynStore, manifest: &Manifest) -> Result<V
     let mut callees: std::collections::BTreeMap<&str, Option<Manifest>> = Default::default();
     for c in &manifest.calls {
         if c.app == manifest.app {
-            out.extend(statex_runtime::call_mismatches(c, manifest).into_iter().map(|p| format!("{}: {p}", c.import)));
+            out.extend(
+                statex_runtime::call_mismatches(c, manifest)
+                    .into_iter()
+                    .map(|p| format!("{}: {p}", c.import)),
+            );
             continue;
         }
         if !callees.contains_key(c.app.as_str()) {
@@ -63,7 +71,11 @@ pub async fn unresolved_calls(store: &DynStore, manifest: &Manifest) -> Result<V
         }
         match &callees[c.app.as_str()] {
             None => out.push(format!("{}: app {} is not deployed", c.import, c.app)),
-            Some(m) => out.extend(statex_runtime::call_mismatches(c, m).into_iter().map(|p| format!("{}: {p}", c.import))),
+            Some(m) => out.extend(
+                statex_runtime::call_mismatches(c, m)
+                    .into_iter()
+                    .map(|p| format!("{}: {p}", c.import)),
+            ),
         }
     }
     Ok(out)
@@ -88,19 +100,39 @@ pub async fn broken_callers(store: &DynStore, manifest: &Manifest) -> Result<Vec
 }
 
 /// Uploads a version and makes it current. Idempotent for the same binary.
-pub async fn deploy(store: &DynStore, wasm: &[u8], manifest: &Manifest, opts: &DeployOptions) -> Result<Current> {
+pub async fn deploy(
+    store: &DynStore,
+    wasm: &[u8],
+    manifest: &Manifest,
+    opts: &DeployOptions,
+) -> Result<Current> {
     let (app, sha) = (&manifest.app, &manifest.sha256);
-    anyhow::ensure!(statex_runtime::sha256_hex(wasm) == *sha, "manifest sha256 does not match component");
+    anyhow::ensure!(
+        statex_runtime::sha256_hex(wasm) == *sha,
+        "manifest sha256 does not match component"
+    );
     let manifest_bytes = to_json_bytes(manifest);
-    let id = statex_runtime::sha256_hex(&[sha.as_bytes(), &manifest_bytes[..]].concat())[..32].to_string();
+    let id = statex_runtime::sha256_hex(&[sha.as_bytes(), &manifest_bytes[..]].concat())[..32]
+        .to_string();
     if !opts.allow_unresolved_calls {
         let problems = unresolved_calls(store, manifest).await?;
         if !problems.is_empty() {
-            return Err(DeployError::UnresolvedCalls { app: app.clone(), problems }.into());
+            return Err(DeployError::UnresolvedCalls {
+                app: app.clone(),
+                problems,
+            }
+            .into());
         }
     }
-    store.put(&deploy_object(app, &id, "component.wasm"), Bytes::copy_from_slice(wasm)).await?;
-    store.put(&deploy_object(app, &id, "manifest.json"), manifest_bytes).await?;
+    store
+        .put(
+            &deploy_object(app, &id, "component.wasm"),
+            Bytes::copy_from_slice(wasm),
+        )
+        .await?;
+    store
+        .put(&deploy_object(app, &id, "manifest.json"), manifest_bytes)
+        .await?;
     let key = deploy_current(app);
     loop {
         let old = get_json::<Current>(&**store, &key).await?;
@@ -113,7 +145,12 @@ pub async fn deploy(store: &DynStore, wasm: &[u8], manifest: &Manifest, opts: &D
                 let mut changes = statex_runtime::breaking_changes((&prev).into(), manifest.into());
                 changes.extend(broken_callers(store, manifest).await?);
                 if !changes.is_empty() {
-                    return Err(DeployError::Breaking { app: app.clone(), version: c.version, changes }.into());
+                    return Err(DeployError::Breaking {
+                        app: app.clone(),
+                        version: c.version,
+                        changes,
+                    }
+                    .into());
                 }
             }
         }
@@ -166,7 +203,12 @@ pub async fn fetch_manifest(store: &DynStore, cur: &Current) -> Result<Manifest>
     let (m, _) = get_json::<Manifest>(&**store, &deploy_object(&cur.app, &cur.id, "manifest.json"))
         .await?
         .ok_or_else(|| anyhow!("missing manifest for {}@{}", cur.app, cur.id))?;
-    anyhow::ensure!(m.sha256 == cur.sha256, "manifest checksum mismatch for {}@{}", cur.app, cur.id);
+    anyhow::ensure!(
+        m.sha256 == cur.sha256,
+        "manifest checksum mismatch for {}@{}",
+        cur.app,
+        cur.id
+    );
     Ok(m)
 }
 

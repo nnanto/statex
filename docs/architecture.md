@@ -1,7 +1,7 @@
 # Architecture
 
 A statex cluster is a set of identical, stateless-looking
-nodes plus one object store bucket, which is the only shared dependency. There
+nodes plus one `ObjectStore`, which is the only shared dependency. There
 is no consensus service, no gossip and no routing table to configure.
 
 ```mermaid
@@ -9,8 +9,8 @@ flowchart LR
   C[client / generated SDK] -->|POST /v1/apps/app/actors/type/key/method| A[any node]
   A -->|owner.json says node B| B[owner node]
   A -.->|no live owner: CAS owner.json| A
-  B --> W[wasmtime instance] --> D[(actor SQLite)]
-  B -->|WAL segment before ack| S[(object store: ADLS / Blob / local dir)]
+  B --> W[wasmtime instance] --> D[(transactional actor state)]
+  B -->|durable change before ack| S[(ObjectStore)]
   A <-->|leases, owner records, deployments| S
 ```
 
@@ -20,13 +20,47 @@ flowchart LR
 |---|---|
 | app | One deployed WASM component plus its manifest (`statex.toml`, migrations) |
 | actor type | One exported WIT interface of the component, such as `counter` |
-| actor | `(app, type, key)`: one instance with its own SQLite database |
+| actor | `(app, type, key)`: one instance with its own transactional state |
 | method | One function in the interface. The JSON arguments map to WIT parameters |
 | node lease | `nodes/<id>.json`, renewed with If-Match. It proves the node is alive |
 | owner record | `actors/<app>/<type>/<key>/owner.json`, holding `{node, session, epoch, state}` |
 | epoch | Increases by one on every activation of an actor, anywhere in the cluster |
 
-## Object store layout
+## Extension boundaries
+
+The library entry point is `statex::local_config` plus `statex::start`.
+Lower-level crates remain usable independently. Defaults require no cloud
+account, team naming scheme, application registry, or multi-app workspace.
+
+`NodeConfig` accepts an object store, database factory, and optional custom
+runtime. The node owns placement, serialization, leases, ownership checks,
+and durability ordering. A state backend owns local transactions, migrations,
+alarm state, snapshots, and replay. The runtime owns WIT invocation and
+resource limits; additional host imports and HTTP/log adapters are registered
+through `RuntimeBuilder`. Guests can use the standard SDK or implement the
+WIT contract with another language or library.
+
+`NodeConfig.extensions` adds ordered admission, owner-side execution,
+transactional before-commit, final-response, and lifecycle hooks. Trusted
+invocation metadata travels inside signed peer messages and is propagated
+to nested actor calls; raw HTTP credentials and typed local hook data are
+not forwarded. Owner checks happen before activation/migrations, and a
+commit-hook rejection rolls back the entire actor transaction. Runtime-only
+embedders have a separate per-guest execution hook.
+
+See the individual contracts for [object stores](extensions/object-stores.md),
+[state backends](extensions/state-backends.md),
+[invocation hooks](extensions/invocation-hooks.md),
+[runtime hooks](extensions/runtime-hooks.md),
+[host capabilities](extensions/host-capabilities.md),
+[host services](extensions/host-services.md),
+[actor callers](extensions/actor-callers.md),
+[guest adapters](extensions/guest-adapters.md), and
+[client transports](extensions/client-transports.md).
+Adapters are trusted implementations, not dynamically downloaded plugins.
+Changing one must not bypass the node's acknowledgement protocol.
+
+## Default SQLite object-store layout
 
 ```
 fleet/peer-auth.json                         shared HMAC key for node-to-node calls
@@ -35,26 +69,27 @@ deploy/<app>/current.json                    {id, sha256, version}; CAS on deplo
 deploy/<app>/<id>/component.wasm
 deploy/<app>/<id>/manifest.json              WIT-derived schema, migrations, limits, http policy
 actors/<app>/<type>/<key>/owner.json          ownership record (never deleted, so epochs stay monotonic)
+actors/<app>/<type>/<key>/ltx/e<epoch>/backend.json   state backend name and format version
 actors/<app>/<type>/<key>/ltx/e<epoch>/snapshot-<txid>.db
 actors/<app>/<type>/<key>/ltx/e<epoch>/<txid>.ltx      WAL page segment of one transaction
 fleet/waker.json                             lease of the node that wakes idle actors' alarms
 wake/<minute>/<app>/<type>/<key>/<at_ms>-<epoch>-<seq>   alarm wake hint (empty object)
 ```
 
-App names are `app` or `team/app`, where each segment is `[a-z0-9-]` and
+App names are `app` or an optionally namespaced `namespace/app`, where each segment is `[a-z0-9-]` and
 neither `actors` nor `schema`. In store paths `/` becomes `.`, so
 `payments/shop` is stored under `deploy/payments.shop/` and
 `actors/payments.shop/`. This mapping is injective because `.` cannot appear in
 a segment.
 
-The store only needs four operations: get (with ranges), put, `put_if_absent`
+The store interface provides get (with ranges), put, `put_if_absent`
 and `put_if_match(etag)`, plus listing and delete. `statex diagnose` runs
 a conformance probe against a bucket. Azure Blob/ADLS Gen2 support these
 natively with `If-None-Match: *` and `If-Match`.
 
 ## Routing
 
-The API is derived from the WIT, so teams register no routes:
+The API is derived from the WIT, so applications register no routes:
 
 ```
 POST   /v1/apps/{app}/actors/{type}/{key}/{method}    body: {"by": 1} or [1] or empty
@@ -63,25 +98,32 @@ DELETE /v1/apps/{app}/actors/{type}/{key}
 GET    /v1/apps, /v1/apps/{app}/schema, /v1/apps/{app}/actors?type=&limit=
 ```
 
-`{app}` may be `team/app`. Because no app segment can be `actors` or `schema`,
+`{app}` may be namespaced. Because no app segment can be `actors` or `schema`,
 the first such segment ends the app name. Keys are a single percent-encoded
 segment.
 
 When a node receives a call:
 
-1. It validates the app, type, method and key, and takes the actor's local slot lock so calls to one actor are serialized.
+1. It creates host-owned invocation context and runs admission once, outside routing retries. Then it validates the app, type, method and key, and takes the actor's local slot lock so calls to one actor are serialized.
 2. If the actor is resident locally, it executes the call.
 3. Otherwise it reads `owner.json`.
    - The record is `owned` by a node whose lease is live (same session, not expired): forward the call to that node's `advertise` URL over `POST /internal/v1/invoke`, which is HMAC-signed. Forwarding is limited to 4 hops.
    - Otherwise the record is missing, unowned, deleted, or its owner's lease is dead: CAS the record to `{me, epoch+1}` and **activate** the actor here.
 4. If two nodes race on the CAS, exactly one wins. The loser re-reads the record and forwards.
 
+The selected owner runs `before_execute` before restoring or starting a
+transaction. A cold-owner rejection may acquire/release coordination
+metadata but never publishes an activation snapshot or applies migrations.
+`before_commit` runs inside the transaction, after a successful guest result.
+Completion is observed only at the entry node, after the final
+durability/ownership decision; observers cannot rewrite it.
+
 Placement is therefore "first touch wins". An actor stays on its
 node until that node goes idle on it (`--idle-timeout`), shuts down
 gracefully, or dies. Clients may talk to any node, for example through a plain
 L4 load balancer.
 
-## Activation
+## Activation with the default state backend
 
 1. Clear the local directory for the actor.
 2. Restore unless the actor is new or deleted. Find the newest epoch that has a snapshot, download that snapshot, then apply the contiguous `.ltx` segments that follow it.
@@ -91,7 +133,12 @@ L4 load balancer.
 The new epoch is therefore self-contained, and a stale owner writing into an
 old epoch prefix can never corrupt it.
 
-## Request path (write)
+Every restore base also carries the selected backend's name and format
+version. Activation rejects a missing or different identity before opening
+the snapshot or replaying changes. There is no implicit legacy-format
+fallback, even for SQLite.
+
+## Request path (default SQLite write)
 
 ```mermaid
 sequenceDiagram
@@ -135,7 +182,8 @@ their next call; pending migrations run inside that call's transaction.
 
 ## Alarms
 
-The authoritative alarm is a row in the actor's own SQLite database
+The authoritative alarm belongs to the actor's transactional state. With the
+default backend it is a row in the actor's own SQLite database
 (`_statex_alarm`: `at_ms`, `retry`, `epoch`, `seq`), so it is replicated and
 restored like any other state, and `alarms.set/clear` are transactional. The
 object store only holds **wake hints**, keys under `wake/<minute>/...` whose
@@ -166,7 +214,8 @@ decides, duplicate firings from a timer and the waker are harmless.
 
 ## Actor-to-actor calls
 
-A caller imports generated client interfaces (`team:app/type`), whose functions
+A caller imports generated client interfaces (`statex:app/type` for a simple
+app name, or `namespace:app/type` for a namespaced app), whose functions
 take the actor key first and return `result<T, statex:host/actors.call-error>`.
 At instantiation the runtime links every such import dynamically
 (`calls::link`). When it is called, the runtime converts the arguments to JSON
@@ -192,6 +241,8 @@ callers listed in the manifest's `calls`.
 
 - A wasmtime component model instance is created per resident actor.
 - Execution time is bounded using epoch interruption (`limits.timeout_ms`) and memory is capped (`limits.memory_mb`).
-- Imports are allowlisted to `statex:host/*`, WASI p2 and client interfaces of other apps (routed as actor calls). Nothing is granted beyond that: no preopened directories, no environment and no sockets. Guest stdout and stderr go to the node log.
+- Default imports are allowlisted to `statex:host/*`, WASI p2 and client interfaces of other apps (routed as actor calls). Additional imports require explicit host registration. Defaults grant no preopened directories, environment or sockets. Guest stdout and stderr go to the node log.
 - Outbound HTTP goes through `statex:host/http-client` and is restricted to `[http] allow` hosts.
+- The default outbound transport does not follow redirects and rejects oversized
+  response bodies. Custom transports must preserve admission and deadlines.
 - The guest `sql` interface rejects transaction-control statements (`BEGIN`, `COMMIT`, `SAVEPOINT`, ...) as well as `ATTACH`, `VACUUM` and `PRAGMA`, because the host owns the transaction.

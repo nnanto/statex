@@ -1,4 +1,6 @@
-# statex monorepo: every app lives at <apps>/<team>/<app> and is named `team/app`.
+# Optional shared tooling; standalone apps need no workspace.
+# Opt in with `statex new <app> --workspace`. Manifest names, including
+# optional namespaces, are independent of source paths and directory depth.
 # Relative paths are resolved from this file.
 apps = "apps"
 host_wit = "wit"

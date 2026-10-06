@@ -1,5 +1,6 @@
-//! Local filesystem object store. Safe for multiple processes on one machine
-//! (per-object advisory file locks), used for `statex dev` and tests.
+//! Local filesystem object store. Cooperating processes on one machine use
+//! per-object advisory file locks. This is not a distributed filesystem or a
+//! crash-atomic object/metadata database; see the provider contract in the docs.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -23,6 +24,7 @@ impl LocalFsStore {
         fs::create_dir_all(root.join("objects"))?;
         fs::create_dir_all(root.join(".meta"))?;
         fs::create_dir_all(root.join(".locks"))?;
+        fs::create_dir_all(root.join(".staging"))?;
         let root = root.canonicalize()?;
         Ok(Self { root })
     }
@@ -30,6 +32,7 @@ impl LocalFsStore {
     fn validate(key: &str) -> Result<()> {
         if key.is_empty()
             || key.starts_with('/')
+            || key.contains('\\')
             || key.split('/').any(|s| s.is_empty() || s == "." || s == "..")
         {
             return Err(StoreError::Other(anyhow::anyhow!("invalid object key {key:?}")));
@@ -55,8 +58,13 @@ impl LocalFsStore {
         Ok(f)
     }
 
-    fn read_etag(&self, key: &str) -> Option<String> {
-        fs::read_to_string(self.meta_path(key)).ok()
+    fn read_etag(&self, key: &str) -> anyhow::Result<Option<String>> {
+        match fs::read_to_string(self.meta_path(key)) {
+            Ok(etag) if !etag.is_empty() => Ok(Some(etag)),
+            Ok(_) => anyhow::bail!("empty object version for {key}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     fn write_locked(&self, key: &str, data: &[u8]) -> anyhow::Result<ETag> {
@@ -71,23 +79,24 @@ impl LocalFsStore {
     ) -> anyhow::Result<ETag> {
         let p = self.obj_path(key);
         fs::create_dir_all(p.parent().unwrap())?;
-        let tmp = p.with_extension(format!("tmp-{:016x}", rand::random::<u64>()));
+        let tmp = self.root.join(".staging").join(format!("{:016x}", rand::random::<u64>()));
+        let mut created = false;
         let res = (|| {
-            let mut f = File::create(&tmp)?;
+            let mut f = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+            created = true;
             fill(&mut f)?;
             f.sync_all()?;
-            Ok(())
+            let etag = format!("\"{:032x}\"", rand::random::<u128>());
+            let m = self.meta_path(key);
+            fs::create_dir_all(m.parent().unwrap())?;
+            fs::write(&m, &etag)?;
+            fs::rename(&tmp, &p)?;
+            Ok(etag)
         })();
-        if let Err(e) = res {
+        if res.is_err() && created {
             let _ = fs::remove_file(&tmp);
-            return Err(e);
         }
-        let etag = format!("\"{:016x}\"", rand::random::<u64>());
-        let m = self.meta_path(key);
-        fs::create_dir_all(m.parent().unwrap())?;
-        fs::write(&m, &etag)?;
-        fs::rename(&tmp, &p)?;
-        Ok(etag)
+        res
     }
 
     fn blocking<T: Send + 'static>(
@@ -116,9 +125,7 @@ fn walk(dir: &Path, base: &Path, out: &mut Vec<String>) -> std::io::Result<()> {
             walk(&p, base, out)?;
         } else {
             let rel = p.strip_prefix(base).unwrap().to_string_lossy().replace('\\', "/");
-            if !rel.contains(".tmp-") {
-                out.push(rel);
-            }
+            out.push(rel);
         }
     }
     Ok(())
@@ -134,7 +141,9 @@ impl ObjectStore for LocalFsStore {
             match fs::read(s.obj_path(&key)) {
                 Ok(d) => Ok(Some(Object {
                     data: Bytes::from(d),
-                    etag: s.read_etag(&key).unwrap_or_default(),
+                    etag: s
+                        .read_etag(&key)?
+                        .ok_or_else(|| anyhow::anyhow!("missing object version for {key}"))?,
                 })),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(e) => Err(StoreError::Other(e.into())),
@@ -223,7 +232,7 @@ impl ObjectStore for LocalFsStore {
         let etag = etag.to_string();
         self.blocking(move |s| {
             let _l = s.lock(&key)?;
-            if !s.obj_path(&key).exists() || s.read_etag(&key).as_deref() != Some(etag.as_str()) {
+            if !s.obj_path(&key).exists() || s.read_etag(&key)?.as_deref() != Some(etag.as_str()) {
                 return Err(StoreError::Precondition);
             }
             Ok(s.write_locked(&key, &data)?)
@@ -232,6 +241,9 @@ impl ObjectStore for LocalFsStore {
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+        if !prefix.is_empty() {
+            Self::validate(prefix.trim_end_matches('/'))?;
+        }
         let prefix = prefix.to_string();
         self.blocking(move |s| {
             let base = s.root.join("objects");

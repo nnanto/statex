@@ -2,7 +2,7 @@
 //!
 //! Rust SDK for writing statex actors. An actor type is an interface exported by
 //! your component's WIT world; this crate gives your implementation access to
-//! the host capabilities (`statex:host`): the actor's SQLite database, its
+//! the host capabilities (`statex:host`): the actor's SQL database (SQLite by default), its
 //! identity, its alarm, outbound HTTP and logging.
 //!
 //! On `wasm32` the functions call the real host. On native targets they run
@@ -19,7 +19,10 @@ use wasm as backend;
 #[cfg(not(target_arch = "wasm32"))]
 mod mock;
 #[cfg(not(target_arch = "wasm32"))]
-use mock as backend;
+use adapters as backend;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod adapters;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod testing;
@@ -66,11 +69,13 @@ pub mod context {
     }
 }
 
-/// The actor's private SQLite database.
+/// The actor's private SQL database (SQLite by default).
 ///
-/// Each method call runs in one host-managed transaction: returning commits,
-/// trapping (panicking) rolls back. Do not issue `BEGIN`/`COMMIT` yourself.
-/// Schema is created by the SQL files in `migrations/<actor-type>/`.
+/// Each method call runs in one host-managed transaction: a successful return
+/// commits; trapping (panicking) or a method-level `result::err` rolls back.
+/// Do not issue `BEGIN`/`COMMIT` yourself. The configured state backend owns
+/// the SQL dialect and migration support. The default backend creates schema
+/// from the SQL files in `migrations/<actor-type>/`.
 pub mod sql {
     use super::{backend, Error, Result};
 
@@ -355,6 +360,8 @@ pub mod actors {
     /// is `statex:host/actors.call-error`; generated client bindings map to it.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum CallError {
+        /// A host extension vetoed the call; no callee transaction committed.
+        Rejected(String),
         /// The callee app, actor type or method does not exist.
         NotFound(String),
         /// The callee's signature no longer matches the client interface.
@@ -375,6 +382,7 @@ pub mod actors {
                 CallError::NotFound(m) => write!(f, "not found: {m}"),
                 CallError::Incompatible(m) => write!(f, "incompatible: {m}"),
                 CallError::Trap(m) => write!(f, "callee trapped: {m}"),
+                CallError::Rejected(m) => write!(f, "rejected: {m}"),
                 CallError::Unavailable(m) => write!(f, "unavailable: {m}"),
                 CallError::Cycle(m) => write!(f, "call cycle: {m}"),
                 CallError::Timeout => write!(f, "timed out"),

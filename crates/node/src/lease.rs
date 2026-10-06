@@ -44,7 +44,12 @@ pub struct Lease {
 
 impl Lease {
     /// Acquires the lease for `node_id`, waiting out a previous holder.
-    pub async fn acquire(store: DynStore, node_id: &str, advertise: &str, ttl: Duration) -> Result<Arc<Lease>> {
+    pub async fn acquire(
+        store: DynStore,
+        node_id: &str,
+        advertise: &str,
+        ttl: Duration,
+    ) -> Result<Arc<Lease>> {
         let session = hex::encode(rand::random::<[u8; 8]>());
         let key = node_key(node_id);
         loop {
@@ -61,7 +66,11 @@ impl Lease {
                 Some((old, etag)) => {
                     if old.alive() {
                         let wait = old.expires_at_ms.saturating_sub(now_ms()).min(1000);
-                        tracing::warn!(node = node_id, "lease held by session {}; waiting {wait} ms", old.session);
+                        tracing::warn!(
+                            node = node_id,
+                            "lease held by session {}; waiting {wait} ms",
+                            old.session
+                        );
                         tokio::time::sleep(Duration::from_millis(wait.max(50))).await;
                         continue;
                     }
@@ -132,7 +141,10 @@ impl Lease {
         let mut rec = self.record();
         rec.expires_at_ms = start + self.ttl.as_millis() as u64;
         let etag = self.etag.lock().unwrap().clone();
-        let new = self.store.put_if_match(&node_key(&rec.node_id), to_json_bytes(&rec), &etag).await?;
+        let new = self
+            .store
+            .put_if_match(&node_key(&rec.node_id), to_json_bytes(&rec), &etag)
+            .await?;
         *self.etag.lock().unwrap() = new;
         self.valid_until.store(rec.expires_at_ms, Ordering::SeqCst);
         *self.record.lock().unwrap() = rec;
@@ -143,7 +155,12 @@ impl Lease {
     pub async fn run(self: Arc<Self>) {
         let period = self.ttl / 3;
         loop {
-            tokio::time::sleep(if self.valid() { period } else { Duration::from_millis(100) }).await;
+            tokio::time::sleep(if self.valid() {
+                period
+            } else {
+                Duration::from_millis(100)
+            })
+            .await;
             if self.fenced() {
                 return;
             }
@@ -170,7 +187,11 @@ impl Lease {
         let mut rec = self.record();
         rec.expires_at_ms = 0;
         let etag = self.etag.lock().unwrap().clone();
-        if let Err(e) = self.store.put_if_match(&node_key(&rec.node_id), to_json_bytes(&rec), &etag).await {
+        if let Err(e) = self
+            .store
+            .put_if_match(&node_key(&rec.node_id), to_json_bytes(&rec), &etag)
+            .await
+        {
             tracing::warn!("lease release failed: {e}");
         }
     }
@@ -178,5 +199,7 @@ impl Lease {
 
 /// Reads another node's lease.
 pub async fn read_node(store: &DynStore, node: &str) -> Result<Option<NodeRecord>> {
-    Ok(get_json::<NodeRecord>(&**store, &node_key(node)).await?.map(|(r, _)| r))
+    Ok(get_json::<NodeRecord>(&**store, &node_key(node))
+        .await?
+        .map(|(r, _)| r))
 }

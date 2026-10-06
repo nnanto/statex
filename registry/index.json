@@ -1,6 +1,32 @@
 {
   "apps": [
     {
+      "app": "demo/config",
+      "calls": [
+        {
+          "app": "demo/db",
+          "type": "kv"
+        }
+      ],
+      "lang": "python",
+      "path": "apps/demo/config",
+      "types": [
+        {
+          "docs": null,
+          "methods": [
+            "set(name: string, value: string) -> u64",
+            "get(name: string) -> option<string>",
+            "all() -> list<setting>",
+            "refresh() -> result<u64, string>"
+          ],
+          "migrations": 2,
+          "name": "config"
+        }
+      ],
+      "wit": "demo/config.wit",
+      "wit_sha256": "bc2a188e0ac710191edad9e08243d02c17d566abc848f72ea1b4ca9689637339"
+    },
+    {
       "app": "demo/db",
       "lang": "python",
       "path": "apps/demo/db",

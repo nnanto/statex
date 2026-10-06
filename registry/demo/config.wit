@@ -1,0 +1,19 @@
+package local:demo-config@0.1.0;
+
+interface config {
+  record setting { name: string, value: string, source: string }
+  set:     func(name: string, value: string) -> u64;
+  get:     func(name: string) -> option<string>;
+  all:     func() -> list<setting>;
+  refresh: func() -> result<u64, string>;
+}
+
+world app {
+  import statex:host/context@0.1.0;
+  import statex:host/sql@0.1.0;
+  import statex:host/http-client@0.1.0;
+  import statex:host/log@0.1.0;
+  import demo:db/kv;
+
+  export config;
+}

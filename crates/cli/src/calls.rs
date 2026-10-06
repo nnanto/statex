@@ -1,7 +1,7 @@
 //! `statex calls`: typed clients for calling other actors from inside an actor.
 //!
 //! For every callee app listed under `[calls] apps` in statex.toml, `sync`
-//! writes `wit/deps/<ns>-<name>/client.wit`: package `<ns>:<name>` (see
+//! writes `wit/deps/<ns>--<name>/client.wit`: package `<ns>:<name>` (see
 //! [`client_package`]) with one interface per actor type. Each method takes the
 //! callee's key first and returns `result<T, call-error>`. Rust projects also
 //! get `src/statex_calls.rs`, which exposes the same functions with stub
@@ -22,6 +22,11 @@ const HOST_ACTORS: &str = "statex:host/actors@0.1.0";
 const WORLD: &str = "statex-calls";
 pub const SHIM: &str = "src/statex_calls.rs";
 
+fn client_file(app: &str) -> PathBuf {
+    let (ns, name) = client_package(app);
+    PathBuf::from(format!("wit/deps/{ns}--{name}/client.wit"))
+}
+
 /// A callee app and its actor types.
 pub struct Callee {
     pub app: String,
@@ -33,10 +38,6 @@ pub fn listed(p: &Project) -> Result<Vec<String>> {
     let mut out: Vec<String> = Vec::new();
     for a in &p.cfg.calls.apps {
         validate_app_name(a).with_context(|| format!("[calls] apps in statex.toml: {a:?}"))?;
-        let (ns, name) = client_package(a);
-        if !is_wit_id(&ns) || !is_wit_id(&name) {
-            bail!("[calls] apps: {a:?} cannot be named in WIT (use lowercase words separated by single dashes, not starting with a digit)");
-        }
         if !out.contains(a) {
             out.push(a.clone());
         }
@@ -46,20 +47,32 @@ pub fn listed(p: &Project) -> Result<Vec<String>> {
 
 /// Source directory of callee `app`: the project itself, `[calls] paths`,
 /// or a workspace app. `None` if the app's source is not available locally.
-pub fn callee_root(p: &Project, ws: Option<&Workspace>, app: &str) -> Option<PathBuf> {
+pub fn callee_root(p: &Project, ws: Option<&Workspace>, app: &str) -> Result<Option<PathBuf>> {
     if app == p.app() {
-        return Some(p.root.clone());
+        return Ok(Some(p.root.clone()));
     }
     if let Some(d) = p.cfg.calls.paths.get(app) {
-        return Some(p.root.join(d));
+        let root = p.root.join(d);
+        if !root.join("statex.toml").is_file() {
+            bail!("[calls] paths: {} has no statex.toml for app {app}", root.display());
+        }
+        let callee = Project::find(&root)?;
+        if callee.app() != app {
+            bail!("[calls] paths: app {app:?} points to {} whose manifest names {:?}", root.display(), callee.app());
+        }
+        return Ok(Some(callee.root));
     }
-    let d = ws?.app_dir(app);
-    d.join("statex.toml").exists().then_some(d)
+    let Some(ws) = ws else { return Ok(None) };
+    Ok(ws.projects()?.into_iter().find(|p| p.app() == app).map(|p| p.root))
 }
 
 /// The actor types of `app` read from source (see [`callee_root`]).
 pub fn local_types(p: &Project, ws: Option<&Workspace>, app: &str) -> Option<Result<Vec<ActorType>>> {
-    let root = callee_root(p, ws, app)?;
+    let root = match callee_root(p, ws, app) {
+        Ok(Some(root)) => root,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
     let mut r = source_surface(&root).map(|s| s.0);
     if r.is_err() && app == p.app() {
         // Calls within the app: its world may import its own client package
@@ -110,8 +123,7 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 pub fn render(p: &Project, callees: &[Callee]) -> Result<BTreeMap<PathBuf, String>> {
     let mut out = BTreeMap::new();
     for c in callees {
-        let (ns, name) = client_package(&c.app);
-        out.insert(PathBuf::from(format!("wit/deps/{ns}-{name}/client.wit")), client_wit(c)?);
+        out.insert(client_file(&c.app), client_wit(c)?);
     }
     if is_rust(p) && !callees.is_empty() {
         out.insert(PathBuf::from(SHIM), rust_shim(callees)?);
@@ -203,13 +215,16 @@ pub fn local_plan(p: &Project, ws: Option<&Workspace>) -> Result<(BTreeMap<PathB
         match local_types(p, ws, app) {
             Some(types) => callees.push(Callee { app: app.clone(), types: types? }),
             None => {
-                let (ns, name) = client_package(app);
-                let rel = PathBuf::from(format!("wit/deps/{ns}-{name}/client.wit"));
+                let rel = client_file(app);
                 match have.get(&rel) {
                     Some(text) => {
+                        let parsed = parse_client(&rel, text)?;
+                        if parsed.app != *app {
+                            bail!("client interface for app {app} names {}; run `statex calls sync --from-url <node url>`", parsed.app);
+                        }
                         keep.insert(rel, text.clone());
                     }
-                    None => bail!("no client interface for app {app}: it is not in this workspace; run `statex calls sync --from-url <node url>`"),
+                    None => bail!("no client interface for app {app}: configure [calls] paths for its source, or run `statex calls sync --from-url <node url>`"),
                 }
                 remote.push(app.clone());
             }
@@ -259,7 +274,7 @@ const WIT_KEYWORDS: &[&str] = &[
     "world", "package", "constructor", "include", "with", "async", "_",
 ];
 
-fn is_wit_id(s: &str) -> bool {
+pub(crate) fn is_wit_id(s: &str) -> bool {
     !s.is_empty()
         && s.split('-').all(|seg| {
             seg.chars().next().is_some_and(|c| c.is_ascii_lowercase())
@@ -267,7 +282,7 @@ fn is_wit_id(s: &str) -> bool {
         })
 }
 
-fn wid(s: &str) -> String {
+pub(crate) fn wid(s: &str) -> String {
     if WIT_KEYWORDS.contains(&s) {
         format!("%{s}")
     } else {
@@ -354,7 +369,7 @@ fn key_param(m: &statex_runtime::Method) -> &'static str {
 
 fn client_wit(c: &Callee) -> Result<String> {
     let (ns, name) = client_package(&c.app);
-    let mut s = format!("// {HEADER} from app {}. Do not edit.\npackage {ns}:{name};\n", c.app);
+    let mut s = format!("// {HEADER} from app {}. Do not edit.\npackage {}:{};\n", c.app, wid(&ns), wid(&name));
     for t in &c.types {
         if t.name == WORLD {
             bail!("app {}: actor type `{WORLD}` clashes with the generated world name", c.app);
@@ -440,7 +455,7 @@ const RUST_KEYWORDS: &[&str] = &[
 ];
 
 /// wit-bindgen's identifier for a kebab-case name.
-fn rid(s: &str) -> String {
+pub(crate) fn rid(s: &str) -> String {
     let snake = s.replace('-', "_");
     if RUST_KEYWORDS.contains(&snake.as_str()) {
         format!("{snake}_")
@@ -550,10 +565,13 @@ fn rust_shim(callees: &[Callee]) -> Result<String> {
     let mut by_ns: BTreeMap<String, Vec<&Callee>> = BTreeMap::new();
     for c in callees {
         let (ns, name) = client_package(&c.app);
+        if rid(&ns) != ns.replace('-', "_") || rid(&name) != name.replace('-', "_") {
+            bail!("app {}: wit-bindgen cannot generate Rust package modules for keyword `{ns}:{name}`; use a non-keyword app namespace/name or a Python caller", c.app);
+        }
         let _ = writeln!(
             s,
-            "\nmod bindings_{m} {{\n    wit_bindgen::generate!({{\n        path: \"wit\",\n        world: \"{ns}:{name}/{WORLD}\",\n        with: {{ \"{HOST_ACTORS}\": statex_guest::actors }},\n        additional_derives: [PartialEq],\n    }});\n}}",
-            m = rid(&format!("{ns}-{name}"))
+            "\n#[allow(non_snake_case)]\nmod bindings_{m} {{\n    wit_bindgen::generate!({{\n        path: \"wit\",\n        world: \"{ns}:{name}/{WORLD}\",\n        with: {{ \"{HOST_ACTORS}\": statex_guest::actors }},\n        additional_derives: [PartialEq],\n    }});\n}}",
+            m = format!("{}__{}", rid(&ns), rid(&name))
         );
         by_ns.entry(ns).or_default().push(c);
     }
@@ -561,7 +579,7 @@ fn rust_shim(callees: &[Callee]) -> Result<String> {
         let _ = writeln!(s, "\npub mod {} {{", rid(ns));
         for c in cs {
             let (_, name) = client_package(&c.app);
-            let bindings = format!("super::super::super::bindings_{}", rid(&format!("{ns}-{name}")));
+            let bindings = format!("super::super::super::bindings_{}__{}", rid(ns), rid(&name));
             let _ = writeln!(s, "    /// Actors of app `{}`.\n    pub mod {} {{", c.app, rid(&name));
             for t in &c.types {
                 let fns = rust_fns(t);
@@ -678,7 +696,7 @@ pub fn imports(callees: &[Callee]) -> Vec<String> {
         .iter()
         .flat_map(|c| {
             let (ns, name) = client_package(&c.app);
-            c.types.iter().map(move |t| format!("import {ns}:{name}/{};", t.name))
+            c.types.iter().map(move |t| format!("import {}:{}/{};", wid(&ns), wid(&name), wid(&t.name)))
         })
         .collect()
 }
@@ -749,5 +767,68 @@ mod tests {
         assert_eq!(f[0].ret, format!("Result<(), {CALL_ERROR}>"));
         assert_eq!(f[1].params[0].0, "actor_key");
         assert_eq!(f[1].ret, format!("Result<Result<Option<Entry>, KvError>, {CALL_ERROR}>"));
+    }
+
+    #[test]
+    fn simple_and_namespaced_clients_preserve_callee_identity() {
+        for app in ["shop", "payments/shop", "type", "interface/type"] {
+            let mut c = kv();
+            c.app = app.into();
+            let wit = client_wit(&c).unwrap();
+            let back = parse_client(Path::new("client.wit"), &wit).unwrap();
+            assert_eq!(back.app, app);
+            assert_eq!(back.types[0].methods, c.types[0].methods);
+        }
+        assert_eq!(module_path("shop", "kv"), "statex_calls::statex::shop::kv");
+        assert_eq!(module_path("payments/shop", "kv"), "statex_calls::payments::shop::kv");
+    }
+
+    #[test]
+    fn explicit_source_path_must_name_the_requested_app() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let caller = d.path().join("caller");
+        let callee = d.path().join("source");
+        crate::scaffold::new_python_project("caller", &caller, "counter", None).unwrap();
+        crate::scaffold::new_python_project("shop", &callee, "counter", None).unwrap();
+        let mut p = Project::find(&caller).unwrap();
+        p.cfg.calls.paths.insert("shop".into(), PathBuf::from("../source"));
+        assert_eq!(callee_root(&p, None, "shop").unwrap().unwrap(), callee.canonicalize().unwrap());
+        p.cfg.calls.paths.insert("wrong".into(), PathBuf::from("../source"));
+        assert!(callee_root(&p, None, "wrong").unwrap_err().to_string().contains("whose manifest names"));
+    }
+
+    #[test]
+    fn namespace_boundaries_do_not_collide_in_generated_names() {
+        assert_ne!(client_file("a/b-c"), client_file("a-b/c"));
+        let mut first = kv();
+        first.app = "a/b-c".into();
+        let mut second = kv();
+        second.app = "a-b/c".into();
+        let shim = rust_shim(&[first, second]).unwrap();
+        assert!(shim.contains("mod bindings_a__b_c"));
+        assert!(shim.contains("mod bindings_a_b__c"));
+        assert!(shim.contains("#[allow(non_snake_case)]\nmod bindings_a__b_c"));
+        assert!(shim.contains("#[allow(non_snake_case)]\nmod bindings_a_b__c"));
+        assert_eq!(shim.matches("#[allow(non_snake_case)]").count(), 2);
+    }
+
+    #[test]
+    fn remote_clients_require_the_unambiguous_directory_layout() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let root = d.path().join("caller");
+        crate::scaffold::new_python_project("caller", &root, "counter", None).unwrap();
+        let mut p = Project::find(&root).unwrap();
+        p.cfg.calls.apps.push("demo/db".into());
+        let old = PathBuf::from("wit/deps/demo-db/client.wit");
+        let old_files = BTreeMap::from([(old, client_wit(&kv()).unwrap())]);
+        write(&p, None, &old_files).unwrap();
+        assert!(local_plan(&p, None).unwrap_err().to_string().contains("no client interface for app demo/db"));
+    }
+
+    #[test]
+    fn rust_package_keyword_limit_has_an_actionable_error() {
+        let mut c = kv();
+        c.app = "type".into();
+        assert!(rust_shim(&[c]).unwrap_err().to_string().contains("wit-bindgen cannot generate Rust package modules"));
     }
 }

@@ -1,6 +1,6 @@
 //! App manifest: the actor types, methods and type signatures discovered from a
 //! component's WIT exports, plus deployment metadata. The manifest drives
-//! routing, JSON mapping and client SDK generation, so teams never register
+//! routing, JSON mapping and client SDK generation, so applications never register
 //! routes by hand.
 
 use std::collections::BTreeMap;
@@ -168,17 +168,26 @@ impl Manifest {
         http: HttpPolicy,
         limits: Limits,
     ) -> Result<Manifest> {
+        Self::build_with_imports(wasm, app, migrations, http, limits, &[])
+    }
+
+    /// Builds a manifest with explicitly registered additional host interfaces.
+    /// Entries are exact component import names, including any WIT version.
+    /// The ordinary [`Self::build`] never admits these extension imports.
+    pub fn build_with_imports(
+        wasm: &[u8],
+        app: &str,
+        migrations: BTreeMap<String, Vec<Migration>>,
+        http: HttpPolicy,
+        limits: Limits,
+        additional_imports: &[String],
+    ) -> Result<Manifest> {
         validate_app_name(app)?;
-        let ins = inspect(wasm)?;
-        let bad: Vec<_> = ins
-            .imports
-            .iter()
-            .filter(|i| !import_allowed(i) && !ins.calls.iter().any(|c| &c.import == *i))
-            .cloned()
-            .collect();
+        let ins = inspect_with_imports(wasm, additional_imports)?;
+        let bad = unprovided_imports(&ins, additional_imports);
         if !bad.is_empty() {
             bail!(
-                "component imports interfaces the host does not provide: {}. Only statex:host/*, wasi:* and statex client interfaces (`statex calls sync`) are available",
+                "component imports interfaces the host does not provide: {}. Only statex:host/*, wasi:*, typed actor clients (`statex calls sync`) and explicitly registered host interfaces are available",
                 bad.join(", ")
             );
         }
@@ -215,7 +224,7 @@ impl Manifest {
     }
 }
 
-/// App names: lowercase letters, digits and dashes, starting with a letter.
+/// General identifiers: lowercase letters, digits and dashes, starting with a letter.
 pub fn validate_name(what: &str, s: &str) -> Result<()> {
     let ok = !s.is_empty()
         && s.len() <= 63
@@ -231,39 +240,45 @@ pub fn validate_name(what: &str, s: &str) -> Result<()> {
 /// use them, so `/v1/apps/<app...>/actors/...` parses unambiguously.
 pub const RESERVED_APP_SEGMENTS: &[&str] = &["actors", "schema"];
 
-/// App names are one segment (`shop`) or namespaced as `team/app`
-/// (`payments/shop`). Each segment follows [`validate_name`].
+/// App names are one segment (`shop`) or namespaced as `namespace/app`
+/// (`payments/shop`). Each segment is a WIT-compatible kebab identifier,
+/// limited to 63 characters.
 pub fn validate_app_name(s: &str) -> Result<()> {
     let segs: Vec<&str> = s.split('/').collect();
     if segs.len() > 2 {
-        bail!("invalid app name {s:?}: use `app` or `team/app`");
+        bail!("invalid app name {s:?}: use `app` or `namespace/app`");
     }
     for seg in segs {
-        validate_name("app", seg).map_err(|_| {
-            anyhow!("invalid app name {s:?}: use `app` or `team/app`, where each part is lowercase letters, digits and dashes, starting with a letter")
-        })?;
+        let valid = seg.len() <= 63
+            && seg.split('-').all(|word| {
+                word.starts_with(|c: char| c.is_ascii_lowercase())
+                    && word.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+            });
+        if !valid {
+            bail!("invalid app name {s:?}: use `app` or `namespace/app`, with 1–63-character segments of lowercase alphanumeric words separated by single dashes, each word starting with a letter");
+        }
         if RESERVED_APP_SEGMENTS.contains(&seg) {
             bail!("invalid app name {s:?}: `{seg}` is reserved");
         }
     }
-    // Client interfaces of app `team/app` live in WIT package `team:app`, and
+    // Client interfaces of app `namespace/app` live in WIT package `namespace:app`, and
     // of a single-segment app `app` in `statex:app` (see [`client_package`]).
     match s.split_once('/') {
-        Some((team, _)) if RESERVED_TEAMS.contains(&team) => bail!("invalid app name {s:?}: team `{team}` is reserved"),
+        Some((namespace, _)) if RESERVED_NAMESPACES.contains(&namespace) => bail!("invalid app name {s:?}: namespace `{namespace}` is reserved"),
         None if s == "host" => bail!("invalid app name {s:?}: `host` is reserved"),
         _ => {}
     }
     Ok(())
 }
 
-/// Teams that cannot own apps because their WIT namespaces belong to the host.
-pub const RESERVED_TEAMS: &[&str] = &["statex", "wasi"];
+/// WIT namespaces reserved for host capabilities.
+pub const RESERVED_NAMESPACES: &[&str] = &["statex", "wasi"];
 
 /// WIT package (`namespace`, `name`) holding the client interfaces of `app`:
-/// `team/app` -> `team:app`, `app` -> `statex:app`.
+/// `namespace/app` -> `namespace:app`, `app` -> `statex:app`.
 pub fn client_package(app: &str) -> (String, String) {
     match app.split_once('/') {
-        Some((team, name)) => (team.to_string(), name.to_string()),
+        Some((namespace, name)) => (namespace.to_string(), name.to_string()),
         None => ("statex".to_string(), app.to_string()),
     }
 }
@@ -287,6 +302,13 @@ pub struct Inspection {
     pub calls: Vec<CallImport>,
 }
 
+fn unprovided_imports(ins: &Inspection, additional_imports: &[String]) -> Vec<String> {
+    ins.imports.iter()
+        .filter(|i| !import_allowed(i) && !additional_imports.contains(i) && !ins.calls.iter().any(|c| &c.import == *i))
+        .cloned()
+        .collect()
+}
+
 /// Import namespaces an actor component may use.
 pub fn import_allowed(name: &str) -> bool {
     name.starts_with("statex:host/") || name.starts_with("wasi:")
@@ -294,12 +316,16 @@ pub fn import_allowed(name: &str) -> bool {
 
 /// Decodes a component binary and extracts its actor types.
 pub fn inspect(wasm: &[u8]) -> Result<Inspection> {
+    inspect_with_imports(wasm, &[])
+}
+
+fn inspect_with_imports(wasm: &[u8], additional_imports: &[String]) -> Result<Inspection> {
     let decoded = wit_component::decode(wasm).map_err(|e| anyhow!("not a valid component: {e}"))?;
     let (resolve, world) = match decoded {
         wit_component::DecodedWasm::Component(r, w) => (r, w),
         _ => bail!("expected a WebAssembly component, found a WIT package"),
     };
-    inspect_world(&resolve, world)
+    inspect_world(&resolve, world, additional_imports)
 }
 
 /// Extracts actor types from WIT source (a directory such as `wit/`, with
@@ -309,7 +335,7 @@ pub fn inspect_wit(dir: &std::path::Path, world: Option<&str>) -> Result<Inspect
     let mut resolve = Resolve::default();
     let (pkg, _) = resolve.push_dir(dir).with_context(|| format!("parse WIT in {}", dir.display()))?;
     let world = resolve.select_world(&[pkg], world)?;
-    inspect_world(&resolve, world)
+    inspect_world(&resolve, world, &[])
 }
 
 /// Client interfaces imported by a WIT world, e.g. a generated `statex-calls`
@@ -318,14 +344,18 @@ pub fn inspect_wit_calls(dir: &std::path::Path, world: Option<&str>) -> Result<V
     let mut resolve = Resolve::default();
     let (pkg, _) = resolve.push_dir(dir).with_context(|| format!("parse WIT in {}", dir.display()))?;
     let world = resolve.select_world(&[pkg], world)?;
-    world_calls(&resolve, world)
+    world_calls(&resolve, world, &[])
 }
 
-fn world_calls(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Vec<CallImport>> {
+fn world_calls(resolve: &Resolve, world: wit_parser::WorldId, additional_imports: &[String]) -> Result<Vec<CallImport>> {
     let mut calls = Vec::new();
     for (key, item) in &resolve.worlds[world].imports {
         if let WorldItem::Interface { id, .. } = item {
-            if let Some(c) = call_import(resolve, *id, &resolve.name_world_key(key))? {
+            let import = resolve.name_world_key(key);
+            if additional_imports.contains(&import) {
+                continue;
+            }
+            if let Some(c) = call_import(resolve, *id, &import)? {
                 calls.push(c);
             }
         }
@@ -333,10 +363,10 @@ fn world_calls(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Vec<Call
     Ok(calls)
 }
 
-fn inspect_world(resolve: &Resolve, world: wit_parser::WorldId) -> Result<Inspection> {
+fn inspect_world(resolve: &Resolve, world: wit_parser::WorldId, additional_imports: &[String]) -> Result<Inspection> {
     let w = &resolve.worlds[world];
     let imports = w.imports.keys().map(|k| resolve.name_world_key(k)).collect();
-    let calls = world_calls(resolve, world)?;
+    let calls = world_calls(resolve, world, additional_imports)?;
     let mut types: Vec<ActorType> = Vec::new();
     for (key, item) in &w.exports {
         let export = resolve.name_world_key(key);
@@ -409,13 +439,24 @@ fn check_alarm_handler(m: &Method, ctx: &str) -> Result<()> {
     Ok(())
 }
 
-/// Parses an imported interface as a statex client interface, or returns
-/// `None` for host interfaces (`statex:host/*`, `wasi:*`).
+/// Recognizes typed actor clients by their use of the host's `call-error`.
+/// Other interfaces remain imports that manifest capability validation must
+/// admit explicitly; a package name alone never turns an import into a client.
 fn call_import(resolve: &Resolve, id: wit_parser::InterfaceId, import: &str) -> Result<Option<CallImport>> {
     let iface = &resolve.interfaces[id];
     let Some(pkg) = iface.package else { return Ok(None) };
     let pn = &resolve.packages[pkg].name;
     let Some(app) = app_of_package(&pn.namespace, &pn.name) else { return Ok(None) };
+    let uses_call_error = iface.types.values().any(|id| is_call_error(resolve, &Type::Id(*id)))
+        || iface.functions.values().any(|f| {
+            matches!(
+                f.result.as_ref().map(|t| deref(resolve, t)),
+                Some(TypeDefKind::Result(r)) if r.err.as_ref().is_some_and(|e| is_call_error(resolve, e))
+            )
+        });
+    if !uses_call_error {
+        return Ok(None);
+    }
     let hint = "client interfaces are generated by `statex calls sync`";
     let actor_type = iface.name.clone().ok_or_else(|| anyhow!("import {import}: unnamed interface; {hint}"))?;
     validate_app_name(&app).with_context(|| format!("import {import} does not name a statex app; {hint}"))?;
@@ -552,11 +593,88 @@ mod tests {
 
     #[test]
     fn app_names() {
-        for ok in ["shop", "payments/shop", "a1/b-2"] {
+        for ok in ["shop", "payments/shop", "a1/b-v2"] {
             validate_app_name(ok).unwrap();
         }
-        for bad in ["", "/shop", "shop/", "a/b/c", "Pay/shop", "payments/actors", "schema", "a//b", "a.b"] {
+        for bad in ["", "/shop", "shop/", "a/b/c", "Pay/shop", "payments/actors", "schema", "a//b", "a.b", "a-2", "a--b", "shop-"] {
             assert!(validate_app_name(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn client_packages_round_trip_without_changing_existing_names() {
+        for app in ["shop", "payments/shop", "type", "interface/type"] {
+            validate_app_name(app).unwrap();
+            let (namespace, name) = client_package(app);
+            assert_eq!(app_of_package(&namespace, &name).as_deref(), Some(app));
+        }
+        assert_eq!(client_package("shop"), ("statex".into(), "shop".into()));
+        assert_eq!(client_package("payments/shop"), ("payments".into(), "shop".into()));
+        for host in [("statex", "host"), ("wasi", "io")] {
+            assert!(app_of_package(host.0, host.1).is_none());
+        }
+        for reserved in ["host", "statex/shop", "wasi/shop", "actors", "schema", "payments/schema"] {
+            assert!(validate_app_name(reserved).is_err(), "{reserved}");
+        }
+    }
+
+    #[test]
+    fn registered_interfaces_are_not_mistaken_for_actor_clients() {
+        let mut resolve = Resolve::default();
+        resolve.push_str("metrics.wit", "package vendor:metrics@1.0.0;\ninterface recorder { write: func(value: u64); }\n").unwrap();
+        let pkg = resolve.push_str("app.wit", r#"
+            package local:shop;
+            interface counter { get: func() -> u64; }
+            world app {
+                import vendor:metrics/recorder@1.0.0;
+                export counter;
+            }
+        "#).unwrap();
+        let world = resolve.select_world(&[pkg], Some("app")).unwrap();
+        let unknown = inspect_world(&resolve, world, &[]).unwrap();
+        assert!(unknown.calls.is_empty());
+        assert_eq!(unprovided_imports(&unknown, &[]), ["vendor:metrics/recorder@1.0.0"]);
+        let ins = inspect_world(&resolve, world, &["vendor:metrics/recorder@1.0.0".into()]).unwrap();
+        assert_eq!(ins.types[0].name, "counter");
+        assert!(ins.calls.is_empty());
+        assert_eq!(ins.imports, ["vendor:metrics/recorder@1.0.0"]);
+        assert!(unprovided_imports(&ins, &["vendor:metrics/recorder@1.0.0".into()]).is_empty());
+        assert_eq!(unprovided_imports(&ins, &["vendor:metrics/recorder".into()]), ["vendor:metrics/recorder@1.0.0"]);
+        assert_eq!(unprovided_imports(&ins, &["vendor:metrics/*".into()]), ["vendor:metrics/recorder@1.0.0"]);
+    }
+
+    #[test]
+    fn typed_actor_clients_remain_distinct_from_custom_capabilities() {
+        for key in ["string", "u64"] {
+            let mut resolve = Resolve::default();
+            resolve.push_str("host.wit", include_str!("../../../wit/statex-host.wit")).unwrap();
+            resolve.push_str("client.wit", &format!(r#"
+                package demo:counter;
+                interface counter {{
+                    use statex:host/actors@0.1.0.{{call-error}};
+                    increment: func(actor: {key}) -> result<u64, call-error>;
+                }}
+            "#)).unwrap();
+            let pkg = resolve.push_str("app.wit", r#"
+                package local:shop;
+                interface shop { get: func() -> u64; }
+                world app {
+                    import demo:counter/counter;
+                    export shop;
+                }
+            "#).unwrap();
+            let world = resolve.select_world(&[pkg], Some("app")).unwrap();
+            if key == "string" {
+                let ins = inspect_world(&resolve, world, &[]).unwrap();
+                assert_eq!(ins.calls[0].app, "demo/counter");
+                assert!(unprovided_imports(&ins, &[]).is_empty());
+            } else {
+                let err = inspect_world(&resolve, world, &[]).unwrap_err();
+                assert!(err.to_string().contains("the first parameter must be"));
+                let registered = inspect_world(&resolve, world, &["demo:counter/counter".into()]).unwrap();
+                assert!(registered.calls.is_empty());
+                assert!(unprovided_imports(&registered, &["demo:counter/counter".into()]).is_empty());
+            }
         }
     }
 }

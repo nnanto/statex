@@ -1,6 +1,6 @@
-//! Monorepo support. A `statex-workspace.toml` at the repository root marks a
-//! workspace where every app lives at `<apps>/<team>/<app>` and is named
-//! `team/app` after its path. Apps link the shared host WIT and guest SDKs
+//! Optional workspace support. `statex-workspace.toml` configures app
+//! discovery and shared dependencies; manifest names are independent of paths.
+//! Apps can link the shared host WIT and guest SDKs
 //! instead of copying them, Rust apps share one Cargo workspace, and CI can
 //! check every app and regenerate the registry in one pass.
 
@@ -17,7 +17,7 @@ pub const FILE: &str = "statex-workspace.toml";
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkspaceToml {
-    /// Directory holding `<team>/<app>` projects.
+    /// Directory recursively searched for projects, with no required nesting.
     pub apps: PathBuf,
     /// Directory containing `statex-host.wit`.
     pub host_wit: PathBuf,
@@ -82,17 +82,9 @@ impl Workspace {
         self.path(&self.cfg.apps)
     }
 
-    /// Where app `team/app` lives.
+    /// Default scaffold directory for an app, not an identity lookup.
     pub fn app_dir(&self, app: &str) -> PathBuf {
         app.split('/').fold(self.apps_dir(), |p, s| p.join(s))
-    }
-
-    /// The name an app at `dir` must have (`team/app`), from its path.
-    pub fn expected_name(&self, dir: &Path) -> Option<String> {
-        let apps = self.apps_dir().canonicalize().ok()?;
-        let rel = dir.canonicalize().ok()?.strip_prefix(&apps).ok()?.to_path_buf();
-        let segs: Vec<String> = rel.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
-        (!segs.is_empty()).then(|| segs.join("/"))
     }
 
     /// Path relative to the workspace root, with `/` separators.
@@ -123,7 +115,15 @@ impl Workspace {
             walk(&self.apps_dir(), &mut dirs)?;
         }
         dirs.sort();
-        dirs.iter().map(|d| Project::find(d)).collect()
+        let projects: Vec<_> = dirs.iter().map(|d| Project::find(d)).collect::<Result<_>>()?;
+        let mut seen = std::collections::BTreeMap::new();
+        for p in &projects {
+            statex_runtime::validate_app_name(p.app())?;
+            if let Some(prev) = seen.insert(p.app(), &p.root) {
+                bail!("app name {:?} is used by both {} and {}", p.app(), prev.display(), p.root.display());
+            }
+        }
+        Ok(projects)
     }
 
 }
@@ -152,7 +152,7 @@ pub fn init(root: &Path, statex_dir: &Path) -> Result<Vec<String>> {
     std::fs::write(
         &f,
         format!(
-            "# statex monorepo: every app lives at <apps>/<team>/<app> and is named `team/app`.\n\
+            "# Optional statex workspace: discover apps recursively; names come from statex.toml.\n\
              # Relative paths are resolved from this file.\n\
              apps = \"apps\"\n\
              host_wit = {:?}\n\
@@ -225,5 +225,17 @@ mod tests {
         std::fs::create_dir_all(d.path().join("apps/payments/shop")).unwrap();
         std::fs::create_dir_all(d.path().join("wit")).unwrap();
         assert_eq!(relative(&d.path().join("apps/payments/shop"), &d.path().join("wit")).unwrap(), PathBuf::from("../../../wit"));
+    }
+
+    #[test]
+    fn discovery_rejects_duplicate_manifest_names() {
+        let d = tempfile::tempdir_in(".").unwrap();
+        let ws = Workspace { root: d.path().to_path_buf(), cfg: WorkspaceToml::default() };
+        for path in ["a", "deep/b"] {
+            let root = ws.apps_dir().join(path);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("statex.toml"), "[app]\nname = \"shop\"\n").unwrap();
+        }
+        assert!(ws.projects().err().unwrap().to_string().contains("used by both"));
     }
 }
