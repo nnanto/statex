@@ -21,6 +21,7 @@ use tokio::task::JoinHandle;
 pub use layout::ActorId;
 pub use node::{InvOp, Invocation, Node, NodeConfig, Outcome};
 pub use statex_runtime::database;
+pub use statex_runtime::{Metric, MetricLabel, MetricsSink, MetricValue, TracingMetricsSink};
 
 /// A running node.
 pub struct NodeHandle {
