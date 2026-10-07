@@ -18,10 +18,11 @@ use statex_runtime::database::{DynDatabaseFactory, SqliteFactory};
 use statex_runtime::limits::HostLimits;
 use statex_runtime::{
     resolve_method, ActorCaller, ActorRef, AppCode, CallError, CallFailure, CallReply, CallRequest,
-    Runtime,
+    Metric, MetricLabel, MetricsSink, Runtime, TracingMetricsSink,
 };
 use statex_store::{get_json, to_json_bytes, DynStore, StoreError};
 use tokio::sync::Mutex as AsyncMutex;
+use tracing::Instrument;
 
 use crate::actor::{self, Actor, Op};
 use crate::deploy;
@@ -74,6 +75,8 @@ pub struct NodeConfig {
     /// Maximum wait for each async hook. Critical hooks also share the
     /// invocation deadline; observers use an independent bounded budget.
     pub extension_timeout: Duration,
+    /// Receives bounded-cardinality framework invocation metrics.
+    pub metrics_sink: Arc<dyn MetricsSink>,
     /// Optional public HTTP router customization, e.g. trusted authentication
     /// middleware. The peer router is never passed through this callback.
     pub public_router: Option<Arc<dyn Fn(axum::Router) -> axum::Router + Send + Sync>>,
@@ -100,6 +103,7 @@ impl NodeConfig {
             guest_limits: HostLimits::default(),
             extensions: Vec::new(),
             extension_timeout: Duration::from_secs(5),
+            metrics_sink: Arc::new(TracingMetricsSink),
             public_router: None,
         }
     }
@@ -474,18 +478,65 @@ impl Node {
         mut context: InvocationContext,
         hops: u32,
     ) -> Outcome {
+        let started = Instant::now();
         inv.ty = norm(&inv.ty);
         if let InvOp::Call { method, .. } = &mut inv.op {
             *method = norm(method);
         }
         (context.target, context.operation) = invocation_parts(&inv);
-        match self.admit(&mut context).await {
-            Ok(()) => self.invoke_routed(&inv, &context, hops, true).await,
-            Err(error) => {
-                let outcome = Outcome::rejected(error);
-                self.completed(context, outcome.clone());
-                outcome
-            }
+        let operation = Self::operation_name(&context.operation);
+        let span = tracing::info_span!(
+            "statex.invocation",
+            request_id = %context.request.request_id,
+            parent_request_id = ?context.request.parent_request_id,
+            app = %context.target.app,
+            actor_type = %context.target.actor_type,
+            operation,
+            status = tracing::field::Empty,
+            result = tracing::field::Empty
+        );
+        async move {
+            let outcome = match self.admit(&mut context).await {
+                Ok(()) => self.invoke_routed(&inv, &context, hops, true).await,
+                Err(error) => {
+                    let outcome = Outcome::rejected(error);
+                    self.completed(context.clone(), outcome.clone());
+                    outcome
+                }
+            };
+            let result = if outcome.status < 400 { "ok" } else { "error" };
+            tracing::Span::current().record("status", outcome.status);
+            tracing::Span::current().record("result", result);
+            let labels = vec![
+                MetricLabel { name: "operation", value: operation.into() },
+                MetricLabel { name: "result", value: result.into() },
+                MetricLabel {
+                    name: "status_class",
+                    value: format!("{}xx", outcome.status / 100),
+                },
+            ];
+            statex_runtime::services::emit_metric(
+                self.cfg.metrics_sink.as_ref(),
+                Metric::counter("statex.invocations", 1, labels.clone()),
+            );
+            statex_runtime::services::emit_metric(
+                self.cfg.metrics_sink.as_ref(),
+                Metric::duration("statex.invocation.duration", started.elapsed(), labels),
+            );
+            outcome
+        }
+        .instrument(span)
+        .await
+    }
+
+    fn operation_name(operation: &InvocationOperation) -> &'static str {
+        match operation {
+            InvocationOperation::Call { .. } => "call",
+            InvocationOperation::Create => "create",
+            InvocationOperation::Delete => "delete",
+            InvocationOperation::Alarm => "alarm",
+            InvocationOperation::OutboxClaim => "outbox_claim",
+            InvocationOperation::OutboxComplete { .. } => "outbox_complete",
         }
     }
 
@@ -567,6 +618,26 @@ impl Node {
     }
 
     async fn lifecycle(&self, id: &ActorId, epoch: u64, kind: LifecycleKind) {
+        let kind_label = match kind {
+            LifecycleKind::Activated => "activated",
+            LifecycleKind::CodeReplaced => "code_replaced",
+            LifecycleKind::Evicted => "evicted",
+            LifecycleKind::Deleted => "deleted",
+            LifecycleKind::Shutdown => "shutdown",
+            LifecycleKind::Fenced => "fenced",
+            LifecycleKind::Discarded => "discarded",
+        };
+        statex_runtime::services::emit_metric(
+            self.cfg.metrics_sink.as_ref(),
+            Metric::counter(
+                "statex.actor.lifecycle",
+                1,
+                vec![MetricLabel {
+                    name: "kind",
+                    value: kind_label.into(),
+                }],
+            ),
+        );
         observe_lifecycle(
             &self.cfg.extensions,
             self.cfg.extension_timeout,

@@ -21,6 +21,70 @@ pub trait LogSink: Send + Sync {
     fn log(&self, actor: &ActorIdentity, level: LogLevel, message: &str);
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetricLabel {
+    pub name: &'static str,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MetricValue {
+    Counter(u64),
+    Duration(Duration),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Metric {
+    pub name: &'static str,
+    pub value: MetricValue,
+    pub labels: Vec<MetricLabel>,
+}
+
+impl Metric {
+    pub fn counter(name: &'static str, value: u64, labels: Vec<MetricLabel>) -> Self {
+        Self {
+            name,
+            value: MetricValue::Counter(value),
+            labels,
+        }
+    }
+
+    pub fn duration(name: &'static str, value: Duration, labels: Vec<MetricLabel>) -> Self {
+        Self {
+            name,
+            value: MetricValue::Duration(value),
+            labels,
+        }
+    }
+}
+
+/// Receives framework measurements. Implementations should avoid unbounded
+/// label values and must not block indefinitely.
+pub trait MetricsSink: Send + Sync {
+    fn record(&self, metric: &Metric);
+}
+
+pub struct TracingMetricsSink;
+
+impl MetricsSink for TracingMetricsSink {
+    fn record(&self, metric: &Metric) {
+        tracing::info!(
+            target: "statex::metrics",
+            metric = metric.name,
+            value = ?metric.value,
+            labels = ?metric.labels,
+            "framework metric"
+        );
+    }
+}
+
+/// Reports a measurement without allowing an observer panic to affect work.
+pub fn emit_metric(sink: &dyn MetricsSink, metric: Metric) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.record(&metric))).is_err() {
+        tracing::warn!(metric = metric.name, "metrics sink panicked");
+    }
+}
+
 /// Default synchronous HTTP adapter, with redirects disabled so an admitted
 /// host cannot redirect a request to a host outside the allowlist.
 pub struct DefaultHttpTransport;

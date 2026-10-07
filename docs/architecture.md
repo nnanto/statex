@@ -48,6 +48,11 @@ not forwarded. Owner checks happen before activation/migrations, and a
 commit-hook rejection rolls back the entire actor transaction. Runtime-only
 embedders have a separate per-guest execution hook.
 
+The node and runtime emit tracing spans and accept configurable metrics sinks;
+guest log output has its own configurable `LogSink`. These defaults use the
+existing `tracing` ecosystem, while embedders can connect custom metrics and
+logging implementations.
+
 See the individual contracts for [object stores](extensions/object-stores.md),
 [state backends](extensions/state-backends.md),
 [invocation hooks](extensions/invocation-hooks.md),

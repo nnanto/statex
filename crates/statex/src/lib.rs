@@ -10,6 +10,7 @@ pub use statex_node::extensions::{
     InvocationExtension, LifecycleEvent, LifecycleKind, TransactionKind,
 };
 pub use statex_node::{deploy, start, ActorId, InvOp, Invocation, NodeConfig, NodeHandle, Outcome};
+pub use statex_node::{Metric, MetricLabel, MetricsSink, MetricValue, TracingMetricsSink};
 pub use statex_runtime as runtime;
 pub use statex_runtime::database::{Database, DatabaseFactory, DatabaseHandle, SqliteFactory};
 pub use statex_runtime::invocation::{

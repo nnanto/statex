@@ -33,7 +33,10 @@ pub use manifest::{
     app_of_package, client_package, inspect, inspect_wit, inspect_wit_calls, validate_app_name, validate_name, ActorType, CallImport,
     Case, Field, HttpPolicy, Limits, Manifest, Method, Migration, Param, Ty,
 };
-pub use services::{DefaultHttpTransport, HttpTransport, LogSink, TracingLogSink};
+pub use services::{
+    DefaultHttpTransport, HttpTransport, LogSink, Metric, MetricLabel, MetricsSink, MetricValue,
+    TracingLogSink, TracingMetricsSink,
+};
 pub use limits::HostLimits;
 use invocation::{Caller, ExecutionExtension, HookError, InvocationContext, InvocationOperation};
 
@@ -69,6 +72,7 @@ pub struct RuntimeBuilder {
     initializers: Vec<Arc<HostInitializer>>,
     http_transport: Arc<dyn HttpTransport>,
     log_sink: Arc<dyn LogSink>,
+    metrics_sink: Arc<dyn MetricsSink>,
     execution_extensions: Vec<Arc<dyn ExecutionExtension>>,
     host_limits: HostLimits,
 }
@@ -81,6 +85,7 @@ impl Default for RuntimeBuilder {
             initializers: Vec::new(),
             http_transport: Arc::new(DefaultHttpTransport),
             log_sink: Arc::new(TracingLogSink),
+            metrics_sink: Arc::new(TracingMetricsSink),
             execution_extensions: Vec::new(),
             host_limits: HostLimits::default(),
         }
@@ -145,6 +150,11 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn metrics_sink(mut self, sink: Arc<dyn MetricsSink>) -> Self {
+        self.metrics_sink = sink;
+        self
+    }
+
     pub fn build(mut self) -> Result<Runtime> {
         self.host_limits.validate()?;
         self.config.epoch_interruption(true);
@@ -176,6 +186,7 @@ impl RuntimeBuilder {
             initializers: self.initializers,
             http_transport: self.http_transport,
             log_sink: self.log_sink,
+            metrics_sink: self.metrics_sink,
             execution_extensions: self.execution_extensions,
             host_limits: self.host_limits,
             quotas: Arc::new(limits::QuotaRegistry::default()),
@@ -212,6 +223,7 @@ pub struct Runtime {
     initializers: Vec<Arc<HostInitializer>>,
     http_transport: Arc<dyn HttpTransport>,
     log_sink: Arc<dyn LogSink>,
+    metrics_sink: Arc<dyn MetricsSink>,
     execution_extensions: Vec<Arc<dyn ExecutionExtension>>,
     host_limits: HostLimits,
     quotas: Arc<limits::QuotaRegistry>,
@@ -300,6 +312,7 @@ impl Runtime {
             initializers: self.initializers.clone(),
             http_transport: self.http_transport.clone(),
             log_sink: self.log_sink.clone(),
+            metrics_sink: self.metrics_sink.clone(),
             execution_extensions: self.execution_extensions.clone(),
             effective_limits,
             quota,
@@ -318,6 +331,7 @@ pub struct AppCode {
     initializers: Vec<Arc<HostInitializer>>,
     http_transport: Arc<dyn HttpTransport>,
     log_sink: Arc<dyn LogSink>,
+    metrics_sink: Arc<dyn MetricsSink>,
     execution_extensions: Vec<Arc<dyn ExecutionExtension>>,
     effective_limits: Limits,
     quota: Arc<limits::Quota>,
@@ -624,7 +638,30 @@ impl ActorInstance {
     ) -> Result<CallOutput, CallError> {
         let app = self.app.clone();
         context.check_deadline().map_err(CallError::Rejected)?;
-        let outcome = self.invoke_guest(actor_type, m, idx, params, chain, context);
+        let span = tracing::info_span!(
+            "statex.guest_execution",
+            app = %self.store.data().identity.app,
+            actor_type,
+            method = %m.name,
+            request_id = %context.request.request_id,
+            result = tracing::field::Empty
+        );
+        let started = Instant::now();
+        let outcome = span.in_scope(|| self.invoke_guest(actor_type, m, idx, params, chain, context));
+        let result = if outcome.is_ok() { "ok" } else { "error" };
+        span.record("result", result);
+        let labels = vec![
+            MetricLabel { name: "actor_type", value: actor_type.to_string() },
+            MetricLabel { name: "result", value: result.into() },
+        ];
+        services::emit_metric(
+            app.metrics_sink.as_ref(),
+            Metric::counter("statex.guest.executions", 1, labels.clone()),
+        );
+        services::emit_metric(
+            app.metrics_sink.as_ref(),
+            Metric::duration("statex.guest.duration", started.elapsed(), labels),
+        );
         drop(admission);
         for extension in &app.execution_extensions {
             if let Err(error) = invocation::run_hook(context, || extension.after_guest(context, &outcome)) {
@@ -776,7 +813,18 @@ mod extension_tests {
             }],
             migrations: BTreeMap::new(), http: Default::default(), limits: Default::default(), calls: vec![],
         };
-        let code = Runtime::new().unwrap().load(COMPONENT.as_bytes(), manifest).unwrap();
+        let metrics = Arc::new(std::sync::Mutex::new(Vec::new()));
+        struct RecordingMetrics(Arc<std::sync::Mutex<Vec<Metric>>>);
+        impl MetricsSink for RecordingMetrics {
+            fn record(&self, metric: &Metric) {
+                self.0.lock().unwrap().push(metric.clone());
+            }
+        }
+        let runtime = Runtime::builder()
+            .metrics_sink(Arc::new(RecordingMetrics(metrics.clone())))
+            .build()
+            .unwrap();
+        let code = runtime.load(COMPONENT.as_bytes(), manifest).unwrap();
         let mut actor = code.instantiate(
             ActorIdentity { app: "context".into(), actor_type: "counter".into(), key: "k".into(), epoch: 1 },
             database::sqlite_handle(Arc::new(std::sync::Mutex::new(rusqlite::Connection::open_in_memory().unwrap()))),
@@ -807,5 +855,12 @@ mod extension_tests {
         assert!(actor.store.data().deadline.is_none());
         assert!(actor.store.data().chain.is_empty());
         assert_eq!(actor.store.get_fuel().unwrap(), 0);
+        let metrics = metrics.lock().unwrap();
+        assert!(metrics.iter().any(|metric| metric.name == "statex.guest.executions"));
+        assert!(metrics.iter().any(|metric| metric.name == "statex.guest.duration"));
+        assert!(metrics.iter().any(|metric| {
+            metric.name == "statex.guest.executions"
+                && metric.labels.iter().any(|label| label.name == "result" && label.value == "error")
+        }));
     }
 }
